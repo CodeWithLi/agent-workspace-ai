@@ -1,0 +1,69 @@
+import pytest
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.agent.service import (
+    ConversationAccessError,
+    get_owned_conversation,
+    infer_tool_calls,
+    ensure_default_agents,
+)
+from app.models import Agent, AgentRole, Conversation, Project, Task, User, UserRole
+
+
+def create_user(db: Session, email: str = "owner@example.com") -> User:
+    user = User(email=email, name="Owner", password_hash="hash", role=UserRole.member)
+    db.add(user)
+    db.flush()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_disabled_tools_never_fall_back_to_agent_declaration(db: Session) -> None:
+    ensure_default_agents(db)
+    user = create_user(db)
+    agent = db.scalar(select(Agent).where(Agent.role == AgentRole.product_manager))
+    assert agent is not None
+    for tool in agent.tool_links:
+        tool.enabled = False
+    db.flush()
+
+    calls = await infer_tool_calls(db, user, agent, None, "请生成 PRD 并创建需求")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_write_tool_requires_intent_and_is_idempotent(db: Session) -> None:
+    ensure_default_agents(db)
+    user = create_user(db)
+    project = Project(name="Test", description="", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    agent = db.scalar(select(Agent).where(Agent.role == AgentRole.project_manager))
+    assert agent is not None
+
+    read_only_calls = await infer_tool_calls(db, user, agent, project, "这个项目现在是什么情况")
+    assert [call["name"] for call in read_only_calls] == ["context_search"]
+    assert db.scalar(select(func.count(Task.id))) == 0
+
+    first = await infer_tool_calls(db, user, agent, project, "请完成任务拆解并创建任务")
+    second = await infer_tool_calls(db, user, agent, project, "请完成任务拆解并创建任务")
+    assert [call["name"] for call in first] == ["context_search", "task_create"]
+    assert [call["name"] for call in second] == ["context_search", "task_create"]
+    assert second[1]["output"] == []
+    assert db.scalar(select(func.count(Task.id))) == 5
+
+
+def test_conversation_isolation(db: Session) -> None:
+    ensure_default_agents(db)
+    owner = create_user(db)
+    intruder = create_user(db, "intruder@example.com")
+    agent = db.scalar(select(Agent).where(Agent.role == AgentRole.architect))
+    assert agent is not None
+    conversation = Conversation(title="Private", agent_id=agent.id, user_id=owner.id)
+    db.add(conversation)
+    db.commit()
+
+    assert get_owned_conversation(db, owner.id, conversation.id).id == conversation.id
+    with pytest.raises(ConversationAccessError):
+        get_owned_conversation(db, intruder.id, conversation.id)
