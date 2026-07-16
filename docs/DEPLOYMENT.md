@@ -29,11 +29,19 @@ SMTP_PORT=587
 SMTP_USERNAME=...
 SMTP_PASSWORD=...
 SMTP_FROM_EMAIL=ai@company.com
+WELCOME_AI_TOKENS=1000
+CHAT_TOKEN_COST=10
+WORKFLOW_TOKEN_COST=100
+RECHARGE_TOKENS_PER_YUAN=100
+AGENT_CONCURRENCY_ACQUIRE_TIMEOUT=3
+AGENT_CONCURRENCY_LEASE_SECONDS=180
 ```
 
 生产配置不满足上述安全约束时，应用会拒绝启动。refresh token 仅写入 `HttpOnly + Secure + SameSite=Lax` cookie，access token 默认 30 分钟，refresh 会话默认 30 天且每次刷新轮换。
 
 通知 worker 默认随 API 进程启动。多副本通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 争抢任务；邮件失败按指数退避重试。生产环境必须配置 SMTP，并监控 `notification.failed` 审计事件。
+
+Python 管理后台使用 `/admin`，仅 `admin` 角色可登录。它使用 8 小时 HttpOnly Cookie、`SameSite=Strict` 和 CSRF Token。生产入口必须使用 HTTPS，并限制后台网络来源。
 
 ## 发布检查
 

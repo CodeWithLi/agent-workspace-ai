@@ -37,6 +37,7 @@
 </template>
 
 <script setup lang="ts">
+import axios from 'axios'
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
@@ -51,6 +52,19 @@ const name = ref('演示用户')
 const password = ref('password123')
 const loading = ref(false)
 
+function authenticationError(error: unknown) {
+  if (!axios.isAxiosError(error) || !error.response) return '无法连接服务，请稍后重试'
+  if (error.response.status === 409) return '该邮箱已注册，请直接登录'
+  if (error.response.status === 401) return '邮箱或密码错误'
+  if (error.response.status === 422) {
+    return mode.value === 'register'
+      ? '请检查邮箱格式、姓名和密码，密码至少 8 位且需包含字母与数字'
+      : '请检查邮箱和密码格式'
+  }
+  const detail = error.response.data?.detail
+  return typeof detail === 'string' ? detail : '认证失败，请稍后重试'
+}
+
 async function submit() {
   loading.value = true
   try {
@@ -61,7 +75,7 @@ async function submit() {
     }
     router.push('/')
   } catch (error) {
-    ElMessage.error('认证失败，请检查输入或先注册账号')
+    ElMessage.error(authenticationError(error))
   } finally {
     loading.value = false
   }

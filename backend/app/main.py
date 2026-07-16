@@ -15,6 +15,8 @@ from app.core.database import SessionLocal, engine, init_db
 from app.core.logging import configure_logging
 from app.core.llm import LLMGatewayError
 from app.services.notifications import notification_dispatcher
+from app.admin import router as admin_router
+from app.services.agent_run_reaper import agent_run_reaper
 
 
 settings = get_settings()
@@ -30,10 +32,12 @@ async def lifespan(_: FastAPI):
         ensure_default_agents(db)
     logger.info("Application started")
     await notification_dispatcher.start()
+    await agent_run_reaper.start()
     try:
         yield
     finally:
         await notification_dispatcher.stop()
+        await agent_run_reaper.stop()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
@@ -97,3 +101,4 @@ def readiness() -> JSONResponse:
 
 
 app.include_router(api_router, prefix=settings.api_prefix)
+app.include_router(admin_router)

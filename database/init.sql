@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
     role VARCHAR(30) DEFAULT 'member',
     is_active BOOLEAN DEFAULT true,
     permissions TEXT DEFAULT '',
+    ai_token_balance INTEGER DEFAULT 1000,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -23,6 +24,38 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);
 CREATE INDEX IF NOT EXISTS ix_user_sessions_expires_at ON user_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS token_transactions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    transaction_type VARCHAR(30) NOT NULL,
+    reference_type VARCHAR(50) DEFAULT '',
+    reference_id VARCHAR(100) DEFAULT '',
+    idempotency_key VARCHAR(150) UNIQUE,
+    description VARCHAR(300) DEFAULT '',
+    operator_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_token_transactions_user_id ON token_transactions(user_id);
+CREATE INDEX IF NOT EXISTS ix_token_transactions_transaction_type ON token_transactions(transaction_type);
+CREATE INDEX IF NOT EXISTS ix_token_transactions_created_at ON token_transactions(created_at);
+
+CREATE TABLE IF NOT EXISTS recharge_orders (
+    id SERIAL PRIMARY KEY,
+    order_no VARCHAR(64) UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount_cents INTEGER NOT NULL,
+    token_amount INTEGER NOT NULL,
+    status VARCHAR(30) DEFAULT 'PAID',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    paid_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_recharge_orders_user_id ON recharge_orders(user_id);
+CREATE INDEX IF NOT EXISTS ix_recharge_orders_status ON recharge_orders(status);
 
 CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
@@ -67,6 +100,7 @@ CREATE TABLE IF NOT EXISTS agents (
     memory_enable BOOLEAN DEFAULT true,
     knowledge_access BOOLEAN DEFAULT true,
     human_approval_required BOOLEAN DEFAULT false,
+    concurrency_limit INTEGER DEFAULT 4,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -108,6 +142,26 @@ CREATE INDEX IF NOT EXISTS ix_agent_actions_project_id ON agent_actions(project_
 CREATE INDEX IF NOT EXISTS ix_agent_actions_agent_id ON agent_actions(agent_id);
 CREATE INDEX IF NOT EXISTS ix_agent_actions_conversation_id ON agent_actions(conversation_id);
 CREATE INDEX IF NOT EXISTS ix_agent_actions_status ON agent_actions(status);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id SERIAL PRIMARY KEY,
+    request_id VARCHAR(64) UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    billing_transaction_id INTEGER REFERENCES token_transactions(id) ON DELETE SET NULL,
+    status VARCHAR(30) DEFAULT 'RUNNING',
+    error TEXT DEFAULT '',
+    started_at TIMESTAMPTZ DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_runs_user_id ON agent_runs(user_id);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_project_id ON agent_runs(project_id);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_agent_id ON agent_runs(agent_id);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_conversation_id ON agent_runs(conversation_id);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_status ON agent_runs(status);
 
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
@@ -218,6 +272,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     current_node VARCHAR(100) DEFAULT 'requirement',
     state_json TEXT DEFAULT '{}',
     human_feedback TEXT DEFAULT '',
+    request_id VARCHAR(64) UNIQUE,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );

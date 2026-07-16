@@ -18,6 +18,7 @@ const router = createRouter({
         { path: 'chat', component: () => import('../views/ChatView.vue'), meta: { requiresPermission: 'agents:read' } },
         { path: 'tasks', component: () => import('../views/TaskBoardView.vue') },
         { path: 'knowledge', component: () => import('../views/KnowledgeView.vue') },
+        { path: 'wallet', component: () => import('../views/WalletView.vue') },
         { path: 'meetings', component: () => import('../views/MeetingsView.vue'), meta: { requiresPermission: 'projects:write' } },
         { path: 'reports', component: () => import('../views/ReportsView.vue'), meta: { requiresPermission: 'projects:write' } },
         { path: 'notifications', component: () => import('../views/NotificationsView.vue'), meta: { requiresPermission: 'projects:write' } },
@@ -34,7 +35,7 @@ router.beforeEach(async (to) => {
   if (to.path !== '/login' && !auth.token) {
     return '/login'
   }
-  if (to.path !== '/login' && auth.token && !auth.user) {
+  if (to.path !== '/login' && auth.token && (!auth.user || typeof auth.user.ai_token_balance !== 'number')) {
     try {
       await auth.fetchMe()
     } catch {

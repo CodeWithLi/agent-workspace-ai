@@ -38,6 +38,7 @@
               <el-form-item label="知识库访问"><el-switch v-model="form.knowledge_access" /></el-form-item>
               <el-form-item label="写操作人工确认"><el-switch v-model="form.human_approval_required" /></el-form-item>
             </div>
+            <el-form-item label="最大并发"><el-input-number v-model="form.concurrency_limit" :min="1" :max="100" /></el-form-item>
           </el-form>
         </el-tab-pane>
         <el-tab-pane label="工具权限" name="tools">
@@ -92,7 +93,8 @@ const form = reactive({
   model: '',
   memory_enable: true,
   knowledge_access: true,
-  human_approval_required: false
+  human_approval_required: false,
+  concurrency_limit: 4
 })
 
 function tools(agent: Agent) {
@@ -113,7 +115,8 @@ async function openConfig(agent: Agent) {
     model: agent.model,
     memory_enable: agent.memory_enable,
     knowledge_access: agent.knowledge_access,
-    human_approval_required: agent.human_approval_required
+    human_approval_required: agent.human_approval_required,
+    concurrency_limit: agent.concurrency_limit
   })
   const { data } = await api.get<AgentTool[]>(`/agents/${agent.id}/tools`)
   agentTools.value = data.map((tool) => ({

@@ -53,6 +53,7 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(SqlEnum(UserRole), default=UserRole.member)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     permissions: Mapped[str] = mapped_column(Text, default="")
+    ai_token_balance: Mapped[int] = mapped_column(Integer, default=1000)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     projects: Mapped[list["Project"]] = relationship(back_populates="owner")
@@ -142,6 +143,7 @@ class Agent(Base):
     memory_enable: Mapped[bool] = mapped_column(Boolean, default=True)
     knowledge_access: Mapped[bool] = mapped_column(Boolean, default=True)
     human_approval_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    concurrency_limit: Mapped[int] = mapped_column(Integer, default=4)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     conversations: Mapped[list["Conversation"]] = relationship(back_populates="agent")
@@ -163,6 +165,22 @@ class AgentAction(Base):
     approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), index=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    conversation_id: Mapped[int | None] = mapped_column(ForeignKey("conversations.id", ondelete="SET NULL"), index=True)
+    billing_transaction_id: Mapped[int | None] = mapped_column(ForeignKey("token_transactions.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(30), default="RUNNING", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentTool(Base):
@@ -338,10 +356,40 @@ class WorkflowRun(Base):
     current_node: Mapped[str] = mapped_column(String(100), default="requirement")
     state_json: Mapped[str] = mapped_column(Text, default="{}")
     human_feedback: Mapped[str] = mapped_column(Text, default="")
+    request_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     project: Mapped[Project] = relationship(back_populates="workflows")
+
+
+class TokenTransaction(Base):
+    __tablename__ = "token_transactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    balance_after: Mapped[int] = mapped_column(Integer)
+    transaction_type: Mapped[str] = mapped_column(String(30), index=True)
+    reference_type: Mapped[str] = mapped_column(String(50), default="")
+    reference_id: Mapped[str] = mapped_column(String(100), default="")
+    idempotency_key: Mapped[str | None] = mapped_column(String(150), unique=True, index=True)
+    description: Mapped[str] = mapped_column(String(300), default="")
+    operator_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class RechargeOrder(Base):
+    __tablename__ = "recharge_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    order_no: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    token_amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), default="PAID", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditLog(Base):

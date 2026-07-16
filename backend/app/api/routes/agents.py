@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agent.router import AgentRoutingError, RouteDecision
+from app.agent.concurrency import AgentBusyError, acquire_agent_slot
 from app.agent.service import (
     ConversationAccessError,
     chat_with_agent,
@@ -17,12 +19,14 @@ from app.agent.service import (
 from app.api.deps import ensure_permission, get_current_user, require_admin, require_permission
 from app.api.routes.projects import get_project_for_user
 from app.core.database import get_db
+from app.core.config import get_settings
 from app.core.audit import record_audit
-from app.models import Agent, AgentAction, AgentTool, Conversation, Message, Project, User, UserRole
+from app.models import Agent, AgentAction, AgentRun, AgentTool, Conversation, Message, Project, User, UserRole
 from app.schemas import (
     AgentOut,
     AgentActionOut,
     AgentRouteResponse,
+    AgentRouteRequest,
     AgentToolOut,
     AgentToolUpdate,
     AgentUpdate,
@@ -33,8 +37,65 @@ from app.schemas import (
 )
 from app.tools.project_tools import task_create
 from app.tools.registry import allowed_tools_for_role
+from app.services.agent_runs import complete_agent_run, fail_agent_run
+from app.services.billing import InsufficientTokensError, apply_token_change
 
 router = APIRouter()
+settings = get_settings()
+
+
+def create_agent_run(
+    db: Session,
+    request: Request,
+    current_user: User,
+    agent: Agent,
+    project: Project | None,
+    payload: ChatRequest,
+) -> AgentRun:
+    existing = db.scalar(select(AgentRun).where(AgentRun.request_id == payload.request_id))
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent request has already been submitted")
+    run = AgentRun(
+        request_id=payload.request_id,
+        user_id=current_user.id,
+        project_id=project.id if project else None,
+        agent_id=agent.id,
+        conversation_id=payload.conversation_id,
+        status="RUNNING",
+    )
+    db.add(run)
+    try:
+        db.flush()
+        billing = apply_token_change(
+            db,
+            current_user.id,
+            -settings.chat_token_cost,
+            "CONSUME",
+            idempotency_key=f"agent:{current_user.id}:{payload.request_id}",
+            reference_type="agent_run",
+            reference_id=payload.request_id,
+            description=f"{agent.name} 对话",
+        )
+        run.billing_transaction_id = billing.id
+        record_audit(
+            db,
+            "agent.run_start",
+            current_user.id,
+            project.id if project else None,
+            "agent_run",
+            run.id,
+            {"agent_id": agent.id, "request_id": payload.request_id, "token_cost": settings.chat_token_cost},
+            request,
+        )
+        db.commit()
+    except InsufficientTokensError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent request has already been submitted") from exc
+    db.refresh(run)
+    return run
 
 
 @router.get("", response_model=list[AgentOut])
@@ -209,7 +270,7 @@ def reject_agent_action(
     return action
 
 
-def resolve_decision(payload: ChatRequest, user: User, db: Session) -> RouteDecision:
+def resolve_decision(payload: AgentRouteRequest, user: User, db: Session) -> RouteDecision:
     ensure_permission(user, "agents:read")
     try:
         if payload.conversation_id:
@@ -225,7 +286,7 @@ def resolve_decision(payload: ChatRequest, user: User, db: Session) -> RouteDeci
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
-def resolve_project(payload: ChatRequest, user: User, db: Session) -> Project | None:
+def resolve_project(payload: AgentRouteRequest, user: User, db: Session) -> Project | None:
     project = get_project_for_user(payload.project_id, user, db, write=True) if payload.project_id else None
     if payload.conversation_id:
         conversation = get_owned_conversation(db, user.id, payload.conversation_id)
@@ -236,7 +297,7 @@ def resolve_project(payload: ChatRequest, user: User, db: Session) -> Project | 
 
 @router.post("/route", response_model=AgentRouteResponse)
 def route(
-    payload: ChatRequest,
+    payload: AgentRouteRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AgentRouteResponse:
@@ -252,6 +313,7 @@ def route(
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     payload: ChatRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ChatResponse:
@@ -259,11 +321,29 @@ async def chat(
     agent = decision.agent
     project = resolve_project(payload, current_user, db)
     try:
+        lease = await acquire_agent_slot(agent.id, agent.concurrency_limit)
+    except AgentBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    try:
+        run = create_agent_run(db, request, current_user, agent, project, payload)
+    except Exception:
+        await lease.release()
+        raise
+    try:
         conversation, answer, thinking, tool_calls, messages = await chat_with_agent(
             db, current_user, agent, payload.message, project, payload.conversation_id, decision.reason
         )
+        complete_agent_run(db, run.id, conversation.id)
     except ConversationAccessError as exc:
+        db.rollback()
+        fail_agent_run(db, run.id, run.billing_transaction_id, str(exc))
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        fail_agent_run(db, run.id, run.billing_transaction_id, str(exc))
+        raise
+    finally:
+        await lease.release()
     return ChatResponse(
         conversation_id=conversation.id,
         agent_id=agent.id,
@@ -278,12 +358,22 @@ async def chat(
 @router.post("/chat/stream")
 async def chat_stream(
     payload: ChatRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     decision = resolve_decision(payload, current_user, db)
     agent = decision.agent
     project = resolve_project(payload, current_user, db)
+    try:
+        lease = await acquire_agent_slot(agent.id, agent.concurrency_limit)
+    except AgentBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    try:
+        run = create_agent_run(db, request, current_user, agent, project, payload)
+    except Exception:
+        await lease.release()
+        raise
     return StreamingResponse(
         stream_chat_events(
             current_user.id,
@@ -292,6 +382,9 @@ async def chat_stream(
             project.id if project else None,
             payload.conversation_id,
             decision.reason,
+            run.id,
+            run.billing_transaction_id,
+            lease,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

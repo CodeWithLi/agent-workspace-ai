@@ -41,18 +41,33 @@
 
 SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `conversation_id`、`agent_id` 和 `agent_name`。
 
+聊天请求必须包含客户端生成的唯一 `request_id`。平台创建 `agent_runs` 运行记录、预扣固定 Token，并在失败或流式连接异常时幂等退款；重复请求返回 `409`。并发达到 Agent 上限时返回 `429`。
+
 用户必须拥有 `agents:read`。审批执行前会重新检查项目写权限、Agent 硬白名单、数据库工具启停和发起者状态；重复审批返回 `409`。
 
 ## 工作流与知识库
 
 - `POST /workflow/run`
 - `POST /workflow/continue`
+- `GET /workflow?project_id=...`
+- `GET /workflow/{workflow_id}`
 - `GET /knowledge/documents`
 - `POST /knowledge/upload`
 - `POST /knowledge/search`
 - `DELETE /knowledge/documents/{document_id}`
 
 知识库上传和删除要求 `knowledge:write`；查询和检索只要求项目读取权限。
+
+`POST /workflow/run` 需要唯一 `request_id`。同一项目存在 `RUNNING/PAUSED` 工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。
+
+## Token 钱包
+
+- `GET /billing/wallet`：余额、价格和最近流水。
+- `POST /billing/recharge`：模拟充值，按配置比例换取 AI Token，要求唯一 `request_id`。
+- `GET /billing/orders`：模拟充值单。
+- `POST /billing/admin/adjust`：管理员增减 Token。
+
+默认新用户 1,000 Token、聊天 10 Token、完整工作流 100 Token、1 元模拟充值兑换 100 Token，均可通过环境变量调整。
 
 ## 其他
 
@@ -67,3 +82,5 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `GET /settings`：仅管理员。
 - `GET /audit`：仅管理员，支持 `action`、`project_id`、`limit` 过滤。
 - `GET /health`、`GET /health/ready`
+
+Python 服务端管理后台位于 `/admin`，使用独立管理员 Cookie 和 CSRF 校验，不属于 `/api/v1`。

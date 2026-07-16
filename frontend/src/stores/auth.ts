@@ -36,6 +36,11 @@ export const useAuthStore = defineStore('auth', {
       localStorage.setItem('token', data.access_token)
       localStorage.setItem('user', JSON.stringify(data.user))
     },
+    setTokenBalance(balance: number) {
+      if (!this.user) return
+      this.user.ai_token_balance = balance
+      localStorage.setItem('user', JSON.stringify(this.user))
+    },
     async logout() {
       try {
         await api.post('/auth/logout')

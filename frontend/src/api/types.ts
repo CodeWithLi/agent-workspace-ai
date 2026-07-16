@@ -5,6 +5,7 @@ export interface User {
   role: 'admin' | 'member'
   is_active: boolean
   permissions: string
+  ai_token_balance: number
   created_at: string
 }
 
@@ -46,6 +47,7 @@ export interface Agent {
   memory_enable: boolean
   knowledge_access: boolean
   human_approval_required: boolean
+  concurrency_limit: number
 }
 
 export interface AgentTool {
@@ -196,4 +198,44 @@ export interface AuditLog {
   details: string
   ip_address: string
   created_at: string
+}
+
+export interface TokenTransaction {
+  id: number
+  user_id: number
+  amount: number
+  balance_after: number
+  transaction_type: string
+  reference_type: string
+  reference_id: string
+  description: string
+  created_at: string
+}
+
+export interface Wallet {
+  balance: number
+  chat_cost: number
+  workflow_cost: number
+  recharge_tokens_per_yuan: number
+  fake_recharge: boolean
+  transactions: TokenTransaction[]
+}
+
+export interface RechargeOrder {
+  id: number
+  order_no: string
+  user_id: number
+  amount_cents: number
+  token_amount: number
+  status: string
+  created_at: string
+  paid_at?: string | null
+}
+
+export interface WorkflowRun {
+  workflow_id: number
+  project_id: number
+  status: string
+  current_node: string
+  state: Record<string, unknown>
 }

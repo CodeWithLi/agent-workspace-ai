@@ -116,6 +116,77 @@ body {
   gap: 10px;
 }
 
+.token-balance {
+  min-width: 78px;
+}
+
+.wallet-balance {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 24px;
+  color: #fff;
+  background: #17324d;
+  border-radius: 8px;
+}
+
+.wallet-balance span,
+.wallet-balance dt {
+  color: #bfd0e1;
+}
+
+.wallet-balance strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 38px;
+}
+
+.wallet-balance dl {
+  display: flex;
+  gap: 30px;
+  margin: 0;
+}
+
+.wallet-balance dd {
+  margin: 8px 0 0;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.section-band {
+  margin-top: 26px;
+}
+
+.recharge-options {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.recharge-options button {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid #d8e2ec;
+  border-radius: 8px;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.recharge-options button.active {
+  border-color: #2d6cdf;
+  background: #eef5ff;
+}
+
+.recharge-options span {
+  color: #657386;
+}
+
+.token-in { color: #18794e; }
+.token-out { color: #b42318; }
+
 .muted {
   margin-left: 10px;
   color: #6b7785;
@@ -311,6 +382,22 @@ h3 {
 .report-panel pre {
   white-space: pre-wrap;
   overflow: auto;
+}
+
+.workflow-steps-scroll {
+  margin: 18px 0;
+  overflow-x: auto;
+}
+
+.workflow-steps {
+  min-width: 680px;
+}
+
+.workflow-documents .markdown-body,
+.workflow-output .markdown-body {
+  max-height: 560px;
+  overflow: auto;
+  padding-right: 8px;
 }
 
 .login-page {
@@ -632,6 +719,20 @@ h3 {
 
   .top-actions .quick-create {
     display: none;
+  }
+
+  .token-balance {
+    min-width: 62px;
+    padding: 8px;
+  }
+
+  .wallet-balance,
+  .wallet-balance dl {
+    flex-direction: column;
+  }
+
+  .recharge-options {
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .logout-button {

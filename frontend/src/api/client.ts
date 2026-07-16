@@ -2,10 +2,10 @@ import axios, { type InternalAxiosRequestConfig } from 'axios'
 import type { TokenResponse } from './types'
 
 
-const baseURL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
+export const apiBaseURL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 
 export const api = axios.create({
-  baseURL,
+  baseURL: apiBaseURL,
   withCredentials: true
 })
 
@@ -19,7 +19,7 @@ function persistSession(data: TokenResponse) {
 export async function refreshAccessToken(): Promise<string> {
   if (!refreshPromise) {
     refreshPromise = axios
-      .post<TokenResponse>(`${baseURL}/auth/refresh`, {}, { withCredentials: true })
+      .post<TokenResponse>(`${apiBaseURL}/auth/refresh`, {}, { withCredentials: true })
       .then(({ data }) => {
         persistSession(data)
         return data.access_token

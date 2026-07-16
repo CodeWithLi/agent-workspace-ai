@@ -21,6 +21,8 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
         statements.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT true")
     if "permissions" not in user_columns:
         statements.append("ALTER TABLE users ADD COLUMN permissions TEXT DEFAULT ''")
+    if "ai_token_balance" not in user_columns:
+        statements.append("ALTER TABLE users ADD COLUMN ai_token_balance INTEGER DEFAULT 1000")
 
     tool_columns = columns("agent_tools")
     if "allowed_roles" not in tool_columns:
@@ -29,6 +31,13 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     agent_columns = columns("agents")
     if "human_approval_required" not in agent_columns:
         statements.append("ALTER TABLE agents ADD COLUMN human_approval_required BOOLEAN DEFAULT false")
+    if "concurrency_limit" not in agent_columns:
+        statements.append("ALTER TABLE agents ADD COLUMN concurrency_limit INTEGER DEFAULT 4")
+
+    workflow_columns = columns("workflow_runs")
+    if "workflow_runs" in tables and "request_id" not in workflow_columns:
+        statements.append("ALTER TABLE workflow_runs ADD COLUMN request_id VARCHAR(64)")
+        statements.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_workflow_runs_request_id ON workflow_runs(request_id)")
 
     notification_columns = columns("notifications")
     notification_additions = {
@@ -67,6 +76,21 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
             statements.append(
                 "INSERT INTO project_members (project_id, user_id, role) "
                 "SELECT id, owner_id, 'owner' FROM projects ON CONFLICT (project_id, user_id) DO NOTHING"
+            )
+
+    if "token_transactions" in tables:
+        if dialect == "sqlite":
+            statements.append(
+                "INSERT OR IGNORE INTO token_transactions "
+                "(user_id, amount, balance_after, transaction_type, reference_type, reference_id, idempotency_key, description) "
+                "SELECT id, ai_token_balance, ai_token_balance, 'WELCOME', '', '', 'welcome:' || id, '存量用户赠送' FROM users"
+            )
+        else:
+            statements.append(
+                "INSERT INTO token_transactions "
+                "(user_id, amount, balance_after, transaction_type, reference_type, reference_id, idempotency_key, description) "
+                "SELECT id, ai_token_balance, ai_token_balance, 'WELCOME', '', '', 'welcome:' || CAST(id AS VARCHAR), '存量用户赠送' "
+                "FROM users ON CONFLICT (idempotency_key) DO NOTHING"
             )
 
     if "requirements" not in tables:

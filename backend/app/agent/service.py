@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.registry import DEFAULT_AGENTS
 from app.agent.router import RouteDecision, route_agent
+from app.agent.concurrency import AgentLease
 from app.core.llm import get_llm
 from app.core.audit import record_audit
 from app.core.database import SessionLocal
@@ -14,6 +15,7 @@ from app.core.memory import get_user_preferences, load_project_memory, save_proj
 from app.models import Agent, AgentAction, AgentTool, Conversation, Message, Project, User
 from app.rag.service import search_knowledge
 from app.tools.registry import allowed_tools_for_role, run_tool
+from app.services.agent_runs import complete_agent_run, fail_agent_run
 
 
 logger = logging.getLogger(__name__)
@@ -300,36 +302,63 @@ async def stream_chat_events(
     project_id: int | None,
     conversation_id: int | None,
     route_reason: str,
+    run_id: int,
+    billing_transaction_id: int | None,
+    lease: AgentLease,
 ) -> AsyncGenerator[str, None]:
-    with SessionLocal() as db:
-        user = db.get(User, user_id)
-        agent = db.get(Agent, agent_id)
-        project = db.get(Project, project_id) if project_id else None
-        if not user or not user.is_active or not agent or (project_id and not project):
-            payload = {"content": "会话上下文已失效，请刷新后重试。"}
-            yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            return
+    try:
+        with SessionLocal() as db:
+            user = db.get(User, user_id)
+            agent = db.get(Agent, agent_id)
+            project = db.get(Project, project_id) if project_id else None
+            if not user or not user.is_active or not agent or (project_id and not project):
+                fail_agent_run(db, run_id, billing_transaction_id, "Conversation context is no longer available")
+                payload = {"content": "会话上下文已失效，请刷新后重试。"}
+                yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                return
 
-        conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
-            db, user, agent, message, project, conversation_id, route_reason
-        )
-        yield f"event: thinking\ndata: {json.dumps({'content': thinking}, ensure_ascii=False)}\n\n"
-        for call in tool_calls:
-            yield f"event: tool\ndata: {json.dumps(call, ensure_ascii=False, default=str)}\n\n"
+            try:
+                conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
+                    db, user, agent, message, project, conversation_id, route_reason
+                )
+            except Exception as exc:
+                db.rollback()
+                fail_agent_run(db, run_id, billing_transaction_id, str(exc))
+                logger.exception("Streaming chat preparation failed: %s", exc)
+                payload = {"content": "会话准备失败，请刷新后重试。"}
+                yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                return
+            yield f"event: thinking\ndata: {json.dumps({'content': thinking}, ensure_ascii=False)}\n\n"
+            for call in tool_calls:
+                yield f"event: tool\ndata: {json.dumps(call, ensure_ascii=False, default=str)}\n\n"
 
-        parts: list[str] = []
-        try:
-            async for token in get_llm().stream(system_prompt, prompt, agent.model):
-                parts.append(token)
-                yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            db.rollback()
-            logger.exception("Streaming chat failed: %s", exc)
-            payload = {"content": "模型服务暂时不可用，请稍后重试。"}
-            yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            return
+            parts: list[str] = []
+            try:
+                async for token in get_llm().stream(system_prompt, prompt, agent.model):
+                    parts.append(token)
+                    yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                db.rollback()
+                fail_agent_run(db, run_id, billing_transaction_id, str(exc))
+                logger.exception("Streaming chat failed: %s", exc)
+                payload = {"content": "模型服务暂时不可用，请稍后重试。"}
+                yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                return
 
-        answer = "".join(parts)
-        _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
-        done = {"conversation_id": conversation.id, "agent_id": agent.id, "agent_name": agent.name}
-        yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
+            answer = "".join(parts)
+            _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
+            complete_agent_run(db, run_id, conversation.id)
+            db.refresh(user)
+            done = {
+                "conversation_id": conversation.id,
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "token_balance": user.ai_token_balance,
+            }
+            yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
+    except BaseException as exc:
+        with SessionLocal() as recovery_db:
+            fail_agent_run(recovery_db, run_id, billing_transaction_id, str(exc) or type(exc).__name__)
+        raise
+    finally:
+        await lease.release()

@@ -1,10 +1,11 @@
 from fastapi import APIRouter
 
-from app.api.routes import agents, audit, auth, dashboard, knowledge, meetings, notifications, projects, reports, requirements, search, settings, users, workflow
+from app.api.routes import agents, audit, auth, billing, dashboard, knowledge, meetings, notifications, projects, reports, requirements, search, settings, users, workflow
 
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(billing.router, prefix="/billing", tags=["billing"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])

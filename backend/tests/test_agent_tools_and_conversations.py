@@ -11,7 +11,7 @@ from app.agent.service import (
     stream_chat_events,
 )
 from app.agent import service as agent_service
-from app.models import Agent, AgentRole, Conversation, Project, Task, User, UserRole
+from app.models import Agent, AgentRole, AgentRun, Conversation, Project, Task, User, UserRole
 
 
 def create_user(db: Session, email: str = "owner@example.com") -> User:
@@ -97,11 +97,35 @@ async def test_stream_owns_database_session(db: Session, monkeypatch: pytest.Mon
     monkeypatch.setattr(agent_service, "SessionLocal", sessionmaker(bind=db.get_bind()))
     monkeypatch.setattr(agent_service, "get_llm", lambda: FakeLLM())
 
+    run = AgentRun(request_id="stream-request", user_id=user.id, project_id=project.id, agent_id=agent.id)
+    db.add(run)
+    db.commit()
+
+    class FakeLease:
+        released = False
+
+        async def release(self):
+            self.released = True
+
+    lease = FakeLease()
+
     events = [
         event
-        async for event in stream_chat_events(user.id, agent.id, "生成测试方案", project.id, None, "explicit")
+        async for event in stream_chat_events(
+            user.id,
+            agent.id,
+            "生成测试方案",
+            project.id,
+            None,
+            "explicit",
+            run.id,
+            None,
+            lease,
+        )
     ]
     assert any("event: token" in event and "streamed answer" in event for event in events)
     assert any("event: done" in event for event in events)
     db.expire_all()
     assert db.scalar(select(func.count(Conversation.id))) == 1
+    assert db.get(AgentRun, run.id).status == "COMPLETED"
+    assert lease.released is True

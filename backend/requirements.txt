@@ -21,3 +21,4 @@ langgraph==0.5.2
 pypdf==5.8.0
 python-docx==1.2.0
 markdown==3.8.2
+Jinja2==3.1.6

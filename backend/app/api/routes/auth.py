@@ -16,7 +16,7 @@ from app.core.security import (
     hash_refresh_token,
     verify_password,
 )
-from app.models import User, UserRole, UserSession
+from app.models import TokenTransaction, User, UserRole, UserSession
 from app.schemas import TokenOut, UserCreate, UserLogin
 
 
@@ -88,9 +88,21 @@ def register(payload: UserCreate, request: Request, response: Response, db: Sess
         password_hash=hash_password(payload.password),
         role=role,
         permissions="agents:read,projects:write,knowledge:write",
+        ai_token_balance=settings.welcome_ai_tokens,
     )
     db.add(user)
     db.flush()
+    if settings.welcome_ai_tokens:
+        db.add(
+            TokenTransaction(
+                user_id=user.id,
+                amount=settings.welcome_ai_tokens,
+                balance_after=settings.welcome_ai_tokens,
+                transaction_type="WELCOME",
+                idempotency_key=f"welcome:{user.id}",
+                description="新用户赠送",
+            )
+        )
     token = issue_session(db, user, request, response)
     record_audit(db, "auth.register", user_id=user.id, resource_type="user", resource_id=user.id, request=request)
     db.commit()

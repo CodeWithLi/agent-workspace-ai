@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = Field(default=30, ge=1, le=180)
     refresh_cookie_name: str = "agent_workspace_refresh"
+    admin_cookie_name: str = "agent_workspace_admin"
     allow_registration: bool = True
     first_superuser_email: str | None = None
     registration_email_domains: list[str] = []
@@ -56,6 +57,14 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_from_email: str | None = None
     smtp_starttls: bool = True
+
+    welcome_ai_tokens: int = Field(default=1000, ge=0, le=1_000_000)
+    chat_token_cost: int = Field(default=10, ge=1, le=10_000)
+    workflow_token_cost: int = Field(default=100, ge=1, le=100_000)
+    recharge_tokens_per_yuan: int = Field(default=100, ge=1, le=100_000)
+    agent_concurrency_acquire_timeout: float = Field(default=3.0, ge=0.1, le=30.0)
+    agent_concurrency_lease_seconds: int = Field(default=180, ge=30, le=900)
+    agent_run_stale_minutes: int = Field(default=15, ge=5, le=1440)
 
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 

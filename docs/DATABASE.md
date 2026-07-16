@@ -6,14 +6,16 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 
 - `users`、`user_sessions`：用户、角色、权限、refresh 会话与撤销状态。
 - `projects`、`project_members`：项目与 `owner/editor/viewer` 成员授权。
-- `agents`、`agent_tools`：AI 员工定义、人工审批策略和运行时工具白名单。
+- `agents`、`agent_tools`：AI 员工定义、人工审批、并发上限和运行时工具白名单。
 - `agent_actions`：待审批工具输入、执行结果、决策人和决策时间；状态为 `PENDING/EXECUTED/REJECTED`。
+- `agent_runs`：带唯一请求 ID 的 Agent 执行、计费引用、状态、耗时和错误。
 - `conversations`、`messages`：用户隔离的连续会话、工具调用和执行说明。
 - `tasks`、`requirements`：任务状态和需求分析。
 - `documents`、`embeddings`：对象元数据、文本块、Milvus ID 和降级向量。
 - `meetings`、`reports`、`notifications`：协作产物；通知记录接收者、调度时间、投递锁、重试和错误。
 - `memory`：项目/Agent 长期记忆和单条滚动摘要。
 - `workflow_runs`：LangGraph 状态快照、暂停和继续。
+- `token_transactions`、`recharge_orders`：余额变更账本与模拟充值单；余额通过条件更新防止并发透支。
 - `audit_logs`：认证、权限、Agent 工具、文档和工作流关键动作。
 
 ## 迁移

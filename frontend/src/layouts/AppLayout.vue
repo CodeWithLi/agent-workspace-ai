@@ -31,6 +31,10 @@
           <el-icon><Files /></el-icon>
           <span>知识库</span>
         </el-menu-item>
+        <el-menu-item index="/wallet">
+          <el-icon><Coin /></el-icon>
+          <span>Token 钱包</span>
+        </el-menu-item>
         <el-menu-item v-if="auth.hasPermission('projects:write')" index="/meetings">
           <el-icon><Notebook /></el-icon>
           <span>会议中心</span>
@@ -71,8 +75,9 @@
           </div>
         </div>
         <div class="top-actions">
-          <el-button class="quick-create" :icon="Plus" @click="router.push('/requirements')">创建需求</el-button>
-          <el-button :icon="Bell" circle title="通知中心" @click="router.push('/notifications')" />
+          <el-button v-if="auth.hasPermission('projects:write')" class="quick-create" :icon="Plus" @click="router.push('/requirements')">创建需求</el-button>
+          <el-button class="token-balance" :icon="Coin" title="AI Token 钱包" @click="router.push('/wallet')">{{ auth.user?.ai_token_balance ?? 0 }}</el-button>
+          <el-button v-if="auth.hasPermission('projects:write')" :icon="Bell" circle title="通知中心" @click="router.push('/notifications')" />
           <el-avatar>{{ auth.user?.name?.slice(0, 1) || '我' }}</el-avatar>
           <el-button class="logout-button" :icon="SwitchButton" title="退出" @click="logout">退出</el-button>
         </div>
@@ -85,7 +90,7 @@
 </template>
 
 <script setup lang="ts">
-import { Bell, ChatDotRound, Document, Files, Folder, List, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User, UserFilled } from '@element-plus/icons-vue'
+import { Bell, ChatDotRound, Coin, Document, Files, Folder, List, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User, UserFilled } from '@element-plus/icons-vue'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'

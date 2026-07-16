@@ -5,6 +5,7 @@
         <h2>系统设置</h2>
         <p>查看当前 LLM Gateway、Embedding、Milvus 配置。</p>
       </div>
+      <el-button type="primary" @click="openPythonAdmin">打开 Python 管理后台</el-button>
     </div>
     <el-descriptions v-if="setting" :column="1" border>
       <el-descriptions-item label="Provider">{{ setting.provider }}</el-descriptions-item>
@@ -25,6 +26,10 @@ import { api } from '../api/client'
 import type { SystemSetting } from '../api/types'
 
 const setting = ref<SystemSetting>()
+
+function openPythonAdmin() {
+  window.location.assign('/admin')
+}
 
 onMounted(async () => {
   const { data } = await api.get<SystemSetting>('/settings')

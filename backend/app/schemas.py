@@ -33,6 +33,7 @@ class UserOut(BaseModel):
     role: UserRole
     is_active: bool
     permissions: str
+    ai_token_balance: int
     created_at: datetime
 
 
@@ -166,6 +167,7 @@ class AgentOut(BaseModel):
     memory_enable: bool
     knowledge_access: bool
     human_approval_required: bool
+    concurrency_limit: int
 
 
 class AgentUpdate(BaseModel):
@@ -175,6 +177,7 @@ class AgentUpdate(BaseModel):
     memory_enable: bool
     knowledge_access: bool
     human_approval_required: bool
+    concurrency_limit: int = Field(ge=1, le=100)
 
 
 class AgentToolOut(BaseModel):
@@ -210,11 +213,15 @@ class AgentActionOut(BaseModel):
     decided_at: datetime | None
 
 
-class ChatRequest(BaseModel):
+class AgentRouteRequest(BaseModel):
     agent_id: int | None = None
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=12000)
     project_id: int | None = None
     conversation_id: int | None = None
+
+
+class ChatRequest(AgentRouteRequest):
+    request_id: str = Field(min_length=8, max_length=64)
 
 
 class ToolCallOut(BaseModel):
@@ -265,8 +272,9 @@ class AgentRouteResponse(BaseModel):
 
 class WorkflowRequest(BaseModel):
     project_id: int
-    user_input: str = Field(min_length=1)
+    user_input: str = Field(min_length=1, max_length=20000)
     pause_before_report: bool = True
+    request_id: str = Field(min_length=8, max_length=64)
 
 
 class WorkflowContinueRequest(BaseModel):
@@ -295,7 +303,7 @@ class KnowledgeDocumentOut(BaseModel):
 
 
 class KnowledgeSearchRequest(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=2000)
     project_id: int | None = None
     top_k: int = Field(default=5, ge=1, le=20)
     min_score: float = Field(default=0.2, ge=0.0, le=1.0)
@@ -406,3 +414,51 @@ class AuditLogOut(BaseModel):
     details: str
     ip_address: str
     created_at: datetime
+
+
+class TokenTransactionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    amount: int
+    balance_after: int
+    transaction_type: str
+    reference_type: str
+    reference_id: str
+    description: str
+    created_at: datetime
+
+
+class RechargeOrderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_no: str
+    user_id: int
+    amount_cents: int
+    token_amount: int
+    status: str
+    created_at: datetime
+    paid_at: datetime | None
+
+
+class WalletOut(BaseModel):
+    balance: int
+    chat_cost: int
+    workflow_cost: int
+    recharge_tokens_per_yuan: int
+    fake_recharge: bool = True
+    transactions: list[TokenTransactionOut]
+
+
+class RechargeRequest(BaseModel):
+    amount_yuan: int = Field(ge=1, le=10_000)
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class AdminTokenAdjustment(BaseModel):
+    user_id: int
+    amount: int = Field(ge=-1_000_000, le=1_000_000)
+    reason: str = Field(min_length=2, max_length=300)
+    request_id: str = Field(min_length=8, max_length=64)

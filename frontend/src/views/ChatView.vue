@@ -70,12 +70,14 @@
 
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { Check, Close, Plus, Promotion } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
-import { api, refreshAccessToken } from '../api/client'
+import { api, apiBaseURL, refreshAccessToken } from '../api/client'
 import type { Agent, AgentAction, ChatMessage, Conversation, Project } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
+import { useAuthStore } from '../stores/auth'
 
 const agents = ref<Agent[]>([])
 const projects = ref<Project[]>([])
@@ -92,6 +94,8 @@ const toolCalls = ref<Record<string, unknown>[]>([])
 const decidingActionId = ref<number | null>(null)
 const messagePane = ref<HTMLElement | null>(null)
 const suppressProjectWatch = ref(false)
+const auth = useAuthStore()
+const router = useRouter()
 
 async function loadBaseData() {
   const [agentResponse, projectResponse] = await Promise.all([
@@ -146,6 +150,7 @@ async function scrollToBottom() {
 async function send() {
   if (!input.value.trim() || sending.value) return
   const content = input.value.trim()
+  const requestId = crypto.randomUUID()
   messages.value.push({ role: 'user', content })
   const target: ChatMessage = { role: 'assistant', content: '' }
   messages.value.push(target)
@@ -155,10 +160,10 @@ async function send() {
   sending.value = true
   await scrollToBottom()
   try {
-    let response = await streamRequest(content)
+    let response = await streamRequest(content, requestId)
     if (response.status === 401) {
       await refreshAccessToken()
-      response = await streamRequest(content)
+      response = await streamRequest(content, requestId)
     }
     if (!response.ok) {
       const body = await response.json().catch(() => ({}))
@@ -189,6 +194,7 @@ async function send() {
           conversationId.value = data.conversation_id
           activeAgentName.value = data.agent_name
           selectedAgent.value = agents.value.find((item) => item.id === data.agent_id) || selectedAgent.value
+          if (typeof data.token_balance === 'number') auth.setTokenBalance(data.token_balance)
         }
         if (type === 'error') throw new Error(data.content || '模型服务暂时不可用')
       }
@@ -197,14 +203,16 @@ async function send() {
     await loadConversations()
   } catch (error) {
     target.content = target.content || '本次请求未完成。'
-    ElMessage.error(error instanceof Error ? error.message : '发送失败')
+    const message = error instanceof Error ? error.message : '发送失败'
+    ElMessage.error(message)
+    if (message.includes('Insufficient AI Token')) await router.push('/wallet')
   } finally {
     sending.value = false
   }
 }
 
-function streamRequest(content: string) {
-  return fetch('/api/v1/agents/chat/stream', {
+function streamRequest(content: string, requestId: string) {
+  return fetch(`${apiBaseURL}/agents/chat/stream`, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -215,7 +223,8 @@ function streamRequest(content: string) {
         agent_id: selectedAgent.value?.id,
         message: content,
         project_id: selectedProjectId.value,
-        conversation_id: conversationId.value
+        conversation_id: conversationId.value,
+        request_id: requestId
       })
     })
 }
