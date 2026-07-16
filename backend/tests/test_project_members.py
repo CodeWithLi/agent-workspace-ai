@@ -7,7 +7,13 @@ from app.models import Project, ProjectMember, ProjectMemberRole, User, UserRole
 
 
 def make_user(db: Session, email: str) -> User:
-    user = User(email=email, name=email.split("@")[0], password_hash="hash", role=UserRole.member)
+    user = User(
+        email=email,
+        name=email.split("@")[0],
+        password_hash="hash",
+        role=UserRole.member,
+        permissions="projects:write",
+    )
     db.add(user)
     db.flush()
     return user
@@ -40,3 +46,9 @@ def test_project_membership_enforces_read_and_write_roles(db: Session) -> None:
     with pytest.raises(HTTPException) as outsider_error:
         get_project_for_user(project.id, outsider, db)
     assert outsider_error.value.status_code == 404
+
+    editor.permissions = ""
+    with pytest.raises(HTTPException) as permission_error:
+        get_project_for_user(project.id, editor, db, write=True)
+    assert permission_error.value.status_code == 403
+    assert permission_error.value.detail == "Permission required: projects:write"

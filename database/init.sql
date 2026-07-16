@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS agents (
     tools VARCHAR(500) DEFAULT '',
     memory_enable BOOLEAN DEFAULT true,
     knowledge_access BOOLEAN DEFAULT true,
+    human_approval_required BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -86,6 +87,27 @@ CREATE TABLE IF NOT EXISTS conversations (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    tool_name VARCHAR(100) NOT NULL,
+    input_json TEXT DEFAULT '{}',
+    result_json TEXT DEFAULT '{}',
+    status VARCHAR(30) DEFAULT 'PENDING',
+    approved_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    decided_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_actions_user_id ON agent_actions(user_id);
+CREATE INDEX IF NOT EXISTS ix_agent_actions_project_id ON agent_actions(project_id);
+CREATE INDEX IF NOT EXISTS ix_agent_actions_agent_id ON agent_actions(agent_id);
+CREATE INDEX IF NOT EXISTS ix_agent_actions_conversation_id ON agent_actions(conversation_id);
+CREATE INDEX IF NOT EXISTS ix_agent_actions_status ON agent_actions(status);
 
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
@@ -159,13 +181,23 @@ CREATE TABLE IF NOT EXISTS notifications (
     id SERIAL PRIMARY KEY,
     project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    recipient_email VARCHAR(255) DEFAULT '',
     title VARCHAR(200) NOT NULL,
     content TEXT NOT NULL,
     channel VARCHAR(50) DEFAULT 'email',
     schedule_at VARCHAR(50) DEFAULT '',
+    scheduled_for TIMESTAMPTZ,
     status VARCHAR(30) DEFAULT 'DRAFT',
+    attempts INTEGER DEFAULT 0,
+    locked_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    last_error TEXT DEFAULT '',
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS ix_notifications_recipient_user_id ON notifications(recipient_user_id);
+CREATE INDEX IF NOT EXISTS ix_notifications_scheduled_for ON notifications(scheduled_for);
 
 CREATE TABLE IF NOT EXISTS memory (
     id SERIAL PRIMARY KEY,

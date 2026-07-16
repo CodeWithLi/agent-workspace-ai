@@ -30,13 +30,17 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def ensure_permission(current_user: User, permission: str) -> None:
+    if current_user.role == UserRole.admin:
+        return
+    permissions = {item.strip() for item in current_user.permissions.split(",") if item.strip()}
+    if permission not in permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission required: {permission}")
+
+
 def require_permission(permission: str):
     def checker(current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role == UserRole.admin:
-            return current_user
-        permissions = {item.strip() for item in current_user.permissions.split(",") if item.strip()}
-        if permission not in permissions:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission required: {permission}")
+        ensure_permission(current_user, permission)
         return current_user
 
     return checker

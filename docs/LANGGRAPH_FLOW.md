@@ -1,27 +1,5 @@
 # LangGraph 流程
 
-## State
+本文件是兼容入口，权威设计见 [LANGGRAPH.md](LANGGRAPH.md)。
 
-```json
-{
-  "user_input": "",
-  "project_info": {},
-  "tasks": [],
-  "documents": [],
-  "messages": []
-}
-```
-
-## 工作流
-
-1. 用户需求输入
-2. 需求分析节点
-3. 产品经理 Agent
-4. 架构师 Agent
-5. 项目经理 Agent
-6. 测试 Agent
-7. 生成项目报告
-
-实现位置：`backend/app/langgraph/workflow.py`。
-
-系统优先使用 LangGraph `StateGraph`，当依赖不可用时降级为顺序执行，保证本地开发可运行。
+真实执行链为：Requirement → Product → Architect → Project Manager → Tester → 人工确认 → Report。实现使用 LangGraph `StateGraph`，状态持久化到 PostgreSQL，可在报告节点前暂停并通过 API 继续。

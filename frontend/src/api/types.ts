@@ -45,6 +45,7 @@ export interface Agent {
   tools: string
   memory_enable: boolean
   knowledge_access: boolean
+  human_approval_required: boolean
 }
 
 export interface AgentTool {
@@ -54,6 +55,21 @@ export interface AgentTool {
   description: string
   enabled: boolean
   allowed_roles: string
+}
+
+export interface AgentAction {
+  id: number
+  user_id: number
+  project_id?: number | null
+  agent_id: number
+  conversation_id?: number | null
+  tool_name: string
+  input_json: string
+  result_json: string
+  status: 'PENDING' | 'EXECUTED' | 'REJECTED'
+  approved_by_user_id?: number | null
+  created_at: string
+  decided_at?: string | null
 }
 
 export interface Conversation {
@@ -132,7 +148,13 @@ export interface NotificationItem {
   content: string
   channel: string
   schedule_at: string
+  recipient_user_id?: number | null
+  recipient_email: string
+  scheduled_for?: string | null
   status: string
+  attempts: number
+  sent_at?: string | null
+  last_error: string
   created_at: string
 }
 

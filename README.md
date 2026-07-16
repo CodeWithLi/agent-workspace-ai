@@ -1,6 +1,6 @@
 # Agent Workspace AI
 
-企业级 AI 数字员工项目协作平台。支持真实项目成员权限、8 类 AI 员工、连续会话、工具执行、多 Agent 工作流、混合 RAG、任务、会议、报告和审计日志。
+企业级 AI 数字员工项目协作平台。支持真实项目成员权限、8 类 AI 员工、连续会话、可审批工具执行、多 Agent 工作流、混合 RAG、任务、会议、通知、报告和审计日志。
 
 ## 技术栈
 
@@ -36,14 +36,15 @@ EMBEDDING_MODEL=embedding-3
 ## 关键设计
 
 - 认证：30 分钟 JWT access token；HttpOnly refresh cookie；服务端会话轮换、撤销和审计。
-- 项目协作：`owner/editor/viewer` 权限；项目级任务、Agent、工作流和知识库统一鉴权。
+- 项目协作：`owner/editor/viewer` 项目角色叠加 `agents:read/projects:write/knowledge:write` 全局权限。
 - Agent 路由：显式选择优先；明确角色名优先；加权意图匹配；会话开始后固定角色，防止漂移。
-- 工具安全：代码硬白名单与数据库白名单取交集；禁用工具不会配置回退；写工具要求明确动作意图。
+- 工具安全：代码硬白名单与数据库白名单取交集；禁用工具不会配置回退；写工具要求明确动作意图，敏感 Agent 的任务写入先生成幂等审批单。
 - Memory：短期上下文有字符预算；项目记忆固定窗口；每个项目/Agent 仅一条滚动摘要。
 - RAG：BM25 风格稀疏检索 + embedding dense 检索 + Milvus ANN + 排名融合 + 阈值过滤 + 引用。
 - 存储：MinIO 对象生命周期；开发可显式回退本地；删除文档同步清理对象和 Milvus 数据。
 - 数据库：Alembic 静态基线迁移；Docker 启动 API 前自动执行 `alembic upgrade head`。
 - 可观测性：健康/就绪探针、安全响应头、结构化日志、管理员审计日志。
+- 通知：站内通知和 SMTP 邮件异步投递、定时发送、失败重试、锁超时恢复和取消。
 
 ## 本地开发
 

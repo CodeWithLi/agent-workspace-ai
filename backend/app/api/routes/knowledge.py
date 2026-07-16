@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import ensure_permission, get_current_user
 from app.api.routes.projects import get_project_for_user
 from app.core.database import get_db
 from app.core.audit import record_audit
@@ -36,6 +36,7 @@ async def upload_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> KnowledgeDocument:
+    ensure_permission(current_user, "knowledge:write")
     if project_id:
         get_project_for_user(project_id, current_user, db, write=True)
     try:
@@ -73,6 +74,7 @@ def delete_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
+    ensure_permission(current_user, "knowledge:write")
     document = db.get(KnowledgeDocument, document_id)
     if not document or document.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")

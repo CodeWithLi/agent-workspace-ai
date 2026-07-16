@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -45,10 +46,13 @@ async def continue_workflow(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> WorkflowResponse:
-    workflow = db.get(WorkflowRun, payload.workflow_id)
+    workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.id == payload.workflow_id).with_for_update())
     if not workflow or workflow.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
-    workflow = await continue_workspace_graph(db, workflow, payload.human_feedback)
+    try:
+        workflow = await continue_workspace_graph(db, workflow, payload.human_feedback)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     record_audit(db, "workflow.continue", current_user.id, workflow.project_id, "workflow", workflow.id, {"status": workflow.status.value}, request)
     db.commit()
     return to_response(workflow)

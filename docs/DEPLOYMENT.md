@@ -24,9 +24,16 @@ LLM_API_KEY=...
 LLM_FALLBACK_ENABLED=false
 STORAGE_FALLBACK_ENABLED=false
 EMBEDDING_API_KEY=...
+SMTP_HOST=smtp.company.com
+SMTP_PORT=587
+SMTP_USERNAME=...
+SMTP_PASSWORD=...
+SMTP_FROM_EMAIL=ai@company.com
 ```
 
 生产配置不满足上述安全约束时，应用会拒绝启动。refresh token 仅写入 `HttpOnly + Secure + SameSite=Lax` cookie，access token 默认 30 分钟，refresh 会话默认 30 天且每次刷新轮换。
+
+通知 worker 默认随 API 进程启动。多副本通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 争抢任务；邮件失败按指数退避重试。生产环境必须配置 SMTP，并监控 `notification.failed` 审计事件。
 
 ## 发布检查
 

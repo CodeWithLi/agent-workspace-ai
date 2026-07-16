@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     local_upload_dir: str = "storage/uploads"
     max_upload_mb: int = Field(default=25, ge=1, le=200)
 
+    notification_worker_enabled: bool = True
+    notification_poll_seconds: int = Field(default=5, ge=1, le=300)
+    notification_max_attempts: int = Field(default=3, ge=1, le=10)
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from_email: str | None = None
+    smtp_starttls: bool = True
+
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     @model_validator(mode="after")

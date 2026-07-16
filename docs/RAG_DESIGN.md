@@ -1,22 +1,5 @@
-# RAG 知识库设计
+# RAG 设计
 
-## 流程
+本文件是兼容入口，权威设计见 [RAG.md](RAG.md)。
 
-1. 上传文件
-2. Document Loader 解析 PDF、Word、Markdown
-3. Text Splitter 切割文本
-4. Embedding
-5. Milvus 存储
-6. Retriever 检索
-7. LLM 生成回答
-
-## 当前实现
-
-MVP 版本完成上传、解析、切割、数据库持久化和检索增强回答。Docker Compose 已包含 Milvus 与 MinIO 服务。为保证无云密钥环境可运行，当前检索提供本地词法检索降级，后续可将 `KnowledgeChunk.vector_id` 接入真实 Milvus 向量 ID。
-
-## 支持格式
-
-- PDF
-- Word
-- Markdown
-- 纯文本
+生产检索同时执行 BM25 风格稀疏召回、embedding 稠密召回和 Milvus ANN，使用排名融合与轻量 rerank，经过相似度阈值后将 TopK 文本和文档引用交给统一 LLM Gateway。Milvus 或外部 embedding 不可用时可显式使用 PostgreSQL 向量与本地 embedding 降级，但不会伪造引用。

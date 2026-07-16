@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal, engine, init_db
 from app.core.logging import configure_logging
 from app.core.llm import LLMGatewayError
+from app.services.notifications import notification_dispatcher
 
 
 settings = get_settings()
@@ -28,7 +29,11 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         ensure_default_agents(db)
     logger.info("Application started")
-    yield
+    await notification_dispatcher.start()
+    try:
+        yield
+    finally:
+        await notification_dispatcher.stop()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)

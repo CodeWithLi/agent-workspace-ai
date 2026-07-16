@@ -5,7 +5,7 @@
         <h2>工作台</h2>
         <p>管理项目空间和默认 AI 员工。</p>
       </div>
-      <el-button type="primary" :icon="Plus" @click="createDialog = true">新建项目</el-button>
+      <el-button v-if="auth.hasPermission('projects:write')" type="primary" :icon="Plus" @click="createDialog = true">新建项目</el-button>
     </div>
 
     <el-row :gutter="20">
@@ -62,7 +62,7 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, reactive, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus } from '@element-plus/icons-vue'
 import { PieChart } from 'echarts/charts'
@@ -71,21 +71,27 @@ import * as echarts from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { api } from '../api/client'
 import type { Agent, DashboardStats, Project } from '../api/types'
+import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
+const auth = useAuthStore()
 const projects = ref<Project[]>([])
 const agents = ref<Agent[]>([])
 const stats = ref<DashboardStats>()
 const chartEl = ref<HTMLDivElement>()
 const createDialog = ref(false)
 const form = reactive({ name: '', description: '', members: '' })
+let chart: echarts.ECharts | undefined
 
 echarts.use([PieChart, TooltipComponent, CanvasRenderer])
 
 async function load() {
+  const agentRequest = auth.hasPermission('agents:read')
+    ? api.get<Agent[]>('/agents')
+    : Promise.resolve({ data: [] as Agent[] })
   const [projectRes, agentRes, statRes] = await Promise.all([
     api.get<Project[]>('/projects'),
-    api.get<Agent[]>('/agents'),
+    agentRequest,
     api.get<DashboardStats>('/dashboard/stats')
   ])
   projects.value = projectRes.data
@@ -93,7 +99,8 @@ async function load() {
   stats.value = statRes.data
   await nextTick()
   if (chartEl.value) {
-    echarts.init(chartEl.value).setOption({
+    chart ||= echarts.init(chartEl.value)
+    chart.setOption({
       tooltip: {},
       series: [
         {
@@ -106,6 +113,10 @@ async function load() {
   }
 }
 
+function resizeChart() {
+  chart?.resize()
+}
+
 async function createProject() {
   await api.post('/projects', form)
   createDialog.value = false
@@ -115,5 +126,13 @@ async function createProject() {
   await load()
 }
 
-onMounted(load)
+onMounted(() => {
+  window.addEventListener('resize', resizeChart)
+  load()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', resizeChart)
+  chart?.dispose()
+  chart = undefined
+})
 </script>

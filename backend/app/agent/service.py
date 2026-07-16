@@ -9,8 +9,9 @@ from app.agent.registry import DEFAULT_AGENTS
 from app.agent.router import RouteDecision, route_agent
 from app.core.llm import get_llm
 from app.core.audit import record_audit
+from app.core.database import SessionLocal
 from app.core.memory import get_user_preferences, load_project_memory, save_project_memory
-from app.models import Agent, AgentTool, Conversation, Message, Project, User
+from app.models import Agent, AgentAction, AgentTool, Conversation, Message, Project, User
 from app.rag.service import search_knowledge
 from app.tools.registry import allowed_tools_for_role, run_tool
 
@@ -99,7 +100,10 @@ def _available_tools(user: User, agent: Agent) -> set[str]:
         }
     else:
         configured = {name.strip() for name in agent.tools.split(",") if name.strip()}
-    return configured & hard_allowlist
+    available = configured & hard_allowlist
+    if not agent.knowledge_access:
+        available.discard("knowledge_search")
+    return available
 
 
 async def infer_tool_calls(
@@ -108,6 +112,7 @@ async def infer_tool_calls(
     agent: Agent,
     project: Project | None,
     message: str,
+    conversation_id: int | None = None,
 ) -> list[dict]:
     calls: list[dict] = []
     tool_names = _available_tools(user, agent)
@@ -123,8 +128,35 @@ async def infer_tool_calls(
             answer, results = await search_knowledge(db, user, message, project.id if project else None, top_k=5)
             calls.append({"name": name, "input": {"query": message}, "output": {"answer": answer, "results": results}})
         elif name == "task_create" and project:
-            tasks = run_tool(name, db=db, project_id=project.id)
-            output = [{"id": task.id, "title": task.title, "status": task.status.value} for task in tasks]
+            if agent.human_approval_required:
+                input_json = json.dumps({"project_id": project.id}, sort_keys=True)
+                action = db.scalar(
+                    select(AgentAction).where(
+                        AgentAction.user_id == user.id,
+                        AgentAction.project_id == project.id,
+                        AgentAction.agent_id == agent.id,
+                        AgentAction.conversation_id == conversation_id,
+                        AgentAction.tool_name == name,
+                        AgentAction.input_json == input_json,
+                        AgentAction.status == "PENDING",
+                    )
+                )
+                if action is None:
+                    action = AgentAction(
+                        user_id=user.id,
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        conversation_id=conversation_id,
+                        tool_name=name,
+                        input_json=input_json,
+                        status="PENDING",
+                    )
+                    db.add(action)
+                    db.flush()
+                output = {"status": "PENDING_APPROVAL", "action_id": action.id}
+            else:
+                tasks = run_tool(name, db=db, project_id=project.id)
+                output = [{"id": task.id, "title": task.title, "status": task.status.value} for task in tasks]
             calls.append({"name": name, "input": {"project_id": project.id}, "output": output})
         elif name == "requirement_create":
             calls.append({"name": name, "input": {"user_input": message}, "output": run_tool(name, user_input=message)})
@@ -190,7 +222,7 @@ async def _prepare_chat(
         )
     )
     context = _short_term_context(recent_messages)
-    tool_calls = await infer_tool_calls(db, user, agent, project, message)
+    tool_calls = await infer_tool_calls(db, user, agent, project, message, conversation.id)
     tool_context = json.dumps(tool_calls, ensure_ascii=False, default=str)
     thinking = (
         f"路由到：{agent.name}。{route_reason or '用户明确选择'}。"
@@ -262,34 +294,42 @@ async def chat_with_agent(
 
 
 async def stream_chat_events(
-    db: Session,
-    user: User,
-    agent: Agent,
+    user_id: int,
+    agent_id: int,
     message: str,
-    project: Project | None,
+    project_id: int | None,
     conversation_id: int | None,
     route_reason: str,
 ) -> AsyncGenerator[str, None]:
-    conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
-        db, user, agent, message, project, conversation_id, route_reason
-    )
-    yield f"event: thinking\ndata: {json.dumps({'content': thinking}, ensure_ascii=False)}\n\n"
-    for call in tool_calls:
-        yield f"event: tool\ndata: {json.dumps(call, ensure_ascii=False, default=str)}\n\n"
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        agent = db.get(Agent, agent_id)
+        project = db.get(Project, project_id) if project_id else None
+        if not user or not user.is_active or not agent or (project_id and not project):
+            payload = {"content": "会话上下文已失效，请刷新后重试。"}
+            yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            return
 
-    parts: list[str] = []
-    try:
-        async for token in get_llm().stream(system_prompt, prompt, agent.model):
-            parts.append(token)
-            yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
-    except Exception as exc:
-        db.rollback()
-        logger.exception("Streaming chat failed: %s", exc)
-        payload = {"content": "模型服务暂时不可用，请稍后重试。"}
-        yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        return
+        conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
+            db, user, agent, message, project, conversation_id, route_reason
+        )
+        yield f"event: thinking\ndata: {json.dumps({'content': thinking}, ensure_ascii=False)}\n\n"
+        for call in tool_calls:
+            yield f"event: tool\ndata: {json.dumps(call, ensure_ascii=False, default=str)}\n\n"
 
-    answer = "".join(parts)
-    _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
-    done = {"conversation_id": conversation.id, "agent_id": agent.id, "agent_name": agent.name}
-    yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
+        parts: list[str] = []
+        try:
+            async for token in get_llm().stream(system_prompt, prompt, agent.model):
+                parts.append(token)
+                yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Streaming chat failed: %s", exc)
+            payload = {"content": "模型服务暂时不可用，请稍后重试。"}
+            yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            return
+
+        answer = "".join(parts)
+        _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
+        done = {"conversation_id": conversation.id, "agent_id": agent.id, "agent_name": agent.name}
+        yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"

@@ -45,7 +45,19 @@
       <el-collapse v-if="thinking || toolCalls.length" class="trace-panel">
         <el-collapse-item title="执行记录" name="trace">
           <p>{{ thinking }}</p>
-          <pre v-for="(tool, index) in toolCalls" :key="index">{{ JSON.stringify(tool, null, 2) }}</pre>
+          <div v-for="(tool, index) in toolCalls" :key="index" class="tool-trace">
+            <div class="tool-trace-head">
+              <strong>{{ String(tool.name || 'tool') }}</strong>
+              <el-tag v-if="pendingActionId(tool)" :type="pendingActionStatus(tool) === 'PENDING_APPROVAL' ? 'warning' : 'success'" size="small">
+                {{ actionStatusLabel(pendingActionStatus(tool)) }}
+              </el-tag>
+            </div>
+            <pre>{{ JSON.stringify(tool, null, 2) }}</pre>
+            <div v-if="pendingActionId(tool) && pendingActionStatus(tool) === 'PENDING_APPROVAL'" class="inline-actions">
+              <el-button type="primary" :icon="Check" :loading="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'approve')">批准执行</el-button>
+              <el-button :icon="Close" :disabled="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'reject')">拒绝</el-button>
+            </div>
+          </div>
         </el-collapse-item>
       </el-collapse>
       <div class="composer">
@@ -58,11 +70,11 @@
 
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue'
-import { Plus, Promotion } from '@element-plus/icons-vue'
+import { Check, Close, Plus, Promotion } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api, refreshAccessToken } from '../api/client'
-import type { Agent, ChatMessage, Conversation, Project } from '../api/types'
+import type { Agent, AgentAction, ChatMessage, Conversation, Project } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
 
 const agents = ref<Agent[]>([])
@@ -77,6 +89,7 @@ const conversationId = ref<number | null>(null)
 const messages = ref<ChatMessage[]>([])
 const thinking = ref('')
 const toolCalls = ref<Record<string, unknown>[]>([])
+const decidingActionId = ref<number | null>(null)
 const messagePane = ref<HTMLElement | null>(null)
 const suppressProjectWatch = ref(false)
 
@@ -205,6 +218,41 @@ function streamRequest(content: string) {
         conversation_id: conversationId.value
       })
     })
+}
+
+function pendingActionId(tool: Record<string, unknown>) {
+  if (!tool.output || typeof tool.output !== 'object') return null
+  const id = (tool.output as Record<string, unknown>).action_id
+  return typeof id === 'number' ? id : null
+}
+
+function pendingActionStatus(tool: Record<string, unknown>) {
+  if (!tool.output || typeof tool.output !== 'object') return ''
+  return String((tool.output as Record<string, unknown>).status || '')
+}
+
+function actionStatusLabel(value: string) {
+  if (value === 'PENDING_APPROVAL') return '等待人工确认'
+  if (value === 'EXECUTED') return '已执行'
+  if (value === 'REJECTED') return '已拒绝'
+  return value
+}
+
+async function decideAction(tool: Record<string, unknown>, decision: 'approve' | 'reject') {
+  const actionId = pendingActionId(tool)
+  if (!actionId || decidingActionId.value) return
+  decidingActionId.value = actionId
+  try {
+    const { data } = await api.post<AgentAction>(`/agents/actions/${actionId}/${decision}`)
+    tool.output = {
+      ...(tool.output as Record<string, unknown>),
+      status: data.status,
+      result: data.result_json
+    }
+    ElMessage.success(decision === 'approve' ? '操作已批准并执行' : '操作已拒绝')
+  } finally {
+    decidingActionId.value = null
+  }
 }
 
 watch(selectedProjectId, async () => {

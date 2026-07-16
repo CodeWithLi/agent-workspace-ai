@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h2>AI 员工</h2>
-        <p>配置 AI 员工的职责、Prompt、模型、工具权限与是否需要人工确认。</p>
+        <p>查看角色能力、模型、工具权限与执行安全策略。</p>
       </div>
     </div>
 
@@ -13,78 +13,90 @@
           <el-icon><Briefcase /></el-icon>
           <h3>{{ agent.name }}</h3>
         </div>
-        <p>{{ displayDescription(agent) }}</p>
+        <p>{{ agent.description }}</p>
         <div class="employee-meta">
-          <span>模型档位：<strong>{{ modelTier(agent) }}</strong></span>
-          <span>人工确认：<strong>{{ needsApproval(agent) ? '需要' : '不需要' }}</strong></span>
+          <span>模型：<strong>{{ agent.model }}</strong></span>
+          <span>人工确认：<strong>{{ agent.human_approval_required ? '需要' : '不需要' }}</strong></span>
           <span>Memory：<strong>{{ agent.memory_enable ? '启用' : '关闭' }}</strong></span>
         </div>
         <div class="tool-tags">
-          <el-tag v-for="tool in tools(agent)" :key="tool" round>{{ tool }}</el-tag>
+          <el-tag v-for="tool in tools(agent)" :key="tool" size="small">{{ tool }}</el-tag>
         </div>
-        <el-button v-if="auth.user?.role === 'admin'" class="card-action" @click="openTools(agent)">配置工具白名单</el-button>
+        <el-button v-if="auth.user?.role === 'admin'" class="card-action" :icon="Setting" @click="openConfig(agent)">配置</el-button>
       </article>
     </div>
 
-    <el-dialog v-model="toolDialog" :title="`${activeAgent?.name || ''} 工具白名单`" width="620">
-      <el-alert type="info" show-icon :closable="false" title="工具调用会同时经过代码硬白名单和数据库启停白名单校验。" />
-      <el-table :data="agentTools" class="data-table">
-        <el-table-column prop="name" label="工具" min-width="180" />
-        <el-table-column label="允许角色" min-width="180">
-          <template #default="{ row }">
-            <el-input v-model="row.allowed_roles" size="small" @change="updateToolRow(row)" />
-          </template>
-        </el-table-column>
-        <el-table-column label="启用" width="100">
-          <template #default="{ row }">
-            <el-switch v-model="row.enabled" @change="updateToolRow(row)" />
-          </template>
-        </el-table-column>
-      </el-table>
+    <el-dialog v-model="configDialog" :title="`配置 ${activeAgent?.name || ''}`" width="min(720px, calc(100vw - 32px))" top="5vh" class="agent-config-dialog">
+      <el-tabs v-model="activeTab">
+        <el-tab-pane label="角色配置" name="profile">
+          <el-form label-position="top">
+            <el-form-item label="职责说明"><el-input v-model="form.description" type="textarea" :rows="3" maxlength="2000" show-word-limit /></el-form-item>
+            <el-form-item label="System Prompt"><el-input v-model="form.system_prompt" type="textarea" :rows="8" maxlength="12000" show-word-limit /></el-form-item>
+            <el-form-item label="模型"><el-input v-model="form.model" placeholder="glm-4-flash" /></el-form-item>
+            <div class="settings-switches">
+              <el-form-item label="Memory"><el-switch v-model="form.memory_enable" /></el-form-item>
+              <el-form-item label="知识库访问"><el-switch v-model="form.knowledge_access" /></el-form-item>
+              <el-form-item label="写操作人工确认"><el-switch v-model="form.human_approval_required" /></el-form-item>
+            </div>
+          </el-form>
+        </el-tab-pane>
+        <el-tab-pane label="工具权限" name="tools">
+          <el-alert type="info" show-icon :closable="false" title="工具必须同时通过代码硬白名单、数据库启停和用户角色校验。" />
+          <el-table :data="agentTools" class="data-table tool-table">
+            <el-table-column prop="name" label="工具" min-width="190" />
+            <el-table-column label="允许角色" min-width="260">
+              <template #default="{ row }">
+                <el-select v-model="row.allowedRoleValues" multiple :disabled="!row.enabled" @change="updateToolRow(row)">
+                  <el-option label="管理员" value="admin" />
+                  <el-option label="成员" value="member" />
+                </el-select>
+              </template>
+            </el-table-column>
+            <el-table-column label="启用" width="100">
+              <template #default="{ row }"><el-switch v-model="row.enabled" @change="updateToolRow(row)" /></template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+      <template #footer>
+        <el-button @click="configDialog = false">取消</el-button>
+        <el-button type="primary" :loading="saving" :disabled="!form.description.trim() || !form.system_prompt.trim() || !form.model.trim()" @click="saveAgent">保存配置</el-button>
+      </template>
     </el-dialog>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { Briefcase } from '@element-plus/icons-vue'
+import { onMounted, reactive, ref } from 'vue'
+import { Briefcase, Setting } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import type { Agent, AgentTool } from '../api/types'
 
+interface ConfigTool extends AgentTool {
+  allowedRoleValues: string[]
+}
+
 const agents = ref<Agent[]>([])
 const auth = useAuthStore()
-const toolDialog = ref(false)
-const activeAgent = ref<Agent>()
-const agentTools = ref<AgentTool[]>([])
-
-const approvalRoles = new Set(['product_manager', 'project_manager', 'architect', 'meeting_summarizer', 'notification_secretary'])
-const fastRoles = new Set(['knowledge_admin', 'notification_secretary'])
+const configDialog = ref(false)
+const activeTab = ref('profile')
+const activeAgent = ref<Agent | null>(null)
+const agentTools = ref<ConfigTool[]>([])
+const saving = ref(false)
+const form = reactive({
+  description: '',
+  system_prompt: '',
+  model: '',
+  memory_enable: true,
+  knowledge_access: true,
+  human_approval_required: false
+})
 
 function tools(agent: Agent) {
   return agent.tools.split(',').map((item) => item.trim()).filter(Boolean)
-}
-
-function modelTier(agent: Agent) {
-  return fastRoles.has(agent.role) ? '快/省' : '强指令'
-}
-
-function needsApproval(agent: Agent) {
-  return approvalRoles.has(agent.role)
-}
-
-function displayDescription(agent: Agent) {
-  const map: Record<string, string> = {
-    product_manager: '把模糊想法变成标准需求：识别、澄清、生成需求卡片与验收标准。',
-    project_manager: '任务拆解、里程碑、延期/阻塞识别、日报周报与项目健康评分。',
-    architect: '技术方案与系统影响分析、接口草案、数据结构建议、风险评估。',
-    test_engineer: '测试用例、验收标准、异常与边界场景、回归清单。',
-    meeting_summarizer: '把会议内容转为结构化资产：纪要、待办、决策、风险、需求变更。',
-    knowledge_admin: '项目知识沉淀：归档、摘要、分类、打标签、去重、FAQ 生成。',
-    notification_secretary: '生成站内信/邮件文案，识别接收人与渠道，跟踪发送与二次提醒。',
-    operations_analyst: '项目健康度、团队效率、需求变更与交付质量分析及管理建议。'
-  }
-  return map[agent.role] || agent.description
 }
 
 async function loadAgents() {
@@ -92,22 +104,54 @@ async function loadAgents() {
   agents.value = data
 }
 
-async function openTools(agent: Agent) {
+async function openConfig(agent: Agent) {
   activeAgent.value = agent
+  activeTab.value = 'profile'
+  Object.assign(form, {
+    description: agent.description,
+    system_prompt: agent.system_prompt,
+    model: agent.model,
+    memory_enable: agent.memory_enable,
+    knowledge_access: agent.knowledge_access,
+    human_approval_required: agent.human_approval_required
+  })
   const { data } = await api.get<AgentTool[]>(`/agents/${agent.id}/tools`)
-  agentTools.value = data
-  toolDialog.value = true
+  agentTools.value = data.map((tool) => ({
+    ...tool,
+    allowedRoleValues: tool.allowed_roles.split(',').map((item) => item.trim()).filter(Boolean)
+  }))
+  configDialog.value = true
 }
 
-async function updateTool(tool: AgentTool) {
+async function saveAgent() {
+  if (!activeAgent.value) return
+  saving.value = true
+  try {
+    await api.patch(`/agents/${activeAgent.value.id}`, form)
+    ElMessage.success('Agent 配置已保存')
+    configDialog.value = false
+    await loadAgents()
+  } finally {
+    saving.value = false
+  }
+}
+
+async function updateTool(tool: ConfigTool) {
+  if (!tool.allowedRoleValues.length) {
+    ElMessage.warning('至少保留一个允许角色')
+    const { data } = await api.get<AgentTool[]>(`/agents/${tool.agent_id}/tools`)
+    agentTools.value = data.map((item) => ({ ...item, allowedRoleValues: item.allowed_roles.split(',').filter(Boolean) }))
+    return
+  }
   await api.patch(`/agents/${tool.agent_id}/tools/${tool.id}`, {
     enabled: tool.enabled,
-    allowed_roles: tool.allowed_roles
+    allowed_roles: tool.allowedRoleValues.join(',')
   })
+  ElMessage.success('工具权限已更新')
 }
 
 function updateToolRow(row: unknown) {
-  return updateTool(row as AgentTool)
+  return updateTool(row as ConfigTool)
 }
 
 onMounted(loadAgents)

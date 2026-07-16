@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import ensure_permission, get_current_user
 from app.api.routes.projects import get_project_for_user
 from app.core.database import get_db
 from app.core.llm import get_llm
@@ -26,6 +26,7 @@ async def create_requirement(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Requirement:
+    ensure_permission(current_user, "projects:write")
     if payload.project_id:
         get_project_for_user(payload.project_id, current_user, db, write=True)
     structured = requirement_create(payload.content)

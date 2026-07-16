@@ -170,13 +170,26 @@ class LLMGateway:
         return [value / norm for value in resized] if norm else resized
 
     def _mock_response(self, system_prompt: str, user_prompt: str) -> str:
-        heading = system_prompt.splitlines()[0] if system_prompt else "AI数字员工"
+        roles = (
+            ("产品经理", "AI 产品经理"),
+            ("项目经理", "AI 项目经理"),
+            ("架构师", "AI 架构师"),
+            ("测试", "AI 测试工程师"),
+            ("会议", "AI 会议纪要员"),
+            ("知识库", "AI 知识库管理员"),
+            ("通知", "AI 通知秘书"),
+            ("运营", "AI 运营分析师"),
+        )
+        role = next((label for keyword, label in roles if keyword in system_prompt), "AI 数字员工")
+        request = user_prompt.rsplit("用户输入：", 1)[-1].strip() if "用户输入：" in user_prompt else user_prompt.strip()
+        request = request[:800]
+        execution = "敏感工具动作已提交人工确认，批准前不会写入项目。" if "PENDING_APPROVAL" in user_prompt else "已完成本地结构化分析。"
         return (
-            f"## {heading}\n\n"
-            f"基于输入：{user_prompt}\n\n"
-            "- 结论：已形成可执行的分析结果。\n"
-            "- 关键动作：拆解目标、约束、风险、任务和验收标准。\n"
-            "- 下一步：进入项目空间沉淀任务、文档和知识库引用。"
+            f"## {role}分析（本地开发回退）\n\n"
+            "> 当前未连接外部大模型，以下结果用于验证业务流程，不替代正式模型输出。\n\n"
+            f"**请求摘要**：{request}\n\n"
+            f"**执行状态**：{execution}\n\n"
+            "**下一步**：检查执行记录和工具结果；配置 `LLM_API_KEY` 后重新生成正式内容。"
         )
 
 

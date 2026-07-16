@@ -5,7 +5,7 @@
         <h2>知识库</h2>
         <p>上传 PDF、Word、Markdown，并进行上下文增强搜索。</p>
       </div>
-      <el-upload :http-request="upload" :show-file-list="false">
+      <el-upload v-if="auth.hasPermission('knowledge:write')" :http-request="upload" :show-file-list="false">
         <el-button type="primary" :icon="Upload">上传文件</el-button>
       </el-upload>
     </div>
@@ -21,7 +21,7 @@
         <el-table :data="documents" class="data-table">
           <el-table-column prop="filename" label="文件名" />
           <el-table-column prop="status" label="状态" width="90" />
-          <el-table-column label="操作" width="90">
+          <el-table-column v-if="auth.hasPermission('knowledge:write')" label="操作" width="90">
             <template #default="{ row }">
               <el-button link type="danger" @click="remove(row.id)">删除</el-button>
             </template>
@@ -47,7 +47,9 @@ import { Search, Upload } from '@element-plus/icons-vue'
 import type { UploadRequestOptions } from 'element-plus'
 import { api } from '../api/client'
 import type { KnowledgeDocument } from '../api/types'
+import { useAuthStore } from '../stores/auth'
 
+const auth = useAuthStore()
 const documents = ref<KnowledgeDocument[]>([])
 const query = ref('')
 const answer = ref('')

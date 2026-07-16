@@ -26,6 +26,24 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     if "allowed_roles" not in tool_columns:
         statements.append("ALTER TABLE agent_tools ADD COLUMN allowed_roles VARCHAR(200) DEFAULT 'admin,member'")
 
+    agent_columns = columns("agents")
+    if "human_approval_required" not in agent_columns:
+        statements.append("ALTER TABLE agents ADD COLUMN human_approval_required BOOLEAN DEFAULT false")
+
+    notification_columns = columns("notifications")
+    notification_additions = {
+        "recipient_user_id": "INTEGER REFERENCES users(id) ON DELETE SET NULL",
+        "recipient_email": "VARCHAR(255) DEFAULT ''",
+        "scheduled_for": "TIMESTAMP",
+        "attempts": "INTEGER DEFAULT 0",
+        "locked_at": "TIMESTAMP",
+        "sent_at": "TIMESTAMP",
+        "last_error": "TEXT DEFAULT ''",
+    }
+    for name, definition in notification_additions.items():
+        if "notifications" in tables and name not in notification_columns:
+            statements.append(f"ALTER TABLE notifications ADD COLUMN {name} {definition}")
+
     embedding_columns = columns("embeddings")
     if "embeddings" in tables and "vector_json" not in embedding_columns:
         statements.append("ALTER TABLE embeddings ADD COLUMN vector_json TEXT DEFAULT '[]'")
@@ -34,6 +52,10 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
         statements.append("UPDATE tasks SET status = UPPER(status) WHERE status IN ('todo', 'running', 'done', 'failed')")
     if dialect != "sqlite" and "workflow_runs" in tables:
         statements.append("UPDATE workflow_runs SET status = UPPER(status) WHERE status IN ('running', 'paused', 'completed', 'failed')")
+
+    if "agents" in tables:
+        approval_roles = "'product_manager','project_manager','architect','meeting_summarizer','notification_secretary'"
+        statements.append(f"UPDATE agents SET human_approval_required = true WHERE role IN ({approval_roles})")
 
     if "project_members" in tables:
         if dialect == "sqlite":

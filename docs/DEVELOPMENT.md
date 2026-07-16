@@ -31,3 +31,7 @@
 ## 第八阶段：Docker 部署
 
 完成 PostgreSQL、Redis、Milvus、MinIO、后端、前端一键启动。
+
+## 生产化补强
+
+已完成 refresh 会话轮换、项目成员授权、Agent 意图路由、Memory 限界、混合 RAG、真实 StateGraph、工具人工审批、通知投递 worker、管理员用户中心、Alembic 迁移、审计和桌面/移动端浏览器验收。

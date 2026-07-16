@@ -36,6 +36,12 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class UserAdminUpdate(BaseModel):
+    role: UserRole | None = None
+    is_active: bool | None = None
+    permissions: list[str] | None = None
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -159,6 +165,16 @@ class AgentOut(BaseModel):
     tools: str
     memory_enable: bool
     knowledge_access: bool
+    human_approval_required: bool
+
+
+class AgentUpdate(BaseModel):
+    description: str = Field(min_length=1, max_length=2000)
+    system_prompt: str = Field(min_length=1, max_length=12000)
+    model: str = Field(min_length=1, max_length=100)
+    memory_enable: bool
+    knowledge_access: bool
+    human_approval_required: bool
 
 
 class AgentToolOut(BaseModel):
@@ -175,6 +191,23 @@ class AgentToolOut(BaseModel):
 class AgentToolUpdate(BaseModel):
     enabled: bool
     allowed_roles: str = "admin,member"
+
+
+class AgentActionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    project_id: int | None
+    agent_id: int
+    conversation_id: int | None
+    tool_name: str
+    input_json: str
+    result_json: str
+    status: str
+    approved_by_user_id: int | None
+    created_at: datetime
+    decided_at: datetime | None
 
 
 class ChatRequest(BaseModel):
@@ -318,9 +351,17 @@ class ReportOut(BaseModel):
 class NotificationCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1)
-    channel: str = "email"
-    schedule_at: str = ""
+    channel: str = "in_app"
+    recipient_email: EmailStr | None = None
+    schedule_at: datetime | None = None
     project_id: int | None = None
+
+    @field_validator("channel")
+    @classmethod
+    def validate_channel(cls, value: str) -> str:
+        if value not in {"in_app", "email"}:
+            raise ValueError("Notification channel must be in_app or email")
+        return value
 
 
 class NotificationOut(BaseModel):
@@ -332,7 +373,13 @@ class NotificationOut(BaseModel):
     content: str
     channel: str
     schedule_at: str
+    recipient_user_id: int | None
+    recipient_email: str
+    scheduled_for: datetime | None
     status: str
+    attempts: int
+    sent_at: datetime | None
+    last_error: str
     created_at: datetime
 
 

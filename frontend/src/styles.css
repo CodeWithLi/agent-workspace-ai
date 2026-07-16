@@ -13,13 +13,16 @@ body {
 }
 
 .shell {
+  height: 100vh;
   min-height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
   background: #102033;
   color: #fff;
   padding: 18px 12px;
+  overflow-y: auto;
 }
 
 .brand {
@@ -31,15 +34,21 @@ body {
   letter-spacing: 0;
 }
 
-.menu {
+.sidebar .menu {
   border-right: 0;
   background: transparent;
+  --el-menu-bg-color: transparent;
+  --el-menu-hover-bg-color: #1a3551;
+  --el-menu-text-color: #dce7f3;
+  --el-menu-active-color: #fff;
 }
 
 .sidebar .el-menu-item {
   color: #dce7f3;
   border-radius: 6px;
   margin: 4px 0;
+  height: 44px;
+  line-height: 44px;
 }
 
 .sidebar .el-menu-item.is-active {
@@ -60,6 +69,12 @@ body {
 .top-search {
   position: relative;
   width: min(620px, 48vw);
+  min-width: 0;
+}
+
+.topbar .mobile-menu-button,
+.sidebar-backdrop {
+  display: none;
 }
 
 .search-popover {
@@ -223,6 +238,8 @@ h3 {
 }
 
 .employee-card {
+  display: flex;
+  flex-direction: column;
   background: #fff;
   border: 1px solid #dfe6ee;
   border-radius: 8px;
@@ -266,7 +283,12 @@ h3 {
 }
 
 .card-action {
-  margin-top: 14px;
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+.employee-card .tool-tags {
+  margin-bottom: 14px;
 }
 
 .agent-row {
@@ -488,6 +510,33 @@ h3 {
   white-space: pre-wrap;
 }
 
+.tool-trace {
+  border-top: 1px solid #e3e9f0;
+  padding: 10px 0;
+}
+
+.tool-trace-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-switches {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.tool-table {
+  margin-top: 14px;
+}
+
+.agent-config-dialog .el-dialog__body {
+  max-height: calc(90vh - 140px);
+  overflow-y: auto;
+}
+
 .kanban {
   display: grid;
   grid-template-columns: repeat(4, minmax(180px, 1fr));
@@ -536,12 +585,68 @@ h3 {
 
 @media (max-width: 900px) {
   .sidebar {
+    display: block;
+    position: fixed;
+    z-index: 1002;
+    inset: 0 auto 0 -248px;
+    width: 236px !important;
+    height: 100vh;
+    transition: left 180ms ease;
+    box-shadow: 12px 0 30px rgba(16, 32, 51, 0.2);
+  }
+
+  .sidebar.mobile-open {
+    left: 0;
+  }
+
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    z-index: 1001;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    background: rgba(12, 24, 38, 0.42);
+  }
+
+  .topbar .mobile-menu-button {
+    display: inline-flex;
+    flex: 0 0 auto;
+  }
+
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .top-search {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .top-actions {
+    gap: 6px;
+  }
+
+  .top-actions .quick-create {
+    display: none;
+  }
+
+  .logout-button {
+    width: 32px;
+    padding: 8px;
+  }
+
+  .top-actions .logout-button span {
     display: none;
   }
 
   .chat-page {
     grid-template-columns: 1fr;
-    height: auto;
+    grid-template-rows: 220px minmax(0, 1fr);
+    height: calc(100vh - 112px);
   }
 
   .page-head,
@@ -554,6 +659,10 @@ h3 {
   .stat-grid,
   .kanban,
   .agent-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-switches {
     grid-template-columns: 1fr;
   }
 

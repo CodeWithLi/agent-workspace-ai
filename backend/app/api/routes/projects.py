@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import ensure_permission, get_current_user
 from app.core.database import get_db
 from app.core.audit import record_audit
 from app.models import Project, ProjectMember, ProjectMemberRole, Task, User
@@ -34,6 +34,8 @@ def get_project_for_user(project_id: int, user: User, db: Session, write: bool =
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     if write and role == ProjectMemberRole.viewer:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Project viewer has read-only access")
+    if write:
+        ensure_permission(user, "projects:write")
     project.current_user_role = role
     return project
 
@@ -84,6 +86,7 @@ def create_project(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Project:
+    ensure_permission(current_user, "projects:write")
     project = Project(
         name=payload.name,
         description=payload.description,
@@ -130,6 +133,7 @@ def add_or_update_member(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ProjectMemberOut:
+    ensure_permission(current_user, "projects:write")
     project = get_project_for_user(project_id, current_user, db)
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the project owner can manage members")
@@ -170,6 +174,7 @@ def remove_member(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
+    ensure_permission(current_user, "projects:write")
     project = get_project_for_user(project_id, current_user, db)
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the project owner can manage members")
