@@ -67,6 +67,8 @@ Color is never the only state signal. Status text, icons or labels accompany sem
 
 - Verify 375, 390, 768, 1024 and 1440px widths.
 - No page-level horizontal scrolling.
+- Business pages use a 1480px maximum content width; compact pages use 1440px so wide screens do not create excessive empty gutters.
+- Desktop content gutters are 28px before max-width centering; prose remains locally constrained instead of narrowing the entire operational page.
 - 3-column Agent cards become 2 columns below 1180px and 1 column below 640px.
 - Dashboard sections stack below 900px; tables remain usable inside their own surface.
 - Top-bar secondary commands hide before they can compress search or account controls.

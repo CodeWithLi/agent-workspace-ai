@@ -25,6 +25,8 @@
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
+  --layout-content-max: 1480px;
+  --layout-compact-max: 1440px;
   color: var(--color-foreground);
   background: var(--color-background);
   font-family: Inter, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
@@ -382,7 +384,7 @@ a {
 }
 
 .content {
-  padding: 28px 32px 48px;
+  padding: 28px 28px 44px;
   overflow-x: hidden;
   background: var(--color-background);
 }
@@ -394,12 +396,12 @@ a {
 .page,
 .chat-page {
   width: 100%;
-  max-width: 1360px;
+  max-width: var(--layout-content-max);
   margin: 0 auto;
 }
 
 .narrow-page {
-  max-width: 1200px;
+  max-width: var(--layout-compact-max);
 }
 
 .page-head {
