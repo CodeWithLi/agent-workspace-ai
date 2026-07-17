@@ -14,6 +14,7 @@ from app.rag.evaluation import (  # noqa: E402
     chonkie_sentence_candidates,
     legacy_candidates,
     load_cases,
+    load_documents,
     structural_candidates,
 )
 
@@ -26,15 +27,17 @@ def main() -> int:
     parser.add_argument("--min-score", type=float, default=0.2)
     parser.add_argument("--embedding-cost-per-million", type=float, default=0.0)
     parser.add_argument("--min-query-coverage", type=float, default=0.15)
+    parser.add_argument("--enforce-gates", action="store_true")
+    parser.add_argument("--min-context-precision-gain", type=float, default=0.01)
+    parser.add_argument("--max-p95-retrieval-ms", type=float, default=100.0)
     args = parser.parse_args()
 
     cases = load_cases(ROOT / "backend" / "tests" / "rag_eval_cases.json")
-    filenames = sorted({case.document for case in cases if case.document is not None})
-    documents = {filename: (ROOT / "docs" / filename).read_bytes() for filename in filenames}
+    documents = load_documents(cases, ROOT / "backend" / "tests" / "rag_eval_documents")
     chunker = StructuralChunker()
     strategies = [
         ("legacy-characters-900-140", lambda: legacy_candidates(documents, chunker.tokens.count)),
-        ("structural-parent-child-v1", lambda: structural_candidates(documents, chunker)),
+        (f"structural-parent-child-v{chunker.version}", lambda: structural_candidates(documents, chunker)),
     ]
     if args.include_chonkie:
         strategies.append(("chonkie-sentence-1.7.0", lambda: chonkie_sentence_candidates(documents)))
@@ -55,17 +58,44 @@ def main() -> int:
         ).to_dict()
         report["chunking_ms"] = elapsed_ms
         reports.append(report)
+    baseline, structural = reports[:2]
+    gate_failures = []
+    for metric in ("recall_at_k", "mrr", "ndcg_at_k", "citation_target_accuracy", "refusal_accuracy"):
+        if structural[metric] < baseline[metric]:
+            gate_failures.append(f"{metric} regressed: {structural[metric]} < {baseline[metric]}")
+    precision_gain = structural["context_precision_at_k"] - baseline["context_precision_at_k"]
+    if precision_gain < args.min_context_precision_gain:
+        gate_failures.append(
+            f"context precision gain {precision_gain:.4f} < {args.min_context_precision_gain:.4f}"
+        )
+    if structural["heading_metadata_coverage"] < 1.0:
+        gate_failures.append("heading metadata coverage is below 100%")
+    if structural["max_chunk_tokens"] > chunker.config.child_tokens:
+        gate_failures.append("structural chunk exceeds the child token budget")
+    if structural["index_tokens"] > baseline["index_tokens"]:
+        gate_failures.append("structural index token count exceeds the legacy baseline")
+    if structural["p95_retrieval_ms"] > args.max_p95_retrieval_ms:
+        gate_failures.append(
+            f"p95 retrieval {structural['p95_retrieval_ms']:.3f}ms > {args.max_p95_retrieval_ms:.3f}ms"
+        )
     payload = {
         "top_k": args.top_k,
         "min_score": args.min_score,
         "min_query_coverage": args.min_query_coverage,
         "reports": reports,
+        "gates": {
+            "passed": not gate_failures,
+            "failures": gate_failures,
+            "min_context_precision_gain": args.min_context_precision_gain,
+            "max_p95_retrieval_ms": args.max_p95_retrieval_ms,
+        },
     }
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
-    return 0
+    return 1 if args.enforce_gates and gate_failures else 0
 
 
 if __name__ == "__main__":

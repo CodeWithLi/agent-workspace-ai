@@ -76,6 +76,10 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
         with pytest.raises(HTTPException) as error:
             update_system_settings(SettingUpdate(values={"database_url": "sqlite:///unsafe"}), request(), admin, db)
         assert error.value.status_code == 400
+
+        with pytest.raises(HTTPException) as invalid_strategy:
+            update_system_settings(SettingUpdate(values={"rag_chunk_strategy": "unknown"}), request(), admin, db)
+        assert invalid_strategy.value.status_code == 400
     finally:
         restore_runtime_defaults()
 

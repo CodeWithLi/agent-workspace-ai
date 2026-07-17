@@ -25,6 +25,10 @@
           <span>需求中心</span>
         </el-menu-item>
         <li class="menu-label" role="presentation">智能协作</li>
+        <el-menu-item index="/prototypes">
+          <el-icon><MagicStick /></el-icon>
+          <span>AI 原型</span>
+        </el-menu-item>
         <el-menu-item v-if="auth.hasPermission('agents:read')" index="/agents">
           <el-icon><Cpu /></el-icon>
           <span>AI 员工</span>
@@ -110,7 +114,7 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, Document, Files, Folder, List, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
+import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, Document, Files, Folder, List, MagicStick, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'

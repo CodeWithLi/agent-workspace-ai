@@ -1,3 +1,4 @@
+import asyncio
 import json
 import hashlib
 import html
@@ -17,10 +18,10 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.llm import get_llm
 from app.core.llm_usage import bind_llm_usage
-from app.core.metrics import RAG_QUERY_REWRITES
+from app.core.metrics import RAG_EMBEDDING_CHUNKS, RAG_QUERY_REWRITES
 from app.core.storage import object_storage
 from app.models import Embedding, KnowledgeDocument, KnowledgeElement, KnowledgeIndexVersion, User
-from app.rag.chunking import ChunkingConfig, StructuralChunker, TokenCounter
+from app.rag.chunking import ChunkingConfig, TokenCounter, build_chunker
 from app.rag.advanced_parser import parse_document_with_backend
 from app.rag.parsers import (
     DocumentParseError,
@@ -187,15 +188,40 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
         overlap_tokens=settings.rag_chunk_overlap_tokens,
         min_chunk_tokens=settings.rag_min_chunk_tokens,
     )
-    chunker = StructuralChunker(config)
-    chunks = chunker.chunk(parsed)
+    gateway = get_llm()
+    try:
+        chunker = build_chunker(
+            config,
+            strategy=settings.rag_chunk_strategy,
+            semantic_threshold=settings.rag_semantic_threshold,
+            embedding_model=settings.embedding_model,
+            embedding_api_key=settings.embedding_api_key or gateway.api_key,
+            embedding_base_url=settings.embedding_base_url or gateway.base_url,
+        )
+    except ValueError as exc:
+        raise DocumentValidationError(str(exc)) from exc
+    chunks = (
+        await asyncio.to_thread(chunker.chunk, parsed)
+        if settings.rag_chunk_strategy == "semantic"
+        else chunker.chunk(parsed)
+    )
     if len(chunks) > settings.rag_max_chunks:
         raise DocumentValidationError("文档切片数量超过限制")
     if not chunks and document.active_index_version > 0:
         raise DocumentValidationError("重建解析结果为空，继续保留当前活动索引")
-    index_version = max(document.active_index_version + 1, document.pending_index_version or 0)
+    latest_version = db.scalar(
+        select(func.max(KnowledgeIndexVersion.version)).where(KnowledgeIndexVersion.document_id == document.id)
+    ) or 0
+    index_version = max(latest_version + 1, document.pending_index_version or 0)
     document.pending_index_version = index_version
-    config_json = json.dumps(asdict(config), ensure_ascii=False)
+    config_json = json.dumps(
+        {
+            **asdict(config),
+            "strategy": settings.rag_chunk_strategy,
+            "semantic_threshold": settings.rag_semantic_threshold,
+        },
+        ensure_ascii=False,
+    )
     index_record = db.scalar(
         select(KnowledgeIndexVersion).where(
             KnowledgeIndexVersion.document_id == document.id,
@@ -247,14 +273,82 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
             for element in parsed.elements
         ]
     )
-    with bind_llm_usage(db=db, user_id=document.owner_id, project_id=document.project_id):
-        vectors = await get_llm().embed_many([chunk.content for chunk in chunks])
-    if len(vectors) != len(chunks):
-        raise RuntimeError("Embedding provider returned a different number of vectors than chunks")
+    chunk_hashes = [hashlib.sha256(chunk.content.encode("utf-8")).hexdigest() for chunk in chunks]
+    reusable_vectors: dict[str, list[float]] = {}
+    reusable_parent_vectors: dict[str, list[float]] = {}
+    active_record = db.scalar(
+        select(KnowledgeIndexVersion).where(
+            KnowledgeIndexVersion.document_id == document.id,
+            KnowledgeIndexVersion.version == document.active_index_version,
+        )
+    )
+    if (
+        active_record is not None
+        and active_record.embedding_model == settings.embedding_model
+        and active_record.embedding_dimensions == settings.embedding_dimensions
+    ):
+        previous_chunks = list(
+            db.scalars(
+                select(Embedding).where(
+                    Embedding.document_id == document.id,
+                    Embedding.index_version == document.active_index_version,
+                )
+            )
+        )
+        for previous in previous_chunks:
+            try:
+                vector = json.loads(previous.vector_json or "[]")
+            except json.JSONDecodeError:
+                vector = []
+            if isinstance(vector, list) and len(vector) == settings.embedding_dimensions:
+                reusable_vectors[previous.content_hash] = [float(value) for value in vector]
+            if settings.rag_multi_vector_enabled and previous.parent_content:
+                try:
+                    parent_vector = json.loads(previous.parent_vector_json or "[]")
+                except json.JSONDecodeError:
+                    parent_vector = []
+                if isinstance(parent_vector, list) and len(parent_vector) == settings.embedding_dimensions:
+                    reusable_parent_vectors[previous.parent_content] = [float(value) for value in parent_vector]
+
+    vectors: list[list[float] | None] = [reusable_vectors.get(content_hash) for content_hash in chunk_hashes]
+    missing_indexes = [index for index, vector in enumerate(vectors) if vector is None]
+    if missing_indexes:
+        with bind_llm_usage(db=db, user_id=document.owner_id, project_id=document.project_id):
+            generated = await gateway.embed_many([chunks[index].content for index in missing_indexes])
+        if len(generated) != len(missing_indexes):
+            raise RuntimeError("Embedding provider returned a different number of vectors than chunks")
+        for index, vector in zip(missing_indexes, generated):
+            vectors[index] = vector
+    if any(vector is None for vector in vectors):
+        raise RuntimeError("Embedding vector assembly is incomplete")
+    RAG_EMBEDDING_CHUNKS.labels("reused").inc(len(chunks) - len(missing_indexes))
+    RAG_EMBEDDING_CHUNKS.labels("generated").inc(len(missing_indexes))
+
+    parent_vectors: list[list[float] | None] = [None] * len(chunks)
+    if settings.rag_multi_vector_enabled:
+        parent_contents = [chunk.parent_content or chunk.content for chunk in chunks]
+        unique_parent_contents = list(dict.fromkeys(parent_contents))
+        missing_parent_contents = [
+            content for content in unique_parent_contents if content not in reusable_parent_vectors
+        ]
+        if missing_parent_contents:
+            with bind_llm_usage(db=db, user_id=document.owner_id, project_id=document.project_id):
+                generated_parents = await gateway.embed_many(missing_parent_contents)
+            if len(generated_parents) != len(missing_parent_contents):
+                raise RuntimeError("Embedding provider returned a different number of vectors than parent chunks")
+            reusable_parent_vectors.update(zip(missing_parent_contents, generated_parents))
+        parent_vectors = [reusable_parent_vectors[content] for content in parent_contents]
+        RAG_EMBEDDING_CHUNKS.labels("reused_parent").inc(
+            len(unique_parent_contents) - len(missing_parent_contents)
+        )
+        RAG_EMBEDDING_CHUNKS.labels("generated_parent").inc(len(missing_parent_contents))
+
     vector_ids: list[str] = []
     try:
-        for chunk, vector in zip(chunks, vectors):
+        for chunk, vector, parent_vector, content_hash in zip(chunks, vectors, parent_vectors, chunk_hashes):
+            assert vector is not None
             vector_id = f"chunk-{document.id}-{index_version}-{chunk.stable_id[:24]}"
+            vector_ids.append(vector_id)
             vector_store.upsert(
                 vector_id,
                 document.id,
@@ -262,8 +356,9 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
                 chunk.content,
                 vector,
                 index_version,
+                parent_embedding=parent_vector,
+                owner_id=document.owner_id,
             )
-            vector_ids.append(vector_id)
             db.add(
                 Embedding(
                     document_id=document.id,
@@ -272,6 +367,7 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
                     chunk_index=chunk.chunk_index,
                     vector_id=vector_id,
                     vector_json=json.dumps(vector),
+                    parent_vector_json=json.dumps(parent_vector or []),
                     score_hint=sum(abs(value) for value in vector) / max(len(vector), 1),
                     stable_id=chunk.stable_id,
                     index_version=index_version,
@@ -283,7 +379,7 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
                     page_end=chunk.page_end,
                     element_ids_json=json.dumps(chunk.element_ids),
                     metadata_json=json.dumps(chunk.metadata, ensure_ascii=False),
-                    content_hash=hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                    content_hash=content_hash,
                 )
             )
     except Exception:
@@ -346,10 +442,13 @@ def rollback_index_version(
     for chunk in chunks:
         try:
             vector = json.loads(chunk.vector_json or "[]")
+            parent_vector = json.loads(chunk.parent_vector_json or "[]")
         except json.JSONDecodeError as exc:
             raise ValueError("Target index version contains an invalid vector") from exc
         if not vector:
             raise ValueError("Target index version contains a missing vector")
+        if not isinstance(parent_vector, list):
+            raise ValueError("Target index version contains an invalid parent vector")
         vector_store.upsert(
             chunk.vector_id or f"chunk-{document.id}-{target_version}-{chunk.stable_id[:24]}",
             document.id,
@@ -357,6 +456,8 @@ def rollback_index_version(
             chunk.content,
             vector,
             target_version,
+            parent_embedding=parent_vector or None,
+            owner_id=document.owner_id,
         )
     db.execute(
         update(KnowledgeIndexVersion)
@@ -613,7 +714,19 @@ async def search_knowledge(
     queries = await rewrite_query(query)
     query_vector = average_vectors(await get_llm().embed_many(queries))
     candidate_limit = max(top_k * 8, 40)
-    hybrid_rows = vector_store.hybrid_search(" ".join(queries), query_vector, project_id, candidate_limit)
+    filtered_document_ids: list[int] | None = None
+    if document_ids or tags or source_labels:
+        filtered_document_ids = list(
+            db.scalars(stmt.with_only_columns(Embedding.document_id).distinct())
+        )
+    hybrid_rows = vector_store.hybrid_search(
+        " ".join(queries),
+        query_vector,
+        project_id,
+        candidate_limit,
+        owner_id=user.id,
+        document_ids=filtered_document_ids,
+    )
     hybrid_scores = {row["vector_id"]: row["score"] for row in hybrid_rows}
     records: list[tuple[Embedding, KnowledgeDocument]] = []
     if hybrid_scores:
@@ -625,21 +738,36 @@ async def search_knowledge(
         )[:12]
         fallback_stmt = stmt
         if fallback_terms:
+            fallback_fields = [Embedding.content]
+            if settings.rag_multi_vector_enabled:
+                fallback_fields.append(Embedding.parent_content)
             fallback_stmt = fallback_stmt.where(
-                or_(*(Embedding.content.contains(term, autoescape=True) for term in fallback_terms))
+                or_(
+                    *(
+                        field.contains(term, autoescape=True)
+                        for term in fallback_terms
+                        for field in fallback_fields
+                    )
+                )
             )
         records = list(db.execute(fallback_stmt.limit(settings.rag_fallback_candidate_limit)))
     if not records:
         return "未找到包含查询关键词的知识内容。", []
 
     stored_vectors: list[list[float]] = []
+    stored_parent_vectors: list[list[float]] = []
     missing_indexes: list[int] = []
     for index, (chunk, _) in enumerate(records):
         try:
             vector = json.loads(chunk.vector_json or "[]")
         except json.JSONDecodeError:
             vector = []
+        try:
+            parent_vector = json.loads(chunk.parent_vector_json or "[]")
+        except json.JSONDecodeError:
+            parent_vector = []
         stored_vectors.append(vector)
+        stored_parent_vectors.append(parent_vector if isinstance(parent_vector, list) else [])
         if not vector:
             missing_indexes.append(index)
     if missing_indexes:
@@ -650,8 +778,16 @@ async def search_knowledge(
     sparse_by_query = [sparse_scores(item, [chunk.content for chunk, _ in records]) for item in queries]
     sparse = [max(scores[index] for scores in sparse_by_query) for index in range(len(records))]
     rows: list[dict] = []
-    for index, ((chunk, document), vector) in enumerate(zip(records, stored_vectors)):
-        dense = cosine_similarity(query_vector, vector)
+    for index, ((chunk, document), vector, parent_vector) in enumerate(
+        zip(records, stored_vectors, stored_parent_vectors)
+    ):
+        child_dense = cosine_similarity(query_vector, vector)
+        parent_dense = (
+            cosine_similarity(query_vector, parent_vector or vector)
+            if settings.rag_multi_vector_enabled
+            else 0.0
+        )
+        dense = max(child_dense, parent_dense)
         try:
             document_metadata = json.loads(document.metadata_json or "{}")
         except json.JSONDecodeError:

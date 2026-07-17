@@ -65,9 +65,8 @@
 
     <section v-if="workflowState" class="report-panel">
       <div class="page-head compact">
-        <div><h3>Agent 工作流</h3><p>{{ workflowCompletedStages }} / 6 个阶段已完成</p></div>
+        <div><h3>Agent 工作流</h3><p>{{ workflowCompletedStages }} / {{ workflowStages.length }} 个阶段已完成</p></div>
         <div class="inline-actions">
-          <el-button v-if="workflowStatus === 'PAUSED'" type="warning" @click="continueWorkflow">人工确认并继续</el-button>
           <el-button v-if="['QUEUED', 'RUNNING'].includes(workflowStatus)" :icon="CircleClose" :loading="workflowActionBusy" @click="cancelWorkflow">取消</el-button>
           <el-button v-if="workflowStatus === 'FAILED'" type="primary" :icon="RefreshRight" :loading="workflowActionBusy" @click="retryWorkflow">重试失败节点</el-button>
           <el-button v-if="workflowStatus === 'COMPENSATION_FAILED'" type="danger" :icon="RefreshRight" :loading="workflowActionBusy" @click="retryCompensation">重试回滚</el-button>
@@ -80,6 +79,29 @@
           <el-step v-for="stage in workflowStages" :key="stage" :title="stage" />
         </el-steps>
       </div>
+      <section v-if="executionPlan" class="workflow-orchestration" aria-label="多 Agent 执行计划">
+        <div class="orchestration-heading">
+          <div><h4>动态执行计划</h4><p>{{ executionPlan.objective }}</p></div>
+          <el-tag type="primary">{{ executionPlan.assignments.length }} 个并行分支</el-tag>
+        </div>
+        <div class="orchestration-branches">
+          <div v-for="assignment in executionPlan.assignments" :key="assignment.role" class="orchestration-branch-row">
+            <span class="branch-role">{{ specialistRoleLabel(assignment.role) }}</span>
+            <div><strong>{{ assignment.deliverable }}</strong><small>{{ assignment.objective }}</small></div>
+            <el-tag :type="handoffFor(assignment.role) ? 'success' : 'info'" size="small">{{ handoffFor(assignment.role) ? `已交接 · R${handoffFor(assignment.role)?.revision_round}` : '等待执行' }}</el-tag>
+          </div>
+        </div>
+        <el-collapse v-if="specialistHandoffs.length" class="handoff-details">
+          <el-collapse-item v-for="handoff in specialistHandoffs" :key="handoff.role" :name="handoff.role" :title="`${specialistRoleLabel(handoff.role)} Handoff · ${handoff.deliverable}`">
+            <pre>{{ handoff.content }}</pre>
+          </el-collapse-item>
+        </el-collapse>
+        <div v-if="qualityGate" class="quality-gate-summary" :class="{ failed: !qualityGate.passed }">
+          <div><strong>{{ qualityGate.passed ? 'Quality Gate 已通过' : 'Quality Gate 需要修订' }}</strong><span>评分 {{ Math.round(qualityGate.score) }} / 100</span></div>
+          <p>{{ qualityGate.summary }}</p>
+          <ul v-if="qualityGate.issues.length"><li v-for="issue in qualityGate.issues" :key="issue">{{ issue }}</li></ul>
+        </div>
+      </section>
       <div v-if="workflowEvents.length" class="workflow-events" aria-live="polite">
         <div v-for="event in workflowEvents.slice(-8)" :key="event.id" class="workflow-event-row">
           <span>{{ workflowEventLabel(event.event_type) }}</span>
@@ -87,6 +109,25 @@
           <time>{{ new Date(event.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</time>
         </div>
       </div>
+      <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate">
+        <div>
+          <strong>{{ workflowCurrentNode === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认' }}</strong>
+          <p>{{ workflowCurrentNode === 'quality_review' ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。' : '确认当前需求、架构、任务和测试产物后继续生成最终报告。' }}</p>
+        </div>
+        <el-input
+          v-model="workflowFeedback"
+          type="textarea"
+          :rows="3"
+          :placeholder="workflowCurrentNode === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'"
+          aria-label="工作流人工反馈"
+        />
+        <el-button
+          type="warning"
+          :loading="workflowActionBusy"
+          :disabled="workflowCurrentNode === 'quality_review' && !workflowFeedback.trim()"
+          @click="continueWorkflow"
+        >{{ workflowCurrentNode === 'quality_review' ? '提交修订意见' : '确认并生成报告' }}</el-button>
+      </section>
       <el-table v-if="workflowSagaSteps.length" :data="workflowSagaSteps" class="data-table">
         <el-table-column label="写操作" min-width="150">
           <template #default="{ row }">{{ sagaToolLabel(row.tool_name) }}</template>
@@ -165,6 +206,32 @@ import 'element-plus/es/components/message/style/css.mjs'
 import axios from 'axios'
 import { confirmDestructiveAction } from '../utils/confirm'
 
+interface WorkflowAssignment {
+  role: string
+  objective: string
+  deliverable: string
+}
+
+interface WorkflowExecutionPlan {
+  objective: string
+  rationale: string
+  assignments: WorkflowAssignment[]
+  success_criteria: string[]
+}
+
+interface WorkflowHandoff extends WorkflowAssignment {
+  content: string
+  revision_round: number
+}
+
+interface WorkflowQualityGate {
+  score: number
+  passed: boolean
+  issues: string[]
+  revision_roles: string[]
+  summary: string
+}
+
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
@@ -175,7 +242,9 @@ const agents = ref<Agent[]>([])
 const workflowState = ref<Record<string, any> | null>(null)
 const workflowId = ref<number | null>(null)
 const workflowStatus = ref('')
+const workflowCurrentNode = ref('')
 const workflowError = ref('')
+const workflowFeedback = ref('')
 const workflowEvents = ref<WorkflowEvent[]>([])
 const workflowSagaSteps = ref<WorkflowSagaStep[]>([])
 const workflowActionBusy = ref(false)
@@ -191,7 +260,19 @@ const projectEditDialog = ref(false)
 const projectSaving = ref(false)
 const projectForm = reactive({ name: '', description: '', status: 'ACTIVE' })
 const activeWorkflowDocument = ref('PRD')
-const workflowStages = ['需求分析', '产品方案', '架构设计', '项目计划', '测试方案', '项目报告']
+const workflowStages = ['需求分析', '产品方案', '架构设计', '动态规划', '专业分支', '质量门禁', '项目计划', '测试方案', '项目报告']
+const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
+  const plan = workflowState.value?.execution_plan
+  return plan && Array.isArray(plan.assignments) ? plan as WorkflowExecutionPlan : null
+})
+const specialistHandoffs = computed<WorkflowHandoff[]>(() => {
+  const handoffs = workflowState.value?.specialist_handoffs
+  return Array.isArray(handoffs) ? handoffs as WorkflowHandoff[] : []
+})
+const qualityGate = computed<WorkflowQualityGate | null>(() => {
+  const gate = workflowState.value?.quality_gate
+  return gate && typeof gate.score === 'number' ? gate as WorkflowQualityGate : null
+})
 const workflowDocuments = computed(() => {
   const documents = workflowState.value?.documents
   if (!Array.isArray(documents)) return []
@@ -207,15 +288,23 @@ const workflowCompletedStages = computed(() => {
       ? workflowState.value.messages.map((item: { role?: string }) => item.role)
       : []
   )
-  return [
+  let completed = [
     'requirement_agent',
     'product_agent',
     'architect_agent',
     'project_manager_agent',
     'tester_agent'
   ].filter((role) => completedRoles.has(role)).length
+  if (executionPlan.value) completed += 1
+  if (specialistHandoffs.value.length) completed += 1
+  if (qualityGate.value?.passed) completed += 1
+  return completed
 })
-const workflowStatusLabel = computed(() => ({
+const workflowStatusLabel = computed(() => {
+  if (workflowStatus.value === 'PAUSED') {
+    return workflowCurrentNode.value === 'quality_review' ? '等待质量修订' : '等待报告确认'
+  }
+  return ({
   QUEUED: '等待执行',
   RUNNING: '执行中',
   CANCELLING: '正在取消',
@@ -225,7 +314,8 @@ const workflowStatusLabel = computed(() => ({
   PAUSED: '等待人工确认',
   COMPLETED: '已完成',
   FAILED: '执行失败'
-}[workflowStatus.value] || workflowStatus.value))
+  }[workflowStatus.value] || workflowStatus.value)
+})
 const workflowTagType = computed(() => ({
   QUEUED: 'info',
   RUNNING: 'primary',
@@ -253,6 +343,10 @@ function workflowStageLabel(node: string) {
     requirement: '需求分析',
     product: '产品方案',
     architect: '架构设计',
+    planning: '动态规划',
+    specialists: '专业分支',
+    quality_gate: '质量门禁',
+    quality_review: '人工修订',
     project_manager: '项目计划',
     tester: '测试方案',
     report: '项目报告',
@@ -267,6 +361,12 @@ function workflowEventLabel(eventType: string) {
     RECOVERED: '已恢复',
     NODE_STARTED: '开始节点',
     NODE_COMPLETED: '完成节点',
+    PLAN_CREATED: '计划已生成',
+    BRANCH_STARTED: '分支已启动',
+    BRANCH_COMPLETED: '分支已交接',
+    QUALITY_GATE_PASSED: '质量门禁通过',
+    QUALITY_GATE_FAILED: '质量门禁未通过',
+    REVISION_REQUESTED: '请求自动修订',
     RETRY_SCHEDULED: '自动重试',
     SAGA_STEP_COMPLETED: '写操作已提交',
     COMPENSATION_STARTED: '开始事务回滚',
@@ -280,6 +380,19 @@ function workflowEventLabel(eventType: string) {
     CANCELLED: '已取消',
     FAILED: '执行失败'
   }[eventType] || eventType
+}
+
+function specialistRoleLabel(role: string) {
+  return {
+    test_engineer: '测试工程师',
+    operations_analyst: '运营分析师',
+    knowledge_admin: '知识库管理员',
+    notification_secretary: '通知秘书'
+  }[role] || role
+}
+
+function handoffFor(role: string) {
+  return specialistHandoffs.value.find((handoff) => handoff.role === role)
 }
 
 function sagaStatusLabel(status: string) {
@@ -324,8 +437,10 @@ function activityLabel(action: string) {
 }
 
 function applyWorkflow(workflow: WorkflowRun) {
+  if (workflowCurrentNode.value !== workflow.current_node) workflowFeedback.value = ''
   workflowId.value = workflow.workflow_id
   workflowStatus.value = workflow.status
+  workflowCurrentNode.value = workflow.current_node
   workflowState.value = workflow.state
   workflowError.value = workflow.error
 }
@@ -370,7 +485,7 @@ async function consumeWorkflowEvents(id: number, controller: AbortController) {
         const event = JSON.parse(raw) as WorkflowEvent
         if (!workflowEvents.value.some((item) => item.id === event.id)) workflowEvents.value.push(event)
         lastWorkflowEventId.value = Math.max(lastWorkflowEventId.value, event.id)
-        if (['NODE_COMPLETED', 'SAGA_STEP_COMPLETED', 'SAGA_STEP_COMPENSATED', 'SAGA_COMPENSATION_FAILED', 'COMPENSATION_FAILED', 'COMPENSATED', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRY_SCHEDULED'].includes(event.event_type)) {
+        if (['NODE_COMPLETED', 'PLAN_CREATED', 'BRANCH_COMPLETED', 'QUALITY_GATE_PASSED', 'QUALITY_GATE_FAILED', 'REVISION_REQUESTED', 'SAGA_STEP_COMPLETED', 'SAGA_STEP_COMPENSATED', 'SAGA_COMPENSATION_FAILED', 'COMPENSATION_FAILED', 'COMPENSATED', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRY_SCHEDULED'].includes(event.event_type)) {
           await refreshWorkflow()
         }
       }
@@ -468,13 +583,20 @@ async function runWorkflow() {
 
 async function continueWorkflow() {
   if (!workflowId.value) return
-  const { data } = await api.post('/workflow/continue', {
-    workflow_id: workflowId.value,
-    human_feedback: '人工确认通过，请生成最终项目报告。'
-  })
-  applyWorkflow(data)
-  watchWorkflowEvents()
-  if (data.status === 'COMPLETED' || data.status === 'FAILED') workflowRequestId.value = crypto.randomUUID()
+  workflowActionBusy.value = true
+  try {
+    const feedback = workflowFeedback.value.trim() || '人工确认通过，请生成最终项目报告。'
+    const { data } = await api.post<WorkflowRun>('/workflow/continue', {
+      workflow_id: workflowId.value,
+      human_feedback: feedback
+    })
+    workflowFeedback.value = ''
+    applyWorkflow(data)
+    watchWorkflowEvents()
+    if (data.status === 'COMPLETED' || data.status === 'FAILED') workflowRequestId.value = crypto.randomUUID()
+  } finally {
+    workflowActionBusy.value = false
+  }
 }
 
 async function cancelWorkflow() {
@@ -549,3 +671,195 @@ async function publishArtifact(documentType: string, target: 'report' | 'knowled
 onMounted(load)
 onBeforeUnmount(() => workflowStream.value?.abort())
 </script>
+
+<style scoped>
+.workflow-orchestration {
+  margin: 18px 0;
+  padding: 16px 0;
+  border-block: 1px solid var(--color-border);
+}
+
+.orchestration-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.orchestration-heading > div {
+  min-width: 0;
+}
+
+.orchestration-heading h4 {
+  margin: 0 0 5px;
+  font-size: 15px;
+}
+
+.orchestration-heading p {
+  max-width: 900px;
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.orchestration-branches {
+  border-top: 1px solid var(--color-border);
+}
+
+.orchestration-branch-row {
+  display: grid;
+  min-height: 62px;
+  grid-template-columns: 112px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.branch-role {
+  color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.orchestration-branch-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.orchestration-branch-row strong {
+  font-size: 13px;
+}
+
+.orchestration-branch-row small {
+  overflow: hidden;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.handoff-details {
+  margin-top: 12px;
+  border-top: 0;
+}
+
+.handoff-details :deep(.el-collapse-item__header) {
+  min-height: 44px;
+  font-size: 12px;
+}
+
+.handoff-details pre {
+  max-height: 280px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: #f6f8fa;
+  color: var(--color-secondary-text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.quality-gate-summary {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--color-success);
+  background: #f0fdf4;
+}
+
+.quality-gate-summary.failed {
+  border-left-color: var(--color-warning);
+  background: #fffbeb;
+}
+
+.quality-gate-summary > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.quality-gate-summary strong,
+.quality-gate-summary span {
+  font-size: 12px;
+}
+
+.quality-gate-summary span {
+  color: var(--color-muted-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.quality-gate-summary p,
+.quality-gate-summary ul {
+  margin: 7px 0 0;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.quality-gate-summary ul {
+  padding-left: 18px;
+}
+
+.workflow-approval-gate {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.4fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin: 16px 0;
+  padding: 14px 16px;
+  border-left: 3px solid var(--color-warning);
+  background: #fffbeb;
+}
+
+.workflow-approval-gate > div {
+  display: grid;
+  gap: 4px;
+}
+
+.workflow-approval-gate strong {
+  font-size: 13px;
+}
+
+.workflow-approval-gate p {
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  .workflow-approval-gate {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-approval-gate .el-button {
+    width: 100%;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 640px) {
+  .orchestration-heading {
+    flex-direction: column;
+  }
+
+  .orchestration-branch-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .branch-role {
+    grid-column: 1 / -1;
+  }
+
+  .orchestration-branch-row small {
+    white-space: normal;
+  }
+}
+</style>

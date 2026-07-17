@@ -76,13 +76,30 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `POST /knowledge/search`
 - `PATCH /knowledge/documents/{document_id}`：修改标签和来源。
 - `GET /knowledge/documents/{document_id}/chunks/{chunk_index}`：定位引用片段。
+- `GET /knowledge/documents/{document_id}/index-versions`：按版本倒序返回 parser、chunker、embedding、块数量、状态和激活时间。
+- `POST /knowledge/documents/{document_id}/index-versions/{index_version}/activate`：使用 `request_id` 激活历史索引；目标版本的 PostgreSQL 向量会先重新写入 Milvus，当前版本保留为 `SUPERSEDED`。
 - `POST /knowledge/documents/{document_id}/retry`
 - `POST /knowledge/documents/{document_id}/reindex`
 - `DELETE /knowledge/documents/{document_id}`
 
 知识库上传和删除要求 `knowledge:write`；查询和检索只要求项目读取权限。上传返回 `202 QUEUED`，相同范围的重复内容返回 `409` 和已有文档 ID。
 
+`POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
+
 `POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点持久化快照，自动重试耗尽或取消后幂等退款。
+
+## AI 原型工作室
+
+- `GET /prototypes`、`GET /prototypes/{prototype_id}`：查询当前用户可访问的原型及不可变版本历史。
+- `POST /prototypes/generate`：从项目、可选需求和自然语言目标生成可交互原型。
+- `POST /prototypes/{prototype_id}/regenerate`：根据修订意见创建新版本，不覆盖历史版本。
+- `POST /prototypes/{prototype_id}/versions/{version}/activate`：切换活动版本；切换到其他版本会把审批状态重置为 `DRAFT`。
+- `PATCH /prototypes/{prototype_id}`、`DELETE /prototypes/{prototype_id}`：更新状态或删除原型。
+- `GET|POST /prototypes/{prototype_id}/comments`：读取或创建当前版本的页面级评审意见。
+- `PATCH /prototypes/{prototype_id}/comments/{comment_id}`：解决或重新打开评审意见。
+- `POST /prototypes/{prototype_id}/materialize`：将已批准版本幂等转换为实现任务和结构化验收用例。
+
+批准要求当前版本通过自动质量门禁且没有待处理评审意见。`materialize` 要求客户端提供唯一 `request_id`；同一原型版本重复调用返回已有交付结果，不重复创建任务或用例。
 
 ## Token 钱包
 
@@ -108,7 +125,7 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `POST /notifications/{notification_id}/send`
 - `POST /notifications/{notification_id}/cancel`
 - `GET|PATCH /settings`：管理员读取或更新运行时配置；密钥只返回配置状态。
-- `POST /settings/test-connection`：测试 LLM、Embedding、Redis、Milvus、MinIO 或 SMTP。
+- `POST /settings/test-connection`：测试 LLM、Embedding、Reranker、Docling、Redis、Milvus、MinIO 或 SMTP。
 - `GET /audit`：仅管理员，支持 `action`、`project_id`、`limit` 过滤。
 - `GET /health`、`GET /health/ready`
 

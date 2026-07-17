@@ -15,6 +15,8 @@ class MilvusVectorStore:
     def __init__(self) -> None:
         self.connected = False
         self.supports_hybrid = False
+        self.supports_multi_vector = False
+        self.supports_owner_filter = False
 
     def connect(self) -> bool:
         if self.connected:
@@ -37,6 +39,7 @@ class MilvusVectorStore:
                     FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=100),
                     FieldSchema(name="document_id", dtype=DataType.INT64),
                     FieldSchema(name="project_id", dtype=DataType.INT64),
+                    FieldSchema(name="owner_id", dtype=DataType.INT64),
                     FieldSchema(name="index_version", dtype=DataType.INT64),
                     FieldSchema(
                         name="content",
@@ -48,6 +51,7 @@ class MilvusVectorStore:
                     ),
                     FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR),
                     FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=settings.embedding_dimensions),
+                    FieldSchema(name="parent_embedding", dtype=DataType.FLOAT_VECTOR, dim=settings.embedding_dimensions),
                 ]
                 schema = CollectionSchema(fields=fields, description="Agent Workspace knowledge chunks")
                 schema.add_function(
@@ -71,15 +75,23 @@ class MilvusVectorStore:
                         "params": {"inverted_index_algo": "DAAT_MAXSCORE"},
                     },
                 )
+                collection.create_index(
+                    field_name="parent_embedding",
+                    index_params={"metric_type": "COSINE", "index_type": "AUTOINDEX", "params": {}},
+                )
             collection = Collection(settings.milvus_collection)
             field_names = {field.name for field in collection.schema.fields}
             self.supports_hybrid = {"sparse", "content", "index_version"}.issubset(field_names)
+            self.supports_multi_vector = "parent_embedding" in field_names
+            self.supports_owner_filter = "owner_id" in field_names
             collection.load()
             self.connected = True
             return True
         except Exception as exc:
             self.connected = False
             self.supports_hybrid = False
+            self.supports_multi_vector = False
+            self.supports_owner_filter = False
             if not settings.vector_fallback_enabled:
                 raise VectorStoreError("Milvus connection failed") from exc
             logger.info("Milvus unavailable, using PostgreSQL retrieval fallback: %s", exc)
@@ -93,6 +105,8 @@ class MilvusVectorStore:
         content: str,
         embedding: list[float],
         index_version: int = 0,
+        parent_embedding: list[float] | None = None,
+        owner_id: int | None = None,
     ) -> None:
         if not self.connect():
             return
@@ -101,18 +115,18 @@ class MilvusVectorStore:
 
             collection = Collection(settings.milvus_collection)
             if self.supports_hybrid:
-                collection.upsert(
-                    [
-                        {
-                            "id": vector_id,
-                            "document_id": document_id,
-                            "project_id": project_id or 0,
-                            "index_version": index_version,
-                            "content": content[:8192],
-                            "embedding": embedding,
-                        }
-                    ]
-                )
+                item = {
+                    "id": vector_id,
+                    "document_id": document_id,
+                    "project_id": project_id or 0,
+                    "owner_id": owner_id or 0,
+                    "index_version": index_version,
+                    "content": content[:8192],
+                    "embedding": embedding,
+                }
+                if self.supports_multi_vector:
+                    item["parent_embedding"] = parent_embedding or embedding
+                collection.upsert([item])
             else:
                 collection.upsert(
                     [
@@ -129,13 +143,44 @@ class MilvusVectorStore:
                 raise VectorStoreError("Milvus upsert failed") from exc
             logger.info("Milvus upsert skipped: %s", exc)
 
-    def search(self, embedding: list[float], project_id: int | None, limit: int) -> list[dict]:
+    def _scope_expression(
+        self,
+        project_id: int | None,
+        owner_id: int | None,
+        document_ids: list[int] | None = None,
+    ) -> str | None:
+        if project_id is not None:
+            expression = f"project_id == {project_id}"
+        elif owner_id is not None and self.supports_owner_filter:
+            expression = f"project_id == 0 and owner_id == {owner_id}"
+        elif owner_id is not None:
+            if not settings.vector_fallback_enabled:
+                raise VectorStoreError("Milvus collection does not support personal owner isolation")
+            logger.warning("Milvus owner filter unavailable; using PostgreSQL retrieval fallback")
+            return None
+        else:
+            expression = "project_id == 0"
+        if document_ids:
+            ids = ", ".join(str(document_id) for document_id in sorted(set(document_ids)))
+            expression += f" and document_id in [{ids}]"
+        return expression
+
+    def search(
+        self,
+        embedding: list[float],
+        project_id: int | None,
+        limit: int,
+        owner_id: int | None = None,
+        document_ids: list[int] | None = None,
+    ) -> list[dict]:
         if not self.connect():
             return []
         try:
             from pymilvus import Collection
 
-            expression = f"project_id == {project_id}" if project_id is not None else "project_id == 0"
+            expression = self._scope_expression(project_id, owner_id, document_ids)
+            if expression is None:
+                return []
             output_fields = ["document_id", "project_id", "content"]
             if self.supports_hybrid:
                 output_fields.append("index_version")
@@ -169,13 +214,23 @@ class MilvusVectorStore:
         embedding: list[float],
         project_id: int | None,
         limit: int,
+        owner_id: int | None = None,
+        document_ids: list[int] | None = None,
     ) -> list[dict]:
         if not self.connect() or not self.supports_hybrid:
-            return self.search(embedding, project_id, limit)
+            return self.search(
+                embedding,
+                project_id,
+                limit,
+                owner_id=owner_id,
+                document_ids=document_ids,
+            )
         try:
             from pymilvus import AnnSearchRequest, Collection, RRFRanker
 
-            expression = f"project_id == {project_id}" if project_id is not None else "project_id == 0"
+            expression = self._scope_expression(project_id, owner_id, document_ids)
+            if expression is None:
+                return []
             dense_request = AnnSearchRequest(
                 data=[embedding],
                 anns_field="embedding",
@@ -190,8 +245,19 @@ class MilvusVectorStore:
                 limit=limit,
                 expr=expression,
             )
+            requests = [sparse_request, dense_request]
+            if settings.rag_multi_vector_enabled and self.supports_multi_vector:
+                requests.append(
+                    AnnSearchRequest(
+                        data=[embedding],
+                        anns_field="parent_embedding",
+                        param={"metric_type": "COSINE", "params": {}},
+                        limit=limit,
+                        expr=expression,
+                    )
+                )
             rows = Collection(settings.milvus_collection).hybrid_search(
-                reqs=[sparse_request, dense_request],
+                reqs=requests,
                 rerank=RRFRanker(60),
                 limit=limit,
                 output_fields=["document_id", "project_id", "index_version", "content"],
@@ -210,7 +276,13 @@ class MilvusVectorStore:
             if not settings.vector_fallback_enabled:
                 raise VectorStoreError("Milvus hybrid search failed") from exc
             logger.warning("Milvus hybrid search failed; using dense search: %s", exc)
-            return self.search(embedding, project_id, limit)
+            return self.search(
+                embedding,
+                project_id,
+                limit,
+                owner_id=owner_id,
+                document_ids=document_ids,
+            )
 
     def delete_document(self, document_id: int) -> None:
         if not self.connect():

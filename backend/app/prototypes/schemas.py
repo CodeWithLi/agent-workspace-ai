@@ -167,3 +167,54 @@ class PrototypeOut(BaseModel):
 class PrototypeDetailOut(PrototypeOut):
     current: PrototypeVersionOut
     versions: list[PrototypeVersionOut]
+
+
+class PrototypeCommentCreate(BaseModel):
+    screen_id: str | None = Field(default=None, max_length=64)
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class PrototypeCommentUpdate(BaseModel):
+    status: Literal["OPEN", "RESOLVED"]
+
+
+class PrototypeCommentOut(BaseModel):
+    id: int
+    prototype_id: int
+    prototype_version: int
+    screen_id: str | None
+    user_id: int
+    user_name: str
+    body: str
+    status: str
+    resolved_by_user_id: int | None
+    resolved_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PrototypeMaterializeRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class PrototypeTestCaseOut(BaseModel):
+    id: int
+    prototype_id: int
+    prototype_version: int
+    screen_id: str
+    case_key: str
+    title: str
+    preconditions: str
+    steps: list[str]
+    expected_result: str
+    priority: str
+    created_at: datetime
+
+
+class PrototypeMaterializationOut(BaseModel):
+    id: int
+    prototype_id: int
+    prototype_version: int
+    task_ids: list[int]
+    test_cases: list[PrototypeTestCaseOut]
+    created_at: datetime

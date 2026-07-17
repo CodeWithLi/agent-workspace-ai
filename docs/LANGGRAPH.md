@@ -15,7 +15,12 @@
   "documents": [],
   "messages": [],
   "report": "",
-  "agent_snapshot": {}
+  "agent_snapshot": {},
+  "execution_plan": {},
+  "specialist_handoffs": [],
+  "quality_gate": {},
+  "revision_round": 0,
+  "revision_feedback": ""
 }
 ```
 
@@ -24,11 +29,18 @@
 1. Requirement Agent
 2. Product Agent
 3. Architect Agent
-4. Project Manager Agent
-5. Tester Agent
-6. Report Generator
+4. Planning Agent：生成经过结构校验的动态执行计划。
+5. Specialist Branches：并行执行 2 至 4 个专业分支并生成结构化 Handoff。
+6. Quality Gate：合并确定性检查和测试 Agent 评审，最多触发一轮自动修订。
+7. Project Manager Agent
+8. Tester Agent
+9. Report Generator
 
-工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时冻结各角色的 Prompt、模型、并发限制和 Prompt 版本；架构师读取真实 PRD，项目经理读取 PRD 与系统设计，测试工程师读取前三阶段产物，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
+工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时冻结各角色的 Prompt、模型、并发限制和 Prompt 版本；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
+
+规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，无效模型输出使用确定性默认计划。专业分支通过 `asyncio.gather` 并行执行；质量门禁检查角色覆盖、交付内容、成功标准和并行广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，人工反馈只重跑指定分支。
+
+除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。
 
 ## Saga 写操作一致性
 
@@ -43,7 +55,7 @@
 ## 暂停与继续
 
 `POST /api/v1/workflow/run` 返回 `202 QUEUED`，后台 dispatcher 认领并执行，默认在 `report` 前进入 `PAUSED`。
-`POST /api/v1/workflow/continue` 接收人工反馈后重新入队，最终报告写入 `reports` 表。`GET /workflow/{id}/events` 以 SSE 返回持久化节点事件。
+`POST /api/v1/workflow/continue` 可在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。最终报告写入 `reports` 表。`GET /workflow/{id}/events` 以 SSE 返回持久化节点事件。
 
 继续操作只允许对 `PAUSED` 运行执行一次；任务创建按标题幂等，重复继续返回 `409`，不会重复落任务或报告。
 

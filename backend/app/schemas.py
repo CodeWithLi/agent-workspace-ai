@@ -182,6 +182,9 @@ class TaskOut(BaseModel):
     assignee_user_id: int | None
     due_date: str
     due_at: datetime | None
+    source_prototype_id: int | None
+    source_prototype_version: int | None
+    source_screen_id: str | None
     created_at: datetime
     updated_at: datetime
 

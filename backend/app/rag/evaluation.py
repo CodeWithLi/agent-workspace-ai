@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from time import perf_counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -56,9 +57,69 @@ class ChunkingEvaluation:
         return asdict(self)
 
 
+@dataclass(slots=True, frozen=True)
+class AnswerJudgeResult:
+    faithfulness: float
+    answer_relevance: float
+    citation_correctness: float
+    refusal_correct: bool
+    reason: str
+
+
+def parse_answer_judge_response(response: str) -> AnswerJudgeResult:
+    candidate = response.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1)
+    try:
+        payload = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("answer judge did not return valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("answer judge response must be an object")
+
+    def score(name: str) -> float:
+        value = payload.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"answer judge field {name} must be numeric")
+        if not 0 <= float(value) <= 1:
+            raise ValueError(f"answer judge field {name} must be within [0, 1]")
+        return float(value)
+
+    refusal_correct = payload.get("refusal_correct")
+    reason = payload.get("reason")
+    if not isinstance(refusal_correct, bool):
+        raise ValueError("answer judge field refusal_correct must be boolean")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("answer judge field reason must be a non-empty string")
+    return AnswerJudgeResult(
+        faithfulness=score("faithfulness"),
+        answer_relevance=score("answer_relevance"),
+        citation_correctness=score("citation_correctness"),
+        refusal_correct=refusal_correct,
+        reason=reason.strip()[:1000],
+    )
+
+
+def answer_citations(answer: str) -> set[str]:
+    return set(re.findall(r"\[([^\[\]]+#chunk-\d+)\]", answer))
+
+
+def deterministic_citation_score(answer: str, allowed: set[str], *, answerable: bool) -> float:
+    citations = answer_citations(answer)
+    if not citations:
+        return 0.0 if answerable else 1.0
+    return 1.0 if citations.issubset(allowed) else 0.0
+
+
 def load_cases(path: Path) -> list[RetrievalCase]:
     rows = json.loads(path.read_text(encoding="utf-8"))
     return [RetrievalCase(**row) for row in rows]
+
+
+def load_documents(cases: list[RetrievalCase], directory: Path) -> dict[str, bytes]:
+    filenames = sorted({case.document for case in cases if case.document is not None})
+    return {filename: (directory / filename).read_bytes() for filename in filenames}
 
 
 def legacy_candidates(documents: dict[str, bytes], token_count: Callable[[str], int]) -> list[CandidateChunk]:
@@ -90,7 +151,7 @@ def chonkie_sentence_candidates(
     documents: dict[str, bytes],
     *,
     chunk_tokens: int = 400,
-    overlap_tokens: int = 60,
+    overlap_tokens: int = 100,
 ) -> list[CandidateChunk]:
     from chonkie import SentenceChunker
 

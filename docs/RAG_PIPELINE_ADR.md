@@ -19,7 +19,7 @@
 | Docling | 63.3k | 代码 MIT，模型另行授权 | v2.113.0，2026-07-14 | 1,231 | 首选高级解析候选，使用独立 worker 隔离资源 |
 | LlamaIndex | 50.9k | MIT | v0.14.23，2026-06-24 | 7,857 | 采用父子块和句子窗口思路，不引入完整框架 |
 | Unstructured | 15.2k | Apache-2.0 | 0.24.1，2026-07-11 | 1,909 | Docling 的解析对照组及格式降级候选 |
-| Chonkie | 4.5k | MIT | v1.7.0，2026-07-07 | 2,201 | 保留为离线分块对照，不进入当前生产依赖 |
+| Chonkie | 4.5k | MIT | v1.7.0，2026-07-07 | 2,201 | 作为可选语义边界策略依赖；结构、表格和代码仍由本项目模型保留 |
 
 ### 能力与集成成本
 
@@ -31,7 +31,7 @@
 | Docling | 多语言 | PDF 版面、OCR、模型管线 | 支持 DOCX、Markdown 等 | 强 | DoclingDocument、页码、bbox、标题层级 | 高，标准依赖包含 Torch/模型，宜独立部署 |
 | Unstructured | 多语言 | partition_pdf 与 OCR 策略 | 多格式 partition | Element 类型保留 | Element metadata、页码、坐标 | 中高，PDF/OCR extras 较重 |
 | MinerU | 中文 PDF 强 | 版面、公式、表格、OCR | 重点是 PDF | 强 | 页码、bbox、阅读顺序 | 高，模型/硬件/自定义许可均需治理 |
-| Chonkie | 分隔符可配置 | 不负责解析 | 对纯文本分块 | Code/Table chunker 可选 | 不恢复源文档结构 | 低，但本轮实测未胜出 |
+| Chonkie | 分隔符可配置 | 不负责解析 | 对连续正文做语义分块 | Code/Table chunker 可选 | 由本项目适配层恢复标题和元素关系 | 中；需要真实 embedding，默认不启用 |
 
 MinerU 附加条款要求：合并口径 MAU 超过 1 亿或月收入超过 2000 万美元时需另取商业许可；基于 MinerU 向第三方提供在线服务时必须显著标识。该约束必须进入部署审批，而不能只记录为“Apache-2.0”。
 
@@ -52,23 +52,23 @@ MinerU 附加条款要求：合并口径 MAU 超过 1 亿或月收入超过 2000
 python scripts/evaluate_rag_chunking.py --include-chonkie
 ```
 
-数据集使用仓库内 6 份真实设计和运维文档、6 个固定查询及逐字证据。当前结果：
+数据集使用仓库内 6 份真实设计和运维文档、8 个固定查询（6 个可回答、2 个拒答）及逐字证据。当前确定性稀疏回归结果采用 `400/100 tokens`：
 
-| 策略 | chunks | Recall@5 | MRR | nDCG@5 | 标题元数据覆盖 | 最大 Token | 首次分块耗时 |
+| 策略 | chunks | Recall@5 | MRR | nDCG@5 | 标题元数据覆盖 | 最大 Token | 索引 Token |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 旧 900/140 字符窗口 | 15 | 0.8333 | 0.7500 | 0.7718 | 0% | 607 | 7.04 ms |
-| 结构化父子分块 v1 | 27 | 0.8333 | 0.7500 | 0.7718 | 100% | 381 | 134.53 ms |
-| Chonkie Sentence 1.7.0 | 17 | 0.8333 | 0.7500 | 0.7311 | 0% | 397 | 1893.89 ms |
+| 旧 900/140 字符窗口 | 20 | 0.6667 | 0.6667 | 0.6667 | 0% | 676 | 7,201 |
+| 结构化父子分块 v2 | 33 | 0.6667 | 0.6667 | 0.6667 | 100% | 391 | 6,990 |
 
-本轮只能证明结构元数据和 Token 上限改善，不能证明召回提升。Chonkie 在该数据集未胜出，因此只保留在 `requirements-rag-eval.txt` 和离线评测适配器中，不进入生产依赖。
+结构化方案的 Context Precision 从 `0.1972` 提升到 `0.2250`，拒答准确率保持 `1.0`，索引 token 减少约 `2.9%`；Recall/MRR/nDCG 尚未提升。`400/60` 会造成父块去重后的排序退化，`400/140` 会使索引 token 超过旧方案，因此默认采用 `400/100`。这仍不能证明真实多语混合检索显著优于基线。Chonkie 在此前同数据对照中未胜出，只保留在离线评测依赖中。
 
 Docling 2.113.0 的 `standard` 依赖包含 Torch、TorchVision、Docling IBM Models、RapidOCR 等组件。隔离 Python 3.13 环境安装 `docling-slim[convert-core,feat-chunking,format-docx,format-markdown,format-pdf]` 用时约 134 秒；`HybridChunker` 可以导入，但 `DocumentConverter` 仍在模块加载阶段硬依赖 Torch。官方 Docling Serve 1.26 CPU 镜像约 4.4 GB。因此高级 Docling/MinerU 解析必须隔离为独立 worker 或服务，不能直接增加 API 容器的冷启动、镜像和内存负担。
 
 ## 尚未完成的验证
 
-- 使用项目真实 PDF、DOCX、Markdown、中文表格、扫描件和代码文档建立脱敏评测集。
+- 当前已固化 6 份仓库真实文档快照并增加 DOCX 表格、随机 Unicode 和扫描 PDF OCR 自动样本；仍需加入业务方脱敏的真实复杂 PDF、中文表格、公式和代码文档。
 - 比较 Docling、MinerU、Unstructured 的解析成功率、结构准确率、耗时、峰值内存、镜像体积和许可证约束。
-- 比较递归、结构、语义和父子分块的 Recall@K、nDCG、Context Precision/Recall 与引用正确率。
-- 验证新 Milvus schema、双版本索引、原子激活、回滚和跨项目隔离。
+- 确定性结构分块 A/B 已进入门禁；真实多语 embedding、查询改写、reranker、答案忠实度与引用正确率工作流已实现，但尚需配置受控外部服务并取得绿色运行报告。
+- Milvus v4 child/parent 多向量、个人 owner 隔离、4 并发 p95 的真实 CI 测试已实现；当前机器无 Docker，尚需首次 GitHub Actions 绿色运行作为证据。双版本索引、原子激活和回滚已有 SQLite/API/E2E 证据。
+- Docling DOCX 表格与图片型 PDF OCR 的真实定期工作流已实现，尚需首次绿色运行；MinerU 与 Unstructured 仍只有选型分析，没有同样本实测。
 
 在上述验证完成前，本 ADR 不把任何单一外部库描述为“最佳”。

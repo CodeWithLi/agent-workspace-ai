@@ -132,6 +132,9 @@ export interface Task {
   assignee_user_id?: number | null
   due_date: string
   due_at?: string | null
+  source_prototype_id?: number | null
+  source_prototype_version?: number | null
+  source_screen_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -488,4 +491,97 @@ export interface PrototypeSpecification {
     radius: 'compact' | 'soft' | 'rounded'
   }
   screens: PrototypeScreen[]
+}
+
+export interface PrototypeQualityCheck {
+  name: string
+  passed: boolean
+  detail: string
+}
+
+export interface PrototypeQuality {
+  score: number
+  passed: boolean
+  checks: PrototypeQualityCheck[]
+  issues: string[]
+  reviewer_summary?: string
+}
+
+export interface PrototypeAgentTrace {
+  role: string
+  agent_id: number
+  name: string
+  model: string
+  prompt_version: number
+  output: string
+}
+
+export interface PrototypeVersion {
+  id: number
+  version: number
+  source_prompt: string
+  specification: PrototypeSpecification
+  agent_trace: PrototypeAgentTrace[]
+  quality: PrototypeQuality
+  generation_mode: string
+  created_by_user_id: number
+  created_at: string
+}
+
+export interface ProductPrototype {
+  id: number
+  project_id: number
+  requirement_id?: number | null
+  created_by_user_id: number
+  title: string
+  summary: string
+  status: 'DRAFT' | 'REVIEW' | 'APPROVED' | 'ARCHIVED'
+  active_version: number
+  screen_count: number
+  quality_score: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ProductPrototypeDetail extends ProductPrototype {
+  current: PrototypeVersion
+  versions: PrototypeVersion[]
+}
+
+export interface PrototypeReviewComment {
+  id: number
+  prototype_id: number
+  prototype_version: number
+  screen_id?: string | null
+  user_id: number
+  user_name: string
+  body: string
+  status: 'OPEN' | 'RESOLVED'
+  resolved_by_user_id?: number | null
+  resolved_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PrototypeTestCase {
+  id: number
+  prototype_id: number
+  prototype_version: number
+  screen_id: string
+  case_key: string
+  title: string
+  preconditions: string
+  steps: string[]
+  expected_result: string
+  priority: string
+  created_at: string
+}
+
+export interface PrototypeMaterialization {
+  id: number
+  prototype_id: number
+  prototype_version: number
+  task_ids: number[]
+  test_cases: PrototypeTestCase[]
+  created_at: string
 }

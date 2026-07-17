@@ -1385,6 +1385,10 @@ h4 {
   display: none;
 }
 
+.version-list-mobile {
+  display: none;
+}
+
 .settings-switches {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2410,6 +2414,46 @@ h4 {
 
   .knowledge-document-actions .el-button + .el-button {
     margin-left: 0;
+  }
+
+  .version-table-desktop {
+    display: none;
+  }
+
+  .version-list-mobile {
+    display: block;
+    overflow: hidden;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+  }
+
+  .version-list-row {
+    display: grid;
+    gap: 5px;
+    padding: 12px;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .version-list-row:last-child {
+    border-bottom: 0;
+  }
+
+  .version-list-heading,
+  .version-list-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .version-list-footer {
+    color: var(--color-muted-text);
+    font-size: 12px;
+  }
+
+  .version-list-footer .el-button {
+    flex: 0 0 auto;
+    margin: 0;
   }
 
   .el-button:not(.is-link),

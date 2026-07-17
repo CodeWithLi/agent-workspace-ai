@@ -1,19 +1,41 @@
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import ensure_permission, get_current_user
 from app.api.routes.projects import accessible_project_ids, get_project_for_user
 from app.core.audit import record_audit
 from app.core.database import get_db
-from app.models import ProductPrototype, ProductPrototypeVersion, Requirement, User
+from app.models import (
+    ProductPrototype,
+    ProductPrototypeMaterialization,
+    ProductPrototypeVersion,
+    PrototypeReviewComment,
+    PrototypeTestCase,
+    Requirement,
+    Task,
+    User,
+)
+from app.prototypes.delivery import (
+    build_prototype_task_blueprints,
+    build_prototype_test_case_blueprints,
+)
 from app.prototypes.schemas import (
+    PrototypeCommentCreate,
+    PrototypeCommentOut,
+    PrototypeCommentUpdate,
     PrototypeDetailOut,
     PrototypeGenerateRequest,
+    PrototypeMaterializationOut,
+    PrototypeMaterializeRequest,
     PrototypeOut,
     PrototypeRegenerateRequest,
+    PrototypeSpecification,
+    PrototypeTestCaseOut,
     PrototypeUpdateRequest,
 )
 from app.prototypes.service import generate_prototype_version, version_out
@@ -90,6 +112,74 @@ def prototype_detail(db: Session, prototype: ProductPrototype) -> PrototypeDetai
         **summary.model_dump(),
         current=version_out(active),
         versions=[version_out(item) for item in versions],
+    )
+
+
+def comment_out(db: Session, item: PrototypeReviewComment) -> PrototypeCommentOut:
+    author = db.get(User, item.user_id)
+    return PrototypeCommentOut(
+        id=item.id,
+        prototype_id=item.prototype_id,
+        prototype_version=item.prototype_version,
+        screen_id=item.screen_id,
+        user_id=item.user_id,
+        user_name=author.name if author else "Unknown",
+        body=item.body,
+        status=item.status,
+        resolved_by_user_id=item.resolved_by_user_id,
+        resolved_at=item.resolved_at,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def test_case_out(item: PrototypeTestCase) -> PrototypeTestCaseOut:
+    return PrototypeTestCaseOut(
+        id=item.id,
+        prototype_id=item.prototype_id,
+        prototype_version=item.prototype_version,
+        screen_id=item.screen_id,
+        case_key=item.case_key,
+        title=item.title,
+        preconditions=item.preconditions,
+        steps=json.loads(item.steps_json or "[]"),
+        expected_result=item.expected_result,
+        priority=item.priority,
+        created_at=item.created_at,
+    )
+
+
+def materialization_out(
+    db: Session,
+    item: ProductPrototypeMaterialization,
+) -> PrototypeMaterializationOut:
+    task_ids = list(
+        db.scalars(
+            select(Task.id)
+            .where(
+                Task.source_prototype_id == item.prototype_id,
+                Task.source_prototype_version == item.prototype_version,
+            )
+            .order_by(Task.id)
+        )
+    )
+    test_cases = list(
+        db.scalars(
+            select(PrototypeTestCase)
+            .where(
+                PrototypeTestCase.prototype_id == item.prototype_id,
+                PrototypeTestCase.prototype_version == item.prototype_version,
+            )
+            .order_by(PrototypeTestCase.id)
+        )
+    )
+    return PrototypeMaterializationOut(
+        id=item.id,
+        prototype_id=item.prototype_id,
+        prototype_version=item.prototype_version,
+        task_ids=task_ids,
+        test_cases=[test_case_out(test_case) for test_case in test_cases],
+        created_at=item.created_at,
     )
 
 
@@ -187,6 +277,26 @@ def update_prototype(
     ensure_permission(current_user, "projects:write")
     prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
     values = payload.model_dump(exclude_unset=True)
+    if values.get("status") == "APPROVED" and prototype.status != "APPROVED":
+        active = current_version(db, prototype)
+        quality = json.loads(active.quality_json or "{}")
+        if not quality.get("passed"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="原型质量门禁通过后才能批准",
+            )
+        open_comment = db.scalar(
+            select(PrototypeReviewComment.id).where(
+                PrototypeReviewComment.prototype_id == prototype.id,
+                PrototypeReviewComment.prototype_version == prototype.active_version,
+                PrototypeReviewComment.status == "OPEN",
+            )
+        )
+        if open_comment:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="请先解决当前版本的待处理评审意见",
+            )
     for field, value in values.items():
         setattr(prototype, field, value)
     record_audit(
@@ -268,7 +378,9 @@ def activate_prototype_version(
         )
     )
     if not selected:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prototype version not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原型版本不存在")
+    if prototype.active_version != version:
+        prototype.status = "DRAFT"
     prototype.active_version = version
     prototype.summary = json.loads(selected.specification_json)["summary"]
     record_audit(
@@ -284,6 +396,231 @@ def activate_prototype_version(
     db.commit()
     db.refresh(prototype)
     return prototype_detail(db, prototype)
+
+
+@router.get("/{prototype_id}/comments", response_model=list[PrototypeCommentOut])
+def list_prototype_comments(
+    prototype_id: int,
+    version: int | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[PrototypeCommentOut]:
+    prototype = get_prototype_for_user(prototype_id, current_user, db)
+    stmt = select(PrototypeReviewComment).where(
+        PrototypeReviewComment.prototype_id == prototype.id
+    )
+    if version is not None:
+        stmt = stmt.where(PrototypeReviewComment.prototype_version == version)
+    items = list(db.scalars(stmt.order_by(PrototypeReviewComment.created_at.desc())))
+    return [comment_out(db, item) for item in items]
+
+
+@router.post(
+    "/{prototype_id}/comments",
+    response_model=PrototypeCommentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_prototype_comment(
+    prototype_id: int,
+    payload: PrototypeCommentCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PrototypeCommentOut:
+    prototype = get_prototype_for_user(prototype_id, current_user, db)
+    version = current_version(db, prototype)
+    specification = PrototypeSpecification.model_validate_json(version.specification_json)
+    if payload.screen_id and not any(
+        screen.id == payload.screen_id for screen in specification.screens
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="评审意见关联的页面必须存在于当前原型版本",
+        )
+    item = PrototypeReviewComment(
+        prototype_id=prototype.id,
+        prototype_version=prototype.active_version,
+        screen_id=payload.screen_id,
+        user_id=current_user.id,
+        body=payload.body.strip(),
+        status="OPEN",
+    )
+    db.add(item)
+    db.flush()
+    record_audit(
+        db,
+        "prototype.comment_create",
+        current_user.id,
+        prototype.project_id,
+        "prototype_review_comment",
+        item.id,
+        {
+            "prototype_id": prototype.id,
+            "version": prototype.active_version,
+            "screen_id": item.screen_id,
+        },
+        request,
+    )
+    db.commit()
+    db.refresh(item)
+    return comment_out(db, item)
+
+
+@router.patch(
+    "/{prototype_id}/comments/{comment_id}",
+    response_model=PrototypeCommentOut,
+)
+def update_prototype_comment(
+    prototype_id: int,
+    comment_id: int,
+    payload: PrototypeCommentUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PrototypeCommentOut:
+    ensure_permission(current_user, "projects:write")
+    prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
+    item = db.get(PrototypeReviewComment, comment_id)
+    if not item or item.prototype_id != prototype.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="原型评审意见不存在",
+        )
+    item.status = payload.status
+    if payload.status == "RESOLVED":
+        item.resolved_by_user_id = current_user.id
+        item.resolved_at = datetime.now(timezone.utc)
+    else:
+        item.resolved_by_user_id = None
+        item.resolved_at = None
+    record_audit(
+        db,
+        "prototype.comment_update",
+        current_user.id,
+        prototype.project_id,
+        "prototype_review_comment",
+        item.id,
+        {"status": item.status},
+        request,
+    )
+    db.commit()
+    db.refresh(item)
+    return comment_out(db, item)
+
+
+@router.post(
+    "/{prototype_id}/materialize",
+    response_model=PrototypeMaterializationOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def materialize_prototype(
+    prototype_id: int,
+    payload: PrototypeMaterializeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PrototypeMaterializationOut:
+    ensure_permission(current_user, "projects:write")
+    prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
+    existing_request = db.scalar(
+        select(ProductPrototypeMaterialization).where(
+            ProductPrototypeMaterialization.request_id == payload.request_id
+        )
+    )
+    if existing_request:
+        if existing_request.prototype_id != prototype.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="该交付请求 ID 已被使用",
+            )
+        return materialization_out(db, existing_request)
+    existing_version = db.scalar(
+        select(ProductPrototypeMaterialization).where(
+            ProductPrototypeMaterialization.prototype_id == prototype.id,
+            ProductPrototypeMaterialization.prototype_version == prototype.active_version,
+        )
+    )
+    if existing_version:
+        return materialization_out(db, existing_version)
+    if prototype.status != "APPROVED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="请先批准当前原型版本再生成交付清单",
+        )
+    version = current_version(db, prototype)
+    specification = PrototypeSpecification.model_validate_json(version.specification_json)
+    task_blueprints = build_prototype_task_blueprints(specification)
+    test_case_blueprints = build_prototype_test_case_blueprints(specification)
+    for blueprint in task_blueprints:
+        db.add(
+            Task(
+                project_id=prototype.project_id,
+                title=blueprint["title"],
+                description=blueprint["description"],
+                priority=blueprint["priority"],
+                source_prototype_id=prototype.id,
+                source_prototype_version=prototype.active_version,
+                source_screen_id=blueprint["screen_id"],
+            )
+        )
+    for blueprint in test_case_blueprints:
+        db.add(
+            PrototypeTestCase(
+                prototype_id=prototype.id,
+                prototype_version=prototype.active_version,
+                screen_id=blueprint["screen_id"],
+                case_key=blueprint["case_key"],
+                title=blueprint["title"],
+                preconditions=blueprint["preconditions"],
+                steps_json=json.dumps(blueprint["steps"], ensure_ascii=False),
+                expected_result=blueprint["expected_result"],
+                priority=blueprint["priority"],
+                created_by_user_id=current_user.id,
+            )
+        )
+    materialization = ProductPrototypeMaterialization(
+        prototype_id=prototype.id,
+        prototype_version=prototype.active_version,
+        request_id=payload.request_id,
+        task_count=len(task_blueprints),
+        test_case_count=len(test_case_blueprints),
+        created_by_user_id=current_user.id,
+    )
+    db.add(materialization)
+    try:
+        db.flush()
+        record_audit(
+            db,
+            "prototype.materialize",
+            current_user.id,
+            prototype.project_id,
+            "product_prototype_materialization",
+            materialization.id,
+            {
+                "prototype_id": prototype.id,
+                "version": prototype.active_version,
+                "task_count": len(task_blueprints),
+                "test_case_count": len(test_case_blueprints),
+            },
+            request,
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        existing = db.scalar(
+            select(ProductPrototypeMaterialization).where(
+                ProductPrototypeMaterialization.prototype_id == prototype.id,
+                ProductPrototypeMaterialization.prototype_version == prototype.active_version,
+            )
+        )
+        if existing:
+            return materialization_out(db, existing)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="原型交付数据与已有转换结果冲突",
+        ) from exc
+    db.refresh(materialization)
+    return materialization_out(db, materialization)
 
 
 @router.delete("/{prototype_id}", status_code=status.HTTP_204_NO_CONTENT)

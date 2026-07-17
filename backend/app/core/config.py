@@ -45,8 +45,11 @@ class Settings(BaseSettings):
     rag_chunk_overlap: int = Field(default=140, ge=0, le=1000)
     rag_child_chunk_tokens: int = Field(default=400, ge=64, le=2000)
     rag_parent_chunk_tokens: int = Field(default=1200, ge=128, le=8000)
-    rag_chunk_overlap_tokens: int = Field(default=60, ge=0, le=500)
+    rag_chunk_overlap_tokens: int = Field(default=100, ge=0, le=500)
     rag_min_chunk_tokens: int = Field(default=30, ge=1, le=500)
+    rag_chunk_strategy: str = "structural"
+    rag_semantic_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    rag_multi_vector_enabled: bool = False
     rag_context_max_tokens: int = Field(default=4000, ge=256, le=32000)
     rag_min_query_coverage: float = Field(default=0.15, ge=0.0, le=1.0)
     rag_dense_override_score: float = Field(default=0.72, ge=0.0, le=1.0)
@@ -79,7 +82,7 @@ class Settings(BaseSettings):
 
     milvus_host: str = "localhost"
     milvus_port: int = 19530
-    milvus_collection: str = "knowledge_chunks_v3"
+    milvus_collection: str = "knowledge_chunks_v4"
     vector_fallback_enabled: bool = True
     metrics_enabled: bool = True
 
@@ -128,6 +131,8 @@ class Settings(BaseSettings):
             raise ValueError("RAG token overlap must be smaller than child token budget")
         if self.rag_min_chunk_tokens > self.rag_child_chunk_tokens:
             raise ValueError("RAG minimum chunk tokens must not exceed child token budget")
+        if self.rag_chunk_strategy not in {"structural", "semantic"}:
+            raise ValueError("RAG chunk strategy must be structural or semantic")
         if self.rag_parser_backend not in {"native", "auto", "docling"}:
             raise ValueError("RAG parser backend must be native, auto or docling")
         if self.environment == "production":

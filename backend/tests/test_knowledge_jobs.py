@@ -1,4 +1,5 @@
 from io import BytesIO
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException, UploadFile
@@ -35,7 +36,7 @@ async def test_document_upload_is_deduplicated_queued_and_indexed(
     content = b"# Recovery\nPostgreSQL backups must be restored in a rehearsal."
     monkeypatch.setattr("app.rag.service.object_storage.save", lambda *_args: "minio://bucket/recovery.md")
     monkeypatch.setattr("app.rag.service.object_storage.read", lambda *_args: content)
-    monkeypatch.setattr("app.rag.service.vector_store.upsert", lambda *_args: None)
+    monkeypatch.setattr("app.rag.service.vector_store.upsert", lambda *_args, **_kwargs: None)
 
     document = await queue_document(
         db,
@@ -131,7 +132,18 @@ async def test_reindex_activates_new_version_without_removing_previous_version(
     content = b"# Recovery\n\nKeep the active index available while rebuilding it."
     monkeypatch.setattr("app.rag.service.object_storage.save", lambda *_args: "minio://bucket/versioned.md")
     monkeypatch.setattr("app.rag.service.object_storage.read", lambda *_args: content)
-    monkeypatch.setattr("app.rag.service.vector_store.upsert", lambda *_args: None)
+    monkeypatch.setattr("app.rag.service.vector_store.upsert", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.rag.service.settings.rag_multi_vector_enabled", True)
+    embedding_calls: list[list[str]] = []
+
+    async def embed_many(texts: list[str]) -> list[list[float]]:
+        embedding_calls.append(texts)
+        return [[1.0] + [0.0] * 255 for _text in texts]
+
+    monkeypatch.setattr(
+        "app.rag.service.get_llm",
+        lambda: SimpleNamespace(embed_many=embed_many, api_key=None, base_url="https://embedding.invalid/v1"),
+    )
 
     document = await queue_document(
         db,
@@ -144,6 +156,7 @@ async def test_reindex_activates_new_version_without_removing_previous_version(
     db.expire_all()
     indexed = db.get(KnowledgeDocument, document.id)
     assert indexed.active_index_version == 1
+    assert len(embedding_calls) == 2
 
     reindex_document(
         document.id,
@@ -160,6 +173,7 @@ async def test_reindex_activates_new_version_without_removing_previous_version(
         db.scalars(select(Embedding.index_version).where(Embedding.document_id == document.id))
     )
     assert rebuilt.active_index_version == 2
+    assert len(embedding_calls) == 2
     assert versions == {1, 2}
     assert get_document_chunk(document.id, 0, user, db).index_version == 2
     index_records = list(
@@ -179,6 +193,67 @@ async def test_reindex_activates_new_version_without_removing_previous_version(
     db.refresh(rebuilt)
     assert rebuilt.active_index_version == 1
     assert get_document_chunk(document.id, 0, user, db).index_version == 1
+
+    monkeypatch.setattr("app.rag.service.settings.embedding_model", "replacement-embedding")
+    reindex_document(
+        document.id,
+        KnowledgeDocumentActionRequest(request_id="versioned-reindex-after-rollback"),
+        user,
+        db,
+    )
+    await process_document(db, document.id)
+    db.expire_all()
+    rebuilt_after_rollback = db.get(KnowledgeDocument, document.id)
+    assert rebuilt_after_rollback.active_index_version == 3
+    assert len(embedding_calls) == 4
+    assert set(db.scalars(select(Embedding.index_version).where(Embedding.document_id == document.id))) == {1, 2, 3}
+    assert [
+        (record.version, record.status)
+        for record in db.scalars(
+            select(KnowledgeIndexVersion)
+            .where(KnowledgeIndexVersion.document_id == document.id)
+            .order_by(KnowledgeIndexVersion.version)
+        )
+    ] == [(1, "SUPERSEDED"), (2, "SUPERSEDED"), (3, "ACTIVE")]
+
+
+@pytest.mark.asyncio
+async def test_failed_vector_write_cleans_attempted_ids_without_activating_index(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, project = project_user(db)
+    content = b"# Recovery\n\nA failed Milvus flush must not activate this index."
+    monkeypatch.setattr("app.rag.service.object_storage.save", lambda *_args: "minio://bucket/atomic.md")
+    monkeypatch.setattr("app.rag.service.object_storage.read", lambda *_args: content)
+    attempted: list[str] = []
+    cleaned: list[str] = []
+
+    def fail_upsert(vector_id: str, *_args, **_kwargs) -> None:
+        attempted.append(vector_id)
+        raise RuntimeError("Milvus flush failed")
+
+    monkeypatch.setattr("app.rag.service.vector_store.upsert", fail_upsert)
+    monkeypatch.setattr("app.rag.service.vector_store.delete_ids", lambda vector_ids: cleaned.extend(vector_ids))
+
+    document = await queue_document(
+        db,
+        user,
+        UploadFile(filename="atomic.md", file=BytesIO(content)),
+        project.id,
+    )
+    db.commit()
+
+    await process_document(db, document.id)
+    db.expire_all()
+    failed = db.get(KnowledgeDocument, document.id)
+
+    assert attempted and cleaned == attempted
+    assert failed.active_index_version == 0
+    assert failed.status == "QUEUED"
+    assert db.scalar(select(func.count(Embedding.id)).where(Embedding.document_id == document.id)) == 0
+    assert db.scalar(
+        select(func.count(KnowledgeIndexVersion.id)).where(KnowledgeIndexVersion.document_id == document.id)
+    ) == 0
 
 
 def test_project_members_share_project_documents(db: Session) -> None:

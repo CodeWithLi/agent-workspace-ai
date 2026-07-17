@@ -1,0 +1,1588 @@
+<template>
+  <section class="page prototype-studio-page">
+    <div class="page-head studio-page-head">
+      <div>
+        <h1>AI 原型工作室</h1>
+        <p>产品方案、可交互界面与多 Agent 评审版本。</p>
+      </div>
+      <div class="studio-head-actions">
+        <el-select
+          v-if="prototypes.length"
+          v-model="selectedPrototypeId"
+          class="prototype-switcher"
+          aria-label="切换产品原型"
+          @change="selectPrototype"
+        >
+          <el-option v-for="item in prototypes" :key="item.id" :label="`${item.title} · v${item.active_version}`" :value="item.id" />
+        </el-select>
+        <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openCreateDialog">新建原型</el-button>
+      </div>
+    </div>
+
+    <div v-loading="loadingCatalog" class="studio-content">
+      <div v-if="!loadingCatalog && !activePrototype" class="studio-empty">
+        <el-empty :description="projects.length ? '还没有产品原型' : '请先创建一个项目'">
+          <el-button v-if="projects.length && canCreate" type="primary" :icon="MagicStick" @click="openCreateDialog">生成第一个原型</el-button>
+          <el-button v-else-if="!projects.length && canCreate" type="primary" :icon="FolderAdd" @click="router.push('/projects')">创建项目</el-button>
+        </el-empty>
+      </div>
+
+      <template v-else-if="activePrototype">
+        <header class="prototype-summary-band">
+          <div class="prototype-heading">
+            <div class="prototype-title-row">
+              <h2>{{ activePrototype.title }}</h2>
+              <el-tag type="warning" effect="light" size="small">AI 草案</el-tag>
+              <span class="version-label">v{{ activePrototype.active_version }}</span>
+            </div>
+            <p>{{ activePrototype.summary }}</p>
+            <div class="prototype-context">
+              <span><el-icon><Folder /></el-icon>{{ activeProjectName }}</span>
+              <span v-if="activeRequirementName"><el-icon><Document /></el-icon>{{ activeRequirementName }}</span>
+              <span><el-icon><Clock /></el-icon>{{ formatDate(activePrototype.updated_at) }}</span>
+            </div>
+          </div>
+
+          <div class="prototype-summary-actions">
+            <el-segmented v-model="deviceMode" :options="deviceOptions" aria-label="原型预览设备" />
+            <el-button v-if="canEdit" :icon="Refresh" :loading="regenerating" @click="openRegenerateDialog">重新生成</el-button>
+            <el-button v-if="canEdit && activePrototype.status === 'APPROVED'" type="primary" :icon="Tickets" :loading="materializing" @click="materializePrototype">生成交付清单</el-button>
+            <el-dropdown trigger="click" @command="handleMoreCommand">
+              <el-button :icon="MoreFilled">更多</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="export" :icon="Download">导出 JSON</el-dropdown-item>
+                  <el-dropdown-item v-if="canEdit" command="delete" :icon="Delete" divided>删除原型</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
+        </header>
+
+        <div v-loading="loadingDetail" class="studio-shell">
+          <aside class="screen-navigator" aria-label="原型界面">
+            <div class="panel-heading">
+              <strong>界面</strong>
+              <span>{{ activePrototype.current.specification.screens.length }}</span>
+            </div>
+            <div class="screen-list">
+              <button
+                v-for="(screen, index) in activePrototype.current.specification.screens"
+                :key="screen.id"
+                :class="{ active: screen.id === activeScreenId }"
+                :aria-current="screen.id === activeScreenId ? 'page' : undefined"
+                @click="navigateScreen(screen.id)"
+              >
+                <span>{{ index + 1 }}</span>
+                <div><strong>{{ screen.name }}</strong><small>{{ screen.description || layoutLabel(screen.layout) }}</small></div>
+                <el-icon><ArrowRight /></el-icon>
+              </button>
+            </div>
+          </aside>
+
+          <main class="preview-workbench">
+            <div class="preview-toolbar">
+              <div>
+                <strong>{{ activeScreen?.name }}</strong>
+                <span>{{ lastInteraction || activeScreen?.description || '可交互原型预览' }}</span>
+              </div>
+              <el-tooltip content="重置当前预览的输入与交互状态" placement="top">
+                <el-button :icon="RefreshLeft" circle aria-label="重置原型交互" @click="resetCanvas" />
+              </el-tooltip>
+            </div>
+            <div class="preview-stage" :class="`preview-${deviceMode}`">
+              <div class="device-frame" :class="`device-${deviceMode}`">
+                <div v-if="deviceMode === 'mobile'" class="mobile-frame-top" aria-hidden="true"><span /></div>
+                <PrototypeCanvas
+                  :key="canvasSession"
+                  :spec="activePrototype.current.specification"
+                  :screen-id="activeScreenId"
+                  :device-mode="deviceMode"
+                  @navigate="navigateScreen"
+                  @back="navigateBack"
+                  @interaction="lastInteraction = $event"
+                />
+              </div>
+            </div>
+          </main>
+
+          <aside class="prototype-inspector">
+            <div class="inspector-status">
+              <div>
+                <small>评审状态</small>
+                <strong>{{ statusLabel(activePrototype.status) }}</strong>
+              </div>
+              <el-select
+                v-if="canEdit"
+                :model-value="activePrototype.status"
+                aria-label="更新原型评审状态"
+                :loading="savingStatus"
+                @change="updateStatus"
+              >
+                <el-option v-for="status in prototypeStatuses" :key="status" :label="statusLabel(status)" :value="status" />
+              </el-select>
+              <el-tag v-else :type="statusTagType(activePrototype.status)">{{ statusLabel(activePrototype.status) }}</el-tag>
+            </div>
+
+            <el-tabs v-model="inspectorTab" stretch>
+              <el-tab-pane label="质量" name="quality">
+                <div class="quality-summary">
+                  <el-progress
+                    type="dashboard"
+                    :percentage="Math.round(activePrototype.current.quality.score)"
+                    :color="qualityColor"
+                    :width="104"
+                    :stroke-width="9"
+                  />
+                  <div><strong>{{ activePrototype.current.quality.passed ? '通过自动门禁' : '需要继续修订' }}</strong><span>{{ activePrototype.current.quality.checks.filter((item) => item.passed).length }} / {{ activePrototype.current.quality.checks.length }} 项检查通过</span></div>
+                </div>
+                <ul class="quality-checks">
+                  <li v-for="check in activePrototype.current.quality.checks" :key="check.name" :class="{ failed: !check.passed }">
+                    <el-icon><CircleCheck v-if="check.passed" /><CircleClose v-else /></el-icon>
+                    <div><strong>{{ qualityCheckLabel(check.name) }}</strong><span>{{ check.detail }}</span></div>
+                  </li>
+                </ul>
+                <div v-if="activePrototype.current.quality.reviewer_summary" class="reviewer-summary">
+                  <strong>测试 Agent 结论</strong>
+                  <p>{{ activePrototype.current.quality.reviewer_summary }}</p>
+                </div>
+              </el-tab-pane>
+
+              <el-tab-pane :label="`评审 ${openReviewCount}`" name="reviews">
+                <div class="review-composer">
+                  <el-select v-model="commentScreenId" aria-label="评审评论所属界面">
+                    <el-option label="整个原型" value="" />
+                    <el-option v-for="screen in activePrototype.current.specification.screens" :key="screen.id" :label="screen.name" :value="screen.id" />
+                  </el-select>
+                  <el-input v-model="commentDraft" type="textarea" :rows="3" maxlength="5000" show-word-limit placeholder="记录需要修订的流程、状态或验收问题" aria-label="原型评审评论" />
+                  <el-button type="primary" :icon="ChatLineRound" :loading="postingComment" :disabled="!commentDraft.trim()" @click="addReviewComment">添加评论</el-button>
+                </div>
+                <div v-if="reviewComments.length" class="review-comment-list">
+                  <article v-for="comment in reviewComments" :key="comment.id" :class="{ resolved: comment.status === 'RESOLVED' }">
+                    <div class="review-comment-head">
+                      <div><strong>{{ comment.user_name }}</strong><span>{{ comment.screen_id ? screenName(comment.screen_id) : '整个原型' }} · {{ formatDate(comment.created_at) }}</span></div>
+                      <el-tag :type="comment.status === 'OPEN' ? 'warning' : 'success'" size="small">{{ comment.status === 'OPEN' ? '待处理' : '已解决' }}</el-tag>
+                    </div>
+                    <p>{{ comment.body }}</p>
+                    <el-button v-if="canEdit && comment.status === 'OPEN'" link type="primary" :loading="resolvingCommentId === comment.id" @click="resolveReviewComment(comment.id)">标记已解决</el-button>
+                  </article>
+                </div>
+                <el-empty v-else description="当前版本暂无评审评论" :image-size="56" />
+              </el-tab-pane>
+
+              <el-tab-pane label="Agent" name="agents">
+                <div class="agent-run-meta">
+                  <span>{{ generationModeLabel(activePrototype.current.generation_mode) }}</span>
+                  <span>{{ activePrototype.current.agent_trace.length }} 个 Agent</span>
+                </div>
+                <el-collapse accordion class="agent-trace-list">
+                  <el-collapse-item v-for="trace in activePrototype.current.agent_trace" :key="`${trace.role}-${trace.agent_id}`" :name="trace.role">
+                    <template #title>
+                      <span class="trace-avatar">{{ trace.name.slice(0, 1) }}</span>
+                      <span class="trace-title"><strong>{{ trace.name }}</strong><small>{{ roleLabel(trace.role) }} · {{ trace.model }}</small></span>
+                    </template>
+                    <pre>{{ trace.output }}</pre>
+                  </el-collapse-item>
+                </el-collapse>
+              </el-tab-pane>
+
+              <el-tab-pane :label="`版本 ${activePrototype.versions.length}`" name="versions">
+                <div class="version-history">
+                  <article v-for="version in activePrototype.versions" :key="version.id" :class="{ active: version.version === activePrototype.active_version }">
+                    <div class="version-marker"><span>v{{ version.version }}</span></div>
+                    <div class="version-copy">
+                      <div><strong>{{ version.version === activePrototype.active_version ? '当前版本' : `历史版本 v${version.version}` }}</strong><el-tag v-if="version.version === activePrototype.active_version" size="small" type="success">活动</el-tag></div>
+                      <span>{{ formatDate(version.created_at) }}</span>
+                      <small>{{ generationModeLabel(version.generation_mode) }} · 质量 {{ Math.round(version.quality.score) }}</small>
+                    </div>
+                    <el-tooltip v-if="canEdit && version.version !== activePrototype.active_version" content="恢复为活动版本" placement="left">
+                      <el-button :icon="RefreshLeft" circle aria-label="恢复原型版本" :loading="restoringVersion === version.version" @click="restoreVersion(version.version)" />
+                    </el-tooltip>
+                  </article>
+                </div>
+              </el-tab-pane>
+            </el-tabs>
+          </aside>
+        </div>
+      </template>
+    </div>
+
+    <el-dialog v-model="createDialog" title="生成产品原型" width="min(620px, 94vw)" :close-on-click-modal="!creating" :close-on-press-escape="!creating" :show-close="!creating">
+      <el-form label-position="top">
+        <div class="form-grid-two">
+          <el-form-item label="所属项目" required>
+            <el-select v-model="createForm.project_id" class="full" placeholder="选择项目" @change="onProjectChange">
+              <el-option v-for="project in writableProjects" :key="project.id" :label="project.name" :value="project.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="关联需求">
+            <el-select v-model="createForm.requirement_id" clearable class="full" placeholder="不关联需求" @change="onRequirementChange">
+              <el-option v-for="item in availableRequirements" :key="item.id" :label="item.title" :value="item.id" />
+            </el-select>
+          </el-form-item>
+        </div>
+        <el-form-item label="原型名称" required>
+          <el-input v-model="createForm.title" maxlength="200" show-word-limit placeholder="例如：手机号注册与邀请增长原型" />
+        </el-form-item>
+        <el-form-item label="产品目标与核心流程" required>
+          <el-input v-model="createForm.prompt" type="textarea" :rows="7" maxlength="12000" show-word-limit placeholder="描述目标用户、业务目标、关键页面、核心流程和验收要求" />
+        </el-form-item>
+      </el-form>
+      <div v-if="creating" class="generation-status" role="status">
+        <el-icon class="is-loading"><Loading /></el-icon>
+        <div><strong>Agent 团队正在生成原型</strong><span>产品经理整理路径，架构师构建交互，测试工程师执行质量门禁。</span></div>
+      </div>
+      <template #footer>
+        <el-button :disabled="creating" @click="createDialog = false">取消</el-button>
+        <el-button type="primary" :icon="MagicStick" :loading="creating" :disabled="!canSubmitCreate" @click="generatePrototype">{{ creating ? '生成中' : '开始生成' }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="regenerateDialog" title="重新生成原型" width="min(560px, 94vw)" :close-on-click-modal="!regenerating" :show-close="!regenerating">
+      <el-form label-position="top">
+        <el-form-item label="本轮修改意见">
+          <el-input v-model="regenerateFeedback" type="textarea" :rows="6" maxlength="4000" show-word-limit placeholder="例如：增加邀请奖励状态，并将移动端首要操作固定在底部" />
+        </el-form-item>
+      </el-form>
+      <div class="regenerate-note"><el-icon><InfoFilled /></el-icon><span>当前版本会保留，新结果将创建为独立版本。</span></div>
+      <template #footer>
+        <el-button :disabled="regenerating" @click="regenerateDialog = false">取消</el-button>
+        <el-button type="primary" :icon="Refresh" :loading="regenerating" @click="regeneratePrototype">生成新版本</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="materializationDialog" title="原型交付清单" width="min(860px, 94vw)">
+      <template v-if="materialization">
+        <div class="materialization-summary">
+          <div><span>实现任务</span><strong>{{ materialization.task_ids.length }}</strong></div>
+          <div><span>验收用例</span><strong>{{ materialization.test_cases.length }}</strong></div>
+          <div><span>原型版本</span><strong>v{{ materialization.prototype_version }}</strong></div>
+        </div>
+        <el-table :data="materialization.test_cases" class="materialization-table">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <div class="test-case-detail">
+                <strong>前置条件</strong><p>{{ row.preconditions }}</p>
+                <strong>执行步骤</strong><ol><li v-for="step in row.steps" :key="step">{{ step }}</li></ol>
+                <strong>预期结果</strong><p>{{ row.expected_result }}</p>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column prop="title" label="验收用例" min-width="260" />
+          <el-table-column label="界面" min-width="160"><template #default="{ row }">{{ screenName(row.screen_id) }}</template></el-table-column>
+          <el-table-column prop="priority" label="优先级" width="90" />
+        </el-table>
+      </template>
+      <template #footer>
+        <el-button @click="materializationDialog = false">关闭</el-button>
+        <el-button type="primary" :icon="Tickets" @click="router.push('/tasks')">查看任务看板</el-button>
+      </template>
+    </el-dialog>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import {
+  ArrowRight,
+  ChatLineRound,
+  CircleCheck,
+  CircleClose,
+  Clock,
+  Delete,
+  Document,
+  Download,
+  Folder,
+  FolderAdd,
+  InfoFilled,
+  Loading,
+  MagicStick,
+  MoreFilled,
+  Plus,
+  Refresh,
+  RefreshLeft,
+  Tickets
+} from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import 'element-plus/es/components/message/style/css.mjs'
+import { api } from '../api/client'
+import type {
+  ProductPrototype,
+  ProductPrototypeDetail,
+  Project,
+  PrototypeMaterialization,
+  PrototypeReviewComment,
+  PrototypeScreen,
+  Requirement
+} from '../api/types'
+import PrototypeCanvas from '../components/PrototypeCanvas.vue'
+import { useAuthStore } from '../stores/auth'
+import { confirmDestructiveAction } from '../utils/confirm'
+
+type DeviceMode = 'desktop' | 'mobile'
+type PrototypeStatus = ProductPrototype['status']
+
+const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
+const prototypes = ref<ProductPrototype[]>([])
+const projects = ref<Project[]>([])
+const requirements = ref<Requirement[]>([])
+const reviewComments = ref<PrototypeReviewComment[]>([])
+const activePrototype = ref<ProductPrototypeDetail | null>(null)
+const selectedPrototypeId = ref<number | null>(null)
+const activeScreenId = ref('')
+const screenHistory = ref<string[]>([])
+const deviceMode = ref<DeviceMode>('desktop')
+const inspectorTab = ref('quality')
+const loadingCatalog = ref(true)
+const loadingDetail = ref(false)
+const createDialog = ref(false)
+const creating = ref(false)
+const regenerateDialog = ref(false)
+const regenerating = ref(false)
+const regenerateFeedback = ref('')
+const savingStatus = ref(false)
+const restoringVersion = ref<number | null>(null)
+const commentDraft = ref('')
+const commentScreenId = ref('')
+const postingComment = ref(false)
+const resolvingCommentId = ref<number | null>(null)
+const materializing = ref(false)
+const materialization = ref<PrototypeMaterialization | null>(null)
+const materializationDialog = ref(false)
+const canvasSession = ref(0)
+const lastInteraction = ref('')
+const prototypeStatuses: PrototypeStatus[] = ['DRAFT', 'REVIEW', 'APPROVED', 'ARCHIVED']
+const deviceOptions = [
+  { label: '桌面', value: 'desktop' },
+  { label: '移动', value: 'mobile' }
+]
+const createForm = reactive({
+  project_id: null as number | null,
+  requirement_id: null as number | null,
+  title: '',
+  prompt: ''
+})
+
+const canCreate = computed(() => auth.hasPermission('projects:write'))
+const writableProjects = computed(() => projects.value.filter((project) => project.current_user_role !== 'viewer'))
+const activeProject = computed(() => projects.value.find((project) => project.id === activePrototype.value?.project_id))
+const canEdit = computed(() => canCreate.value && activeProject.value?.current_user_role !== 'viewer')
+const activeProjectName = computed(() => activeProject.value?.name || '项目')
+const activeRequirementName = computed(() => requirements.value.find((item) => item.id === activePrototype.value?.requirement_id)?.title || '')
+const availableRequirements = computed(() => requirements.value.filter((item) => item.project_id === createForm.project_id))
+const canSubmitCreate = computed(() => Boolean(
+  !creating.value
+  && createForm.project_id
+  && createForm.title.trim()
+  && createForm.prompt.trim().length >= 10
+))
+const activeScreen = computed<PrototypeScreen | undefined>(() =>
+  activePrototype.value?.current.specification.screens.find((screen) => screen.id === activeScreenId.value)
+)
+const openReviewCount = computed(() => reviewComments.value.filter((comment) => comment.status === 'OPEN').length)
+const qualityColor = computed(() => {
+  const score = activePrototype.value?.current.quality.score || 0
+  if (score >= 80) return '#15803d'
+  if (score >= 60) return '#b45309'
+  return '#b91c1c'
+})
+
+function summaryFromDetail(detail: ProductPrototypeDetail): ProductPrototype {
+  return {
+    id: detail.id,
+    project_id: detail.project_id,
+    requirement_id: detail.requirement_id,
+    created_by_user_id: detail.created_by_user_id,
+    title: detail.title,
+    summary: detail.summary,
+    status: detail.status,
+    active_version: detail.active_version,
+    screen_count: detail.screen_count,
+    quality_score: detail.quality_score,
+    created_at: detail.created_at,
+    updated_at: detail.updated_at
+  }
+}
+
+function mergePrototypeSummary(detail: ProductPrototypeDetail) {
+  const summary = summaryFromDetail(detail)
+  const index = prototypes.value.findIndex((item) => item.id === detail.id)
+  if (index >= 0) prototypes.value.splice(index, 1, summary)
+  else prototypes.value.unshift(summary)
+}
+
+async function loadReviewComments(prototypeId: number, version: number) {
+  const { data } = await api.get<PrototypeReviewComment[]>(`/prototypes/${prototypeId}/comments`, {
+    params: { version }
+  })
+  reviewComments.value = data
+}
+
+async function loadCatalog() {
+  loadingCatalog.value = true
+  try {
+    const [prototypeResponse, projectResponse, requirementResponse] = await Promise.all([
+      api.get<ProductPrototype[]>('/prototypes'),
+      api.get<Project[]>('/projects'),
+      api.get<Requirement[]>('/requirements')
+    ])
+    prototypes.value = prototypeResponse.data
+    projects.value = projectResponse.data
+    requirements.value = requirementResponse.data
+    const queryId = Number(route.query.prototype)
+    const initialId = prototypes.value.some((item) => item.id === queryId) ? queryId : prototypes.value[0]?.id
+    if (initialId) await openPrototype(initialId)
+  } finally {
+    loadingCatalog.value = false
+  }
+}
+
+async function openPrototype(id: number, syncRoute = true) {
+  if (!id) return
+  loadingDetail.value = true
+  selectedPrototypeId.value = id
+  try {
+    const { data } = await api.get<ProductPrototypeDetail>(`/prototypes/${id}`)
+    activePrototype.value = data
+    activeScreenId.value = data.current.specification.start_screen_id
+    commentScreenId.value = activeScreenId.value
+    screenHistory.value = []
+    lastInteraction.value = ''
+    materialization.value = null
+    canvasSession.value += 1
+    mergePrototypeSummary(data)
+    await loadReviewComments(data.id, data.active_version)
+    if (syncRoute && String(route.query.prototype || '') !== String(id)) {
+      await router.replace({ query: { ...route.query, prototype: String(id) } })
+    }
+  } finally {
+    loadingDetail.value = false
+  }
+}
+
+function selectPrototype(value: unknown) {
+  const id = Number(value)
+  if (id && id !== activePrototype.value?.id) void openPrototype(id)
+}
+
+function navigateScreen(screenId: string) {
+  if (!activePrototype.value || screenId === activeScreenId.value) return
+  if (!activePrototype.value.current.specification.screens.some((screen) => screen.id === screenId)) return
+  if (activeScreenId.value) screenHistory.value.push(activeScreenId.value)
+  activeScreenId.value = screenId
+  commentScreenId.value = screenId
+  lastInteraction.value = ''
+}
+
+function navigateBack() {
+  const previous = screenHistory.value.pop()
+  if (previous) activeScreenId.value = previous
+  else if (activePrototype.value) activeScreenId.value = activePrototype.value.current.specification.start_screen_id
+  commentScreenId.value = activeScreenId.value
+}
+
+function resetCanvas() {
+  canvasSession.value += 1
+  screenHistory.value = []
+  lastInteraction.value = '交互状态已重置'
+}
+
+function openCreateDialog() {
+  const project = writableProjects.value[0]
+  Object.assign(createForm, {
+    project_id: project?.id || null,
+    requirement_id: null,
+    title: '',
+    prompt: ''
+  })
+  createDialog.value = true
+}
+
+function onProjectChange() {
+  if (!availableRequirements.value.some((item) => item.id === createForm.requirement_id)) {
+    createForm.requirement_id = null
+  }
+}
+
+function onRequirementChange(value: unknown) {
+  const requirement = requirements.value.find((item) => item.id === Number(value))
+  if (!requirement) return
+  createForm.title = `${requirement.title} - 产品原型`
+  createForm.prompt = [requirement.content, requirement.analysis].filter(Boolean).join('\n\n')
+}
+
+async function generatePrototype() {
+  if (!canSubmitCreate.value || !createForm.project_id) return
+  creating.value = true
+  try {
+    const { data } = await api.post<ProductPrototypeDetail>('/prototypes/generate', {
+      project_id: createForm.project_id,
+      requirement_id: createForm.requirement_id,
+      title: createForm.title.trim(),
+      prompt: createForm.prompt.trim()
+    })
+    activePrototype.value = data
+    mergePrototypeSummary(data)
+    selectedPrototypeId.value = data.id
+    activeScreenId.value = data.current.specification.start_screen_id
+    commentScreenId.value = activeScreenId.value
+    reviewComments.value = []
+    materialization.value = null
+    screenHistory.value = []
+    canvasSession.value += 1
+    createDialog.value = false
+    await router.replace({ query: { ...route.query, prototype: String(data.id) } })
+    ElMessage.success('可交互原型已生成')
+  } finally {
+    creating.value = false
+  }
+}
+
+function openRegenerateDialog() {
+  regenerateFeedback.value = ''
+  regenerateDialog.value = true
+}
+
+async function regeneratePrototype() {
+  if (!activePrototype.value) return
+  regenerating.value = true
+  try {
+    const { data } = await api.post<ProductPrototypeDetail>(`/prototypes/${activePrototype.value.id}/regenerate`, {
+      feedback: regenerateFeedback.value.trim()
+    })
+    activePrototype.value = data
+    mergePrototypeSummary(data)
+    activeScreenId.value = data.current.specification.start_screen_id
+    commentScreenId.value = activeScreenId.value
+    screenHistory.value = []
+    canvasSession.value += 1
+    materialization.value = null
+    await loadReviewComments(data.id, data.active_version)
+    regenerateDialog.value = false
+    inspectorTab.value = 'versions'
+    ElMessage.success(`原型 v${data.active_version} 已生成`)
+  } finally {
+    regenerating.value = false
+  }
+}
+
+async function updateStatus(value: unknown) {
+  if (!activePrototype.value) return
+  savingStatus.value = true
+  try {
+    const { data } = await api.patch<ProductPrototypeDetail>(`/prototypes/${activePrototype.value.id}`, { status: value })
+    activePrototype.value = data
+    mergePrototypeSummary(data)
+    ElMessage.success(`原型状态已更新为${statusLabel(data.status)}`)
+  } finally {
+    savingStatus.value = false
+  }
+}
+
+async function restoreVersion(version: number) {
+  if (!activePrototype.value || version === activePrototype.value.active_version) return
+  restoringVersion.value = version
+  try {
+    const { data } = await api.post<ProductPrototypeDetail>(`/prototypes/${activePrototype.value.id}/versions/${version}/activate`)
+    activePrototype.value = data
+    mergePrototypeSummary(data)
+    activeScreenId.value = data.current.specification.start_screen_id
+    commentScreenId.value = activeScreenId.value
+    screenHistory.value = []
+    canvasSession.value += 1
+    materialization.value = null
+    await loadReviewComments(data.id, data.active_version)
+    ElMessage.success(`已恢复原型 v${version}`)
+  } finally {
+    restoringVersion.value = null
+  }
+}
+
+function screenName(screenId: string) {
+  return activePrototype.value?.current.specification.screens.find((screen) => screen.id === screenId)?.name || screenId
+}
+
+async function addReviewComment() {
+  if (!activePrototype.value || !commentDraft.value.trim()) return
+  postingComment.value = true
+  try {
+    const { data } = await api.post<PrototypeReviewComment>(`/prototypes/${activePrototype.value.id}/comments`, {
+      screen_id: commentScreenId.value || null,
+      body: commentDraft.value.trim()
+    })
+    reviewComments.value.unshift(data)
+    commentDraft.value = ''
+    ElMessage.success('评审评论已添加')
+  } finally {
+    postingComment.value = false
+  }
+}
+
+async function resolveReviewComment(commentId: number) {
+  if (!activePrototype.value) return
+  resolvingCommentId.value = commentId
+  try {
+    const { data } = await api.patch<PrototypeReviewComment>(`/prototypes/${activePrototype.value.id}/comments/${commentId}`, {
+      status: 'RESOLVED'
+    })
+    const index = reviewComments.value.findIndex((comment) => comment.id === commentId)
+    if (index >= 0) reviewComments.value.splice(index, 1, data)
+    ElMessage.success('评审评论已解决')
+  } finally {
+    resolvingCommentId.value = null
+  }
+}
+
+async function materializePrototype() {
+  if (!activePrototype.value) return
+  materializing.value = true
+  try {
+    const { data } = await api.post<PrototypeMaterialization>(`/prototypes/${activePrototype.value.id}/materialize`, {
+      request_id: crypto.randomUUID()
+    })
+    materialization.value = data
+    materializationDialog.value = true
+    ElMessage.success(`已生成 ${data.task_ids.length} 个任务和 ${data.test_cases.length} 条验收用例`)
+  } finally {
+    materializing.value = false
+  }
+}
+
+function exportPrototype() {
+  if (!activePrototype.value) return
+  const blob = new Blob([JSON.stringify(activePrototype.value.current.specification, null, 2)], { type: 'application/json' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `prototype-${activePrototype.value.id}-v${activePrototype.value.active_version}.json`
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+async function deletePrototype() {
+  if (!activePrototype.value) return
+  if (!await confirmDestructiveAction('删除后所有原型版本都会永久移除，确认继续吗？', '删除产品原型')) return
+  const id = activePrototype.value.id
+  await api.delete(`/prototypes/${id}`)
+  prototypes.value = prototypes.value.filter((item) => item.id !== id)
+  activePrototype.value = null
+  selectedPrototypeId.value = null
+  const next = prototypes.value[0]
+  if (next) await openPrototype(next.id)
+  else await router.replace({ query: {} })
+  ElMessage.success('产品原型已删除')
+}
+
+function handleMoreCommand(command: string | number | object) {
+  if (command === 'export') exportPrototype()
+  if (command === 'delete') void deletePrototype()
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function statusLabel(status: string) {
+  return { DRAFT: '草案', REVIEW: '评审中', APPROVED: '已批准', ARCHIVED: '已归档' }[status] || status
+}
+
+function statusTagType(status: string) {
+  return { DRAFT: 'info', REVIEW: 'warning', APPROVED: 'success', ARCHIVED: 'info' }[status] as 'success' | 'warning' | 'info' | undefined
+}
+
+function layoutLabel(layout: string) {
+  return { auth: '认证流程', app: '应用界面', dashboard: '数据看板', form: '表单流程', list: '列表界面' }[layout] || layout
+}
+
+function qualityCheckLabel(name: string) {
+  return {
+    navigation_integrity: '导航完整性',
+    interactive_paths: '交互路径',
+    primary_actions: '主要操作',
+    visible_form_labels: '表单可访问性',
+    responsive_contract: '响应式结构'
+  }[name] || name
+}
+
+function roleLabel(role: string) {
+  return { product_manager: '产品定义', architect: '交互架构', test_engineer: '质量评审' }[role] || role
+}
+
+function generationModeLabel(mode: string) {
+  return mode === 'MULTI_AGENT' ? '多 Agent 生成' : mode === 'MULTI_AGENT_TEMPLATE_FALLBACK' ? '多 Agent + 安全模板' : mode
+}
+
+watch(() => route.query.prototype, (value) => {
+  const id = Number(value)
+  if (id && id !== activePrototype.value?.id && prototypes.value.some((item) => item.id === id)) {
+    void openPrototype(id, false)
+  }
+})
+
+onMounted(loadCatalog)
+</script>
+
+<style scoped>
+.prototype-studio-page {
+  max-width: 1480px;
+}
+
+.studio-page-head {
+  margin-bottom: 16px;
+}
+
+.studio-head-actions,
+.prototype-summary-actions,
+.prototype-context,
+.prototype-title-row,
+.agent-run-meta {
+  display: flex;
+  align-items: center;
+}
+
+.studio-head-actions,
+.prototype-summary-actions {
+  gap: 8px;
+}
+
+.prototype-switcher {
+  width: min(340px, 36vw);
+}
+
+.studio-content {
+  min-height: 520px;
+}
+
+.studio-empty {
+  display: grid;
+  min-height: 520px;
+  place-items: center;
+  border-block: 1px solid var(--color-border);
+}
+
+.prototype-summary-band {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 18px 0 20px;
+  border-block: 1px solid var(--color-border);
+}
+
+.prototype-heading {
+  min-width: 0;
+}
+
+.prototype-title-row {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.prototype-title-row h2 {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 21px;
+  line-height: 1.35;
+}
+
+.version-label {
+  color: var(--color-muted-text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.prototype-heading > p {
+  max-width: 900px;
+  margin: 8px 0 10px;
+  color: var(--color-secondary-text);
+  line-height: 1.6;
+}
+
+.prototype-context {
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  color: var(--color-muted-text);
+  font-size: 12px;
+}
+
+.prototype-context span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.prototype-summary-actions {
+  flex: 0 0 auto;
+}
+
+.studio-shell {
+  display: grid;
+  min-height: 760px;
+  grid-template-columns: 190px minmax(540px, 1fr) 286px;
+  gap: 16px;
+  padding-top: 16px;
+}
+
+.screen-navigator,
+.prototype-inspector,
+.preview-workbench {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.screen-navigator,
+.prototype-inspector {
+  align-self: start;
+}
+
+.prototype-inspector {
+  max-height: 760px;
+  overflow-y: auto;
+}
+
+.panel-heading {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.panel-heading strong {
+  font-size: 13px;
+}
+
+.panel-heading span {
+  display: grid;
+  min-width: 24px;
+  height: 22px;
+  place-items: center;
+  border-radius: 11px;
+  background: var(--color-surface-subtle);
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.screen-list {
+  display: grid;
+  gap: 3px;
+  padding: 7px;
+}
+
+.screen-list button {
+  display: grid;
+  width: 100%;
+  min-height: 58px;
+  grid-template-columns: 26px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-secondary-text);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 180ms ease, color 180ms ease;
+}
+
+.screen-list button:hover {
+  background: #f3f4f6;
+  color: var(--color-foreground);
+}
+
+.screen-list button.active {
+  background: var(--color-primary-soft);
+  color: #1d4ed8;
+}
+
+.screen-list button > span {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.screen-list button.active > span {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.screen-list button div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.screen-list button strong,
+.screen-list button small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.screen-list button strong {
+  font-size: 12px;
+}
+
+.screen-list button small {
+  color: var(--color-muted-text);
+  font-size: 10px;
+}
+
+.screen-list button > .el-icon {
+  opacity: 0;
+}
+
+.screen-list button.active > .el-icon {
+  opacity: 1;
+}
+
+.preview-workbench {
+  display: flex;
+  min-height: 760px;
+  flex-direction: column;
+}
+
+.preview-toolbar {
+  display: flex;
+  min-height: 52px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 10px 7px 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.preview-toolbar > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.preview-toolbar strong {
+  font-size: 13px;
+}
+
+.preview-toolbar span {
+  overflow: hidden;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-stage {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  justify-content: center;
+  padding: 16px;
+  overflow: auto;
+  background: #eef1f5;
+}
+
+.preview-mobile {
+  align-items: flex-start;
+  padding: 24px 16px;
+}
+
+.device-frame {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.09);
+}
+
+.device-desktop {
+  border-radius: 7px;
+}
+
+.device-mobile {
+  width: min(390px, 100%);
+  flex: 0 0 auto;
+  padding: 0 7px 9px;
+  border: 7px solid #1f2937;
+  border-radius: 26px;
+  background: #1f2937;
+}
+
+.mobile-frame-top {
+  display: grid;
+  height: 23px;
+  place-items: center;
+  background: #1f2937;
+}
+
+.mobile-frame-top span {
+  width: 68px;
+  height: 5px;
+  border-radius: 3px;
+  background: #64748b;
+}
+
+.device-mobile :deep(.prototype-runtime) {
+  border-radius: 14px;
+}
+
+.inspector-status {
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.inspector-status > div {
+  display: grid;
+  gap: 2px;
+}
+
+.inspector-status small {
+  color: var(--color-muted-text);
+  font-size: 10px;
+}
+
+.inspector-status strong {
+  font-size: 13px;
+}
+
+.inspector-status .el-select {
+  width: 108px;
+}
+
+.prototype-inspector :deep(.el-tabs__header) {
+  margin: 0;
+}
+
+.prototype-inspector :deep(.el-tabs__content) {
+  padding: 14px;
+}
+
+.quality-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.quality-summary > div:last-child {
+  display: grid;
+  gap: 5px;
+}
+
+.quality-summary strong {
+  font-size: 13px;
+}
+
+.quality-summary span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.quality-checks {
+  display: grid;
+  gap: 0;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.quality-checks li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.quality-checks .el-icon {
+  margin-top: 1px;
+  color: var(--color-success);
+}
+
+.quality-checks li.failed .el-icon {
+  color: var(--color-danger);
+}
+
+.quality-checks li div {
+  display: grid;
+  gap: 2px;
+}
+
+.quality-checks strong {
+  font-size: 11px;
+}
+
+.quality-checks span {
+  color: var(--color-muted-text);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.reviewer-summary {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-left: 3px solid var(--color-primary);
+  border-radius: var(--radius-sm);
+  background: var(--color-primary-soft);
+}
+
+.reviewer-summary strong {
+  font-size: 11px;
+}
+
+.reviewer-summary p {
+  max-height: 220px;
+  margin: 5px 0 0;
+  overflow-y: auto;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.review-composer {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.review-composer .el-button {
+  width: 100%;
+}
+
+.review-comment-list {
+  display: grid;
+}
+
+.review-comment-list article {
+  padding: 11px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.review-comment-list article.resolved {
+  opacity: 0.66;
+}
+
+.review-comment-head,
+.review-comment-head > div {
+  display: flex;
+}
+
+.review-comment-head {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.review-comment-head > div {
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.review-comment-head strong {
+  font-size: 11px;
+}
+
+.review-comment-head span {
+  overflow: hidden;
+  color: var(--color-muted-text);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-comment-list p {
+  margin: 7px 0 2px;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.materialization-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 16px;
+  border-block: 1px solid var(--color-border);
+}
+
+.materialization-summary > div {
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border-right: 1px solid var(--color-border);
+}
+
+.materialization-summary > div:last-child {
+  border-right: 0;
+}
+
+.materialization-summary span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.materialization-summary strong {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}
+
+.materialization-table {
+  width: 100%;
+}
+
+.test-case-detail {
+  padding: 4px 18px 10px;
+}
+
+.test-case-detail strong {
+  font-size: 12px;
+}
+
+.test-case-detail p,
+.test-case-detail ol {
+  margin: 5px 0 12px;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.test-case-detail ol {
+  padding-left: 20px;
+}
+
+.agent-run-meta {
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: var(--color-muted-text);
+  font-size: 10px;
+}
+
+.agent-trace-list {
+  border-top: 0;
+}
+
+.agent-trace-list :deep(.el-collapse-item__header) {
+  min-height: 58px;
+  line-height: 1.2;
+}
+
+.agent-trace-list :deep(.el-collapse-item__content) {
+  padding-bottom: 10px;
+}
+
+.trace-avatar {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  margin-right: 8px;
+  border-radius: var(--radius-md);
+  background: #eef2f7;
+  color: var(--color-foreground);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.trace-title {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.trace-title strong,
+.trace-title small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-title strong {
+  font-size: 11px;
+}
+
+.trace-title small {
+  color: var(--color-muted-text);
+  font-size: 9px;
+}
+
+.agent-trace-list pre {
+  max-height: 320px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: #f6f8fa;
+  color: var(--color-secondary-text);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.version-history {
+  display: grid;
+}
+
+.version-history article {
+  display: grid;
+  min-height: 70px;
+  grid-template-columns: 38px minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.version-history article:last-child {
+  border-bottom: 0;
+}
+
+.version-marker {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 50%;
+  color: var(--color-muted-text);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.version-history article.active .version-marker {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.version-copy,
+.version-copy > div {
+  display: flex;
+  min-width: 0;
+}
+
+.version-copy {
+  flex-direction: column;
+  gap: 3px;
+}
+
+.version-copy > div {
+  align-items: center;
+  gap: 5px;
+}
+
+.version-copy strong {
+  font-size: 11px;
+}
+
+.version-copy span,
+.version-copy small {
+  color: var(--color-muted-text);
+  font-size: 9px;
+}
+
+.form-grid-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.generation-status,
+.regenerate-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: var(--color-primary-soft);
+  color: #1d4ed8;
+}
+
+.generation-status > div {
+  display: grid;
+  gap: 3px;
+}
+
+.generation-status strong {
+  font-size: 12px;
+}
+
+.generation-status span,
+.regenerate-note span {
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 1280px) {
+  .studio-shell {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+
+  .prototype-inspector {
+    grid-column: 1 / -1;
+  }
+
+  .prototype-inspector :deep(.el-tabs__content) {
+    max-width: 760px;
+  }
+}
+
+@media (max-width: 900px) {
+  .prototype-summary-band {
+    flex-direction: column;
+  }
+
+  .prototype-summary-actions {
+    width: 100%;
+  }
+
+  .prototype-summary-actions .el-segmented {
+    margin-right: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .studio-page-head,
+  .studio-head-actions,
+  .prototype-summary-actions {
+    align-items: stretch;
+  }
+
+  .studio-head-actions,
+  .prototype-summary-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .prototype-switcher {
+    width: 100%;
+  }
+
+  .studio-head-actions > .el-button,
+  .prototype-summary-actions > .el-button,
+  .prototype-summary-actions > .el-dropdown {
+    flex: 1;
+  }
+
+  .prototype-summary-actions .el-segmented {
+    width: 100%;
+    min-height: 44px;
+    margin: 0;
+  }
+
+  .prototype-summary-actions :deep(.el-dropdown .el-button) {
+    width: 100%;
+  }
+
+  .studio-shell {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .screen-navigator,
+  .preview-workbench,
+  .prototype-inspector {
+    grid-column: 1;
+  }
+
+  .prototype-inspector {
+    max-height: none;
+    overflow-y: visible;
+  }
+
+  .screen-list {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+  }
+
+  .screen-list button {
+    min-width: 168px;
+    flex: 0 0 168px;
+    scroll-snap-align: start;
+  }
+
+  .preview-workbench {
+    min-height: 720px;
+  }
+
+  .preview-stage {
+    padding: 10px;
+  }
+
+  .preview-mobile {
+    padding-block: 16px;
+  }
+
+  .form-grid-two {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .materialization-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .materialization-summary > div {
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .materialization-summary > div:last-child {
+    border-bottom: 0;
+  }
+}
+
+@media (max-width: 420px) {
+  .prototype-title-row h2 {
+    width: 100%;
+    font-size: 18px;
+  }
+
+  .preview-toolbar span {
+    max-width: 230px;
+  }
+
+  .device-mobile {
+    border-width: 5px;
+    border-radius: 22px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .screen-list button {
+    transition: none;
+  }
+}
+</style>

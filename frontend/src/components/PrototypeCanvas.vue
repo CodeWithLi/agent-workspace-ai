@@ -43,17 +43,19 @@
                 :placeholder="component.placeholder"
                 :disabled="component.disabled"
                 :type="component.id.includes('password') ? 'password' : 'text'"
+                :aria-invalid="invalidFields[component.id] || undefined"
+                @input="clearInvalid(component.id)"
               />
             </label>
 
             <label v-else-if="component.type === 'textarea'" class="runtime-field">
               <span>{{ component.label }}<b v-if="component.required"> *</b></span>
-              <textarea v-model="inputValues[component.id]" :placeholder="component.placeholder" :disabled="component.disabled" rows="4" />
+              <textarea v-model="inputValues[component.id]" :placeholder="component.placeholder" :disabled="component.disabled" :aria-invalid="invalidFields[component.id] || undefined" rows="4" @input="clearInvalid(component.id)" />
             </label>
 
             <label v-else-if="component.type === 'select'" class="runtime-field">
               <span>{{ component.label }}<b v-if="component.required"> *</b></span>
-              <select v-model="inputValues[component.id]" :disabled="component.disabled">
+              <select v-model="inputValues[component.id]" :disabled="component.disabled" :aria-invalid="invalidFields[component.id] || undefined" @change="clearInvalid(component.id)">
                 <option value="" disabled>请选择</option>
                 <option v-for="option in component.options" :key="option.value" :value="option.value">{{ option.label }}</option>
               </select>
@@ -127,7 +129,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import type { PrototypeComponentSpec, PrototypeScreen, PrototypeSpecification } from '../api/types'
 
 const props = defineProps<{
@@ -138,12 +140,14 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   navigate: [screenId: string]
+  back: []
   interaction: [message: string]
 }>()
 
 const inputValues = reactive<Record<string, string>>({})
 const stepStates = reactive<Record<string, number>>({})
 const tabStates = reactive<Record<string, string>>({})
+const invalidFields = reactive<Record<string, boolean>>({})
 const toastMessage = ref('')
 let toastTimer = 0
 
@@ -175,19 +179,37 @@ function tabValue(component: PrototypeComponentSpec) {
   return tabStates[component.id] || component.options[0]?.value || ''
 }
 
+function clearInvalid(componentId: string) {
+  invalidFields[componentId] = false
+}
+
+function validateCurrentScreen() {
+  let valid = true
+  for (const component of screen.value.sections.flatMap((section) => section.components)) {
+    if (!component.required || !['input', 'textarea', 'select'].includes(component.type)) continue
+    const missing = !String(inputValues[component.id] || '').trim()
+    invalidFields[component.id] = missing
+    if (missing) valid = false
+  }
+  if (!valid) showToast('请先完成必填项')
+  return valid
+}
+
 async function handleAction(component: PrototypeComponentSpec) {
   const action = component.action
   if (!action) return
   if (action.type === 'navigate' && action.target) {
+    if (component.type === 'button' && !validateCurrentScreen()) return
     if (action.message) showToast(action.message)
     emit('navigate', action.target)
     return
   }
   if (action.type === 'back') {
-    window.history.back()
+    emit('back')
     return
   }
   if (action.type === 'advance_step') {
+    if (!validateCurrentScreen()) return
     const stepper = screen.value.sections.flatMap((section) => section.components).find((item) => item.type === 'stepper')
     if (stepper) {
       const current = stepActive(stepper)
@@ -205,12 +227,21 @@ async function handleAction(component: PrototypeComponentSpec) {
     showToast(action.message || '内容已复制')
     return
   }
+  if (action.type === 'submit' && !validateCurrentScreen()) return
   showToast(action.message || (action.type === 'submit' ? '提交成功' : '操作已完成'))
 }
 
 watch(() => [props.screenId, props.spec], () => {
   toastMessage.value = ''
-})
+  Object.keys(invalidFields).forEach((key) => { invalidFields[key] = false })
+  for (const component of props.spec.screens.flatMap((item) => item.sections).flatMap((section) => section.components)) {
+    if (['input', 'textarea', 'select'].includes(component.type) && inputValues[component.id] === undefined) {
+      inputValues[component.id] = component.value || ''
+    }
+  }
+}, { immediate: true })
+
+onBeforeUnmount(() => window.clearTimeout(toastTimer))
 </script>
 
 <style scoped>
@@ -247,7 +278,7 @@ watch(() => [props.screenId, props.spec], () => {
 .runtime-brand strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-header nav { display: flex; gap: 4px; }
 .runtime-header nav button,
-.runtime-user { min-height: 36px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: #64748b; font: inherit; cursor: pointer; }
+.runtime-user { min-height: 40px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: #64748b; font: inherit; cursor: pointer; }
 .runtime-header nav button:hover,
 .runtime-header nav button.active { background: #f1f5f9; color: var(--prototype-foreground); }
 .runtime-user { justify-self: end; display: grid; place-items: center; background: #f1f5f9; cursor: default; }
@@ -277,6 +308,7 @@ watch(() => [props.screenId, props.spec], () => {
 .runtime-field input:focus,
 .runtime-field textarea:focus,
 .runtime-field select:focus { border-color: var(--prototype-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--prototype-accent) 14%, transparent); }
+.runtime-field [aria-invalid="true"] { border-color: #b91c1c; box-shadow: 0 0 0 3px rgba(185, 28, 28, 0.1); }
 
 .runtime-button,
 .runtime-link { min-height: 44px; border-radius: 7px; font: inherit; font-weight: 700; cursor: pointer; }

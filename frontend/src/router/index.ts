@@ -14,6 +14,7 @@ const router = createRouter({
         { path: 'projects', component: () => import('../views/DashboardView.vue') },
         { path: 'projects/:id', component: () => import('../views/ProjectView.vue') },
         { path: 'requirements', component: () => import('../views/RequirementsView.vue'), meta: { requiresPermission: 'projects:write' } },
+        { path: 'prototypes', component: () => import('../views/PrototypeStudioView.vue') },
         { path: 'agents', component: () => import('../views/AgentListView.vue'), meta: { requiresPermission: 'agents:read' } },
         { path: 'chat', component: () => import('../views/ChatView.vue'), meta: { requiresPermission: 'agents:read' } },
         { path: 'tasks', component: () => import('../views/TaskBoardView.vue') },

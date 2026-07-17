@@ -114,7 +114,7 @@
     </el-dialog>
 
     <el-dialog v-model="versionDialog" :title="`${selectedDocument?.filename || ''} · 索引版本`" width="min(760px, 94vw)">
-      <el-table v-loading="versionsLoading" :data="indexVersions" class="data-table version-table">
+      <el-table v-loading="versionsLoading" :data="indexVersions" class="data-table version-table version-table-desktop">
         <el-table-column label="版本" width="84"><template #default="{ row }">v{{ row.version }}</template></el-table-column>
         <el-table-column label="状态" width="104">
           <template #default="{ row }"><el-tag :type="row.status === 'ACTIVE' ? 'success' : 'info'" size="small">{{ indexStatusLabel(row.status) }}</el-tag></template>
@@ -133,6 +133,21 @@
           </template>
         </el-table-column>
       </el-table>
+      <div v-loading="versionsLoading" class="version-list-mobile">
+        <article v-for="row in indexVersions" :key="row.version" class="version-list-row">
+          <div class="version-list-heading">
+            <strong>v{{ row.version }}</strong>
+            <el-tag :type="row.status === 'ACTIVE' ? 'success' : 'info'" size="small">{{ indexStatusLabel(row.status) }}</el-tag>
+          </div>
+          <strong>{{ row.parser_name }} {{ row.parser_version }}</strong>
+          <div class="document-meta">{{ row.chunker_name }} {{ row.chunker_version }}</div>
+          <div class="document-meta">{{ row.element_count }} elements · {{ row.chunk_count }} chunks</div>
+          <div class="version-list-footer">
+            <span>{{ row.activated_at ? new Date(row.activated_at).toLocaleString() : '尚未激活' }}</span>
+            <el-button v-if="auth.hasPermission('knowledge:write')" link type="primary" :icon="RefreshLeft" :disabled="row.status === 'ACTIVE'" :loading="activatingVersion === row.version" @click="activateVersion(row.version)">激活</el-button>
+          </div>
+        </article>
+      </div>
     </el-dialog>
   </section>
 </template>

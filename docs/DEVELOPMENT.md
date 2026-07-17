@@ -36,4 +36,4 @@
 
 已完成 refresh 会话轮换、项目成员授权、Agent 意图路由、Memory 限界、混合 RAG、真实 StateGraph、工具人工审批、通知投递 worker、管理员用户中心、Alembic 迁移、审计和桌面/移动端浏览器验收。
 
-已完成 Token 钱包与模拟充值、原子扣费和幂等退款、Agent 运行记录与僵死回收、Redis 并发租约续期、动态本地限流、多 Agent 工作流互斥与计费、Python/Jinja 管理后台、可读工作流产物视图和跨域 SSE API 基址统一。后端全量测试当前为 31 项。
+已完成 Token 钱包与模拟充值、原子扣费和幂等退款、Agent 运行记录与僵死回收、Redis 并发租约续期、动态本地限流、多 Agent 工作流互斥与计费、Python/Jinja 管理后台、可读工作流产物视图和跨域 SSE API 基址统一。测试数量随功能演进，不在文档中固化；本地使用 `pytest -q`、前端 unit/E2E 和 RAG 评测脚本确认当前状态。

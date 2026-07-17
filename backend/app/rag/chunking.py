@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -41,7 +43,7 @@ PROMPT_INJECTION_PATTERNS = (
 class ChunkingConfig:
     child_tokens: int = 400
     parent_tokens: int = 1200
-    overlap_tokens: int = 60
+    overlap_tokens: int = 100
     min_chunk_tokens: int = 30
     encoding_name: str = "cl100k_base"
     include_heading_context: bool = True
@@ -62,6 +64,7 @@ class _Segment:
     content: str
     elements: tuple[DocumentElement, ...]
     overlap: bool = False
+    boundary_before: bool = False
 
 
 class TokenCounter:
@@ -75,7 +78,11 @@ class TokenCounter:
         if tokens <= 0:
             return ""
         encoded = self.encoding.encode(text, disallowed_special=())
-        return self.encoding.decode(encoded[-tokens:]).strip()
+        budget = min(tokens, len(encoded))
+        value = self.encoding.decode(encoded[-budget:]).strip()
+        while value and self.count(value) > budget:
+            value = value[1:].lstrip()
+        return value
 
 
 def _hash(*parts: object) -> str:
@@ -85,11 +92,12 @@ def _hash(*parts: object) -> str:
 
 class StructuralChunker:
     name = "structural-parent-child"
-    version = "1"
+    version = "2"
 
     def __init__(self, config: ChunkingConfig | None = None) -> None:
         self.config = config or ChunkingConfig()
         self.tokens = TokenCounter(self.config.encoding_name)
+
     def chunk(self, document: ParsedDocument) -> list[KnowledgeChunk]:
         chunks: list[KnowledgeChunk] = []
         for heading_path, elements in self._sections(document.elements):
@@ -102,6 +110,7 @@ class StructuralChunker:
                     self.config.child_tokens,
                     self.config.overlap_tokens,
                     heading_path,
+                    respect_boundaries=True,
                 )
                 for child_position, group in enumerate(child_groups):
                     content = self._render(group, heading_path)
@@ -185,9 +194,47 @@ class StructuralChunker:
             if self.tokens.count(content) + heading_budget <= self.config.child_tokens:
                 segments.append(_Segment(content, (element,)))
                 continue
-            pieces = splitter.split_text(content)
-            segments.extend(_Segment(piece, (element,)) for piece in pieces if piece.strip())
+            pieces = self._split_table(content, content_budget) if element.kind == "table" else []
+            if not pieces:
+                pieces = splitter.split_text(content)
+            segments.extend(
+                _Segment(piece, (element,), boundary_before=element.kind == "table" and index > 0)
+                for index, piece in enumerate(pieces)
+                if piece.strip()
+            )
         return segments
+
+    def _split_table(self, content: str, token_budget: int) -> list[str]:
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if len(lines) < 3 or not re.fullmatch(r"\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?", lines[1]):
+            return []
+        header = "\n".join(lines[:2])
+        remaining_budget = token_budget - self.tokens.count(header) - 2
+        if remaining_budget < 8:
+            return []
+
+        rows: list[str] = []
+        for row in lines[2:]:
+            if self.tokens.count(row) <= remaining_budget:
+                rows.append(row)
+                continue
+            encoded = self.tokens.encoding.encode(row.strip("| "), disallowed_special=())
+            rows.extend(
+                f"| {self.tokens.encoding.decode(encoded[index : index + remaining_budget]).strip()} |"
+                for index in range(0, len(encoded), remaining_budget)
+            )
+
+        pieces: list[str] = []
+        current: list[str] = []
+        for row in rows:
+            candidate = "\n".join([header, *current, row])
+            if current and self.tokens.count(candidate) > token_budget:
+                pieces.append("\n".join([header, *current]))
+                current = []
+            current.append(row)
+        if current:
+            pieces.append("\n".join([header, *current]))
+        return pieces
 
     def _pack(
         self,
@@ -195,10 +242,15 @@ class StructuralChunker:
         limit: int,
         overlap_tokens: int,
         heading_path: tuple[str, ...],
+        *,
+        respect_boundaries: bool = False,
     ) -> list[list[_Segment]]:
         groups: list[list[_Segment]] = []
         current: list[_Segment] = []
         for segment in segments:
+            if respect_boundaries and segment.boundary_before and current:
+                groups.append(current)
+                current = []
             candidate = [*current, segment]
             if current and self.tokens.count(self._render(candidate, heading_path)) > limit:
                 groups.append(current)
@@ -220,6 +272,8 @@ class StructuralChunker:
         if len(groups) < 2:
             return groups
         tail = groups[-1]
+        if tail and tail[0].boundary_before:
+            return groups
         if self.tokens.count(self._render(tail, heading_path)) >= self.config.min_chunk_tokens:
             return groups
         merged = [*groups[-2], *tail]
@@ -257,3 +311,121 @@ class StructuralChunker:
     def _page_end(elements: tuple[DocumentElement, ...]) -> int | None:
         pages = [element.page_end for element in elements if element.page_end is not None]
         return max(pages) if pages else None
+
+
+class SemanticChunkerProtocol(Protocol):
+    def chunk(self, text: str) -> list[Any]: ...
+
+
+class SemanticStructuralChunker(StructuralChunker):
+    name = "semantic-structural-parent-child"
+    version = "1"
+
+    def __init__(self, semantic_chunker: SemanticChunkerProtocol, config: ChunkingConfig | None = None) -> None:
+        super().__init__(config)
+        self.semantic_chunker = semantic_chunker
+
+    def _segments(
+        self,
+        elements: tuple[DocumentElement, ...],
+        heading_path: tuple[str, ...],
+    ) -> list[_Segment]:
+        segments: list[_Segment] = []
+        semantic_run: list[DocumentElement] = []
+
+        def flush_run() -> None:
+            if not semantic_run:
+                return
+            combined_parts: list[str] = []
+            ranges: list[tuple[int, int, DocumentElement]] = []
+            cursor = 0
+            for element in semantic_run:
+                content = element.content.strip()
+                if combined_parts:
+                    combined_parts.append("\n\n")
+                    cursor += 2
+                start = cursor
+                combined_parts.append(content)
+                cursor += len(content)
+                ranges.append((start, cursor, element))
+            combined = "".join(combined_parts)
+            semantic_chunks = self.semantic_chunker.chunk(combined)
+            if not semantic_chunks:
+                segments.extend(super(SemanticStructuralChunker, self)._segments(tuple(semantic_run), heading_path))
+                semantic_run.clear()
+                return
+            heading_budget = self.tokens.count(self._heading_prefix(heading_path))
+            content_budget = max(1, self.config.child_tokens - heading_budget)
+            splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+                encoding_name=self.config.encoding_name,
+                chunk_size=content_budget,
+                chunk_overlap=0,
+                separators=SEPARATORS,
+                keep_separator="end",
+                strip_whitespace=True,
+            )
+            for chunk_index, semantic_chunk in enumerate(semantic_chunks):
+                content = str(getattr(semantic_chunk, "text", "")).strip()
+                if not content:
+                    continue
+                start = max(0, int(getattr(semantic_chunk, "start_index", 0)))
+                end = max(start, int(getattr(semantic_chunk, "end_index", start + len(content))))
+                mapped = tuple(element for left, right, element in ranges if left < end and right > start)
+                mapped = mapped or tuple(semantic_run)
+                pieces = [content]
+                if self.tokens.count(content) + heading_budget > self.config.child_tokens:
+                    pieces = splitter.split_text(content)
+                for piece_index, piece in enumerate(pieces):
+                    segments.append(
+                        _Segment(
+                            piece,
+                            mapped,
+                            boundary_before=chunk_index > 0 and piece_index == 0,
+                        )
+                    )
+            semantic_run.clear()
+
+        for element in elements:
+            if element.kind in {"table", "code"}:
+                flush_run()
+                segments.extend(super()._segments((element,), heading_path))
+            else:
+                semantic_run.append(element)
+        flush_run()
+        return segments
+
+
+def build_chunker(
+    config: ChunkingConfig,
+    *,
+    strategy: str,
+    semantic_threshold: float,
+    embedding_model: str,
+    embedding_api_key: str | None,
+    embedding_base_url: str,
+) -> StructuralChunker:
+    if strategy == "structural":
+        return StructuralChunker(config)
+    if strategy != "semantic":
+        raise ValueError("RAG chunk strategy must be structural or semantic")
+    if not embedding_api_key:
+        raise ValueError("Semantic chunking requires an external embedding API key")
+
+    from chonkie import OpenAIEmbeddings, SemanticChunker
+
+    embeddings = OpenAIEmbeddings(
+        model=embedding_model,
+        base_url=embedding_base_url,
+        api_key=embedding_api_key,
+    )
+    semantic_chunker = SemanticChunker(
+        embedding_model=embeddings,
+        threshold=semantic_threshold,
+        chunk_size=config.child_tokens,
+        similarity_window=3,
+        min_sentences_per_chunk=1,
+        min_characters_per_sentence=12,
+        delim=["。", "！", "？", ". ", "! ", "? ", "\n"],
+        include_delim="prev",
+    )
+    return SemanticStructuralChunker(semantic_chunker, config)

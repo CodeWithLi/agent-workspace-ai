@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -11,6 +12,14 @@ from sqlalchemy.orm import Session
 from app.core.llm import get_llm
 from app.core.llm_usage import bind_llm_usage
 from app.agent.concurrency import acquire_agent_slot
+from app.agent.orchestration import (
+    AgentHandoff,
+    MultiAgentExecutionPlan,
+    build_task_blueprints,
+    evaluate_handoffs,
+    merge_reviewer_decision,
+    parse_execution_plan,
+)
 from app.models import Agent, AgentRole, Project, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.services.workflow_saga import (
     WorkflowLeaseLost,
@@ -38,6 +47,12 @@ class ProjectState(TypedDict, total=False):
     messages: list[dict[str, str]]
     report: str
     agent_snapshot: dict[str, dict[str, Any]]
+    execution_plan: dict[str, Any]
+    specialist_handoffs: list[dict[str, Any]]
+    quality_gate: dict[str, Any]
+    revision_round: int
+    revision_feedback: str
+    manual_revision_count: int
 
 
 class WorkspaceGraphState(ProjectState, total=False):
@@ -79,6 +94,12 @@ def initial_state(
         "messages": [],
         "report": "",
         "agent_snapshot": agent_snapshot or {},
+        "execution_plan": {},
+        "specialist_handoffs": [],
+        "quality_gate": {},
+        "revision_round": 0,
+        "revision_feedback": "",
+        "manual_revision_count": 0,
     }
 
 
@@ -179,7 +200,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     persisted_state = json.loads(workflow.state_json or "{}")
     agent_snapshot = persisted_state.get("agent_snapshot", {})
 
-    async def invoke_agent(role: AgentRole, fallback_prompt: str, content: str) -> str:
+    async def invoke_agent(
+        role: AgentRole,
+        fallback_prompt: str,
+        content: str,
+        *,
+        isolated_usage: bool = False,
+    ) -> str:
         frozen = agent_snapshot.get(role.value, {})
         agent = db.get(Agent, frozen.get("agent_id")) if frozen.get("agent_id") else None
         if not agent and not frozen:
@@ -190,15 +217,18 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         concurrency_limit = int(frozen.get("concurrency_limit") or agent.concurrency_limit)
         lease = await acquire_agent_slot(agent_id, concurrency_limit) if agent_id else None
         try:
-            with bind_llm_usage(
-                db=db,
+            usage_context = dict(
                 user_id=workflow.user_id,
                 project_id=workflow.project_id,
                 agent_id=agent_id,
                 workflow_id=workflow.id,
-            ):
+            )
+            if not isolated_usage:
+                usage_context["db"] = db
+            with bind_llm_usage(**usage_context):
+                agent_prompt = frozen.get("system_prompt") or agent.system_prompt
                 return await get_llm().chat(
-                    frozen.get("system_prompt") or agent.system_prompt,
+                    f"{agent_prompt}\n\n{fallback_prompt}",
                     content,
                     frozen.get("model") or agent.model,
                 )
@@ -255,13 +285,209 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "architecture": architecture,
             "documents": [*state.get("documents", []), {"type": "SYSTEM_DESIGN", "content": content}],
             "messages": append_message(state, "architect_agent", content),
-            "current_node": "project_manager",
+            "current_node": "planning",
+        }, expected_lease_token)
+
+    async def planning_node(state: WorkspaceGraphState) -> dict[str, Any]:
+        begin_node(db, workflow, "planning", expected_lease_token)
+        planner_output = await invoke_agent(
+            AgentRole.project_manager,
+            (
+                "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
+                "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
+                "role、objective、deliverable。role 仅允许 test_engineer、operations_analyst、"
+                "knowledge_admin、notification_secretary。"
+            ),
+            json.dumps(
+                {
+                    "user_input": state["user_input"],
+                    "requirements": without_analysis(state["requirements"]),
+                    "architecture": state["architecture"],
+                    "product_prd": document_content(state, "PRD"),
+                    "system_design": document_content(state, "SYSTEM_DESIGN"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        plan = parse_execution_plan(planner_output, state["user_input"])
+        record_workflow_event(
+            db,
+            workflow,
+            "PLAN_CREATED",
+            "Dynamic multi-agent execution plan created",
+            node="planning",
+            payload={
+                "roles": [assignment.role for assignment in plan.assignments],
+                "success_criteria_count": len(plan.success_criteria),
+            },
+        )
+        return complete_node(db, workflow, "planning", state, {
+            "execution_plan": plan.model_dump(mode="json"),
+            "messages": append_message(
+                state,
+                "planning_agent",
+                plan.model_dump_json(),
+            ),
+            "current_node": "specialists",
+        }, expected_lease_token)
+
+    async def specialists_node(state: WorkspaceGraphState) -> dict[str, Any]:
+        begin_node(db, workflow, "specialists", expected_lease_token)
+        plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
+        previous_handoffs = {
+            handoff.role: handoff
+            for handoff in (
+                AgentHandoff.model_validate(item)
+                for item in state.get("specialist_handoffs", [])
+            )
+        }
+        quality_gate = state.get("quality_gate", {})
+        requested_roles = set(quality_gate.get("revision_roles") or [])
+        assignments = [
+            assignment
+            for assignment in plan.assignments
+            if not requested_roles or assignment.role in requested_roles
+        ]
+        revision_round = int(state.get("revision_round", 0))
+        revision_feedback = state.get("revision_feedback", "")
+        for assignment in assignments:
+            record_workflow_event(
+                db,
+                workflow,
+                "BRANCH_STARTED",
+                f"Started specialist branch {assignment.role}",
+                node="specialists",
+                payload={
+                    "role": assignment.role,
+                    "deliverable": assignment.deliverable,
+                    "revision_round": revision_round,
+                },
+            )
+        db.commit()
+
+        async def run_assignment(assignment) -> AgentHandoff:
+            previous = previous_handoffs.get(assignment.role)
+            content = await invoke_agent(
+                AgentRole(assignment.role),
+                (
+                    "你是专业交接 Agent。围绕分配目标输出可供其他 Agent 直接使用的专业 Handoff。"
+                    "必须包含范围判断、关键决策、风险、边界场景、验收证据和下一步负责人。"
+                ),
+                json.dumps(
+                    {
+                        "workflow_objective": plan.objective,
+                        "assignment": assignment.model_dump(mode="json"),
+                        "success_criteria": plan.success_criteria,
+                        "requirements": without_analysis(state["requirements"]),
+                        "architecture": state["architecture"],
+                        "revision_feedback": revision_feedback,
+                        "previous_handoff": previous.content if previous else "",
+                    },
+                    ensure_ascii=False,
+                ),
+                isolated_usage=True,
+            )
+            return AgentHandoff(
+                role=assignment.role,
+                objective=assignment.objective,
+                deliverable=assignment.deliverable,
+                content=content,
+                revision_round=revision_round,
+            )
+
+        generated = await asyncio.gather(*(run_assignment(assignment) for assignment in assignments))
+        generated_by_role = {handoff.role: handoff for handoff in generated}
+        merged_handoffs = [
+            generated_by_role.get(assignment.role)
+            or previous_handoffs[assignment.role]
+            for assignment in plan.assignments
+        ]
+        messages = list(state.get("messages", []))
+        for handoff in generated:
+            messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
+            record_workflow_event(
+                db,
+                workflow,
+                "BRANCH_COMPLETED",
+                f"Completed specialist branch {handoff.role}",
+                node="specialists",
+                payload={
+                    "role": handoff.role,
+                    "deliverable": handoff.deliverable,
+                    "revision_round": handoff.revision_round,
+                    "output_chars": len(handoff.content),
+                },
+            )
+        return complete_node(db, workflow, "specialists", state, {
+            "specialist_handoffs": [handoff.model_dump(mode="json") for handoff in merged_handoffs],
+            "messages": messages,
+            "revision_feedback": "",
+            "current_node": "quality_gate",
+        }, expected_lease_token)
+
+    async def quality_gate_node(state: WorkspaceGraphState) -> dict[str, Any]:
+        begin_node(db, workflow, "quality_gate", expected_lease_token)
+        plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
+        handoffs = [AgentHandoff.model_validate(item) for item in state.get("specialist_handoffs", [])]
+        deterministic = evaluate_handoffs(plan, handoffs)
+        reviewer_output = await invoke_agent(
+            AgentRole.test_engineer,
+            (
+                "你是交接质量评审 Agent。只输出 JSON，字段为 passed、score、issues、"
+                "revision_roles、summary。检查可追溯性、冲突、边界场景、验收证据和发布风险。"
+            ),
+            json.dumps(
+                {
+                    "execution_plan": plan.model_dump(mode="json"),
+                    "handoffs": [handoff.model_dump(mode="json") for handoff in handoffs],
+                    "deterministic_gate": deterministic.model_dump(mode="json"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        decision = merge_reviewer_decision(deterministic, reviewer_output, plan)
+        revision_round = int(state.get("revision_round", 0))
+        if decision.passed:
+            next_node = "project_manager"
+            event_type = "QUALITY_GATE_PASSED"
+            event_message = "Specialist handoffs passed the quality gate"
+        elif revision_round < 1:
+            next_node = "specialists"
+            event_type = "REVISION_REQUESTED"
+            event_message = "Quality gate requested a bounded automatic revision"
+            revision_round += 1
+        else:
+            next_node = "quality_review"
+            event_type = "QUALITY_GATE_FAILED"
+            event_message = "Quality gate requires human revision direction"
+        record_workflow_event(
+            db,
+            workflow,
+            event_type,
+            event_message,
+            node="quality_gate",
+            payload={
+                "score": decision.score,
+                "issues": decision.issues,
+                "revision_roles": decision.revision_roles,
+                "revision_round": revision_round,
+                "next_node": next_node,
+            },
+        )
+        feedback = "\n".join([decision.summary, *decision.issues])
+        return complete_node(db, workflow, "quality_gate", state, {
+            "quality_gate": decision.model_dump(mode="json"),
+            "revision_round": revision_round,
+            "revision_feedback": feedback,
+            "messages": append_message(state, "quality_gate_agent", reviewer_output),
+            "current_node": next_node,
         }, expected_lease_token)
 
     async def project_manager_node(state: WorkspaceGraphState) -> dict[str, Any]:
         begin_node(db, workflow, "project_manager", expected_lease_token)
-        titles = ["PRD评审", "架构设计评审", "后端接口开发", "前端页面开发", "RAG联调", "测试验收"]
-        tasks = [{"title": title, "priority": "HIGH" if index < 2 else "MEDIUM"} for index, title in enumerate(titles)]
+        execution_plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
+        tasks = build_task_blueprints(execution_plan)
+        titles = [task["title"] for task in tasks]
         plan = await invoke_agent(
             AgentRole.project_manager,
             "你是AI项目经理。根据需求和架构生成里程碑、依赖关系、风险与资源计划。",
@@ -272,6 +498,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "product_prd": document_content(state, "PRD"),
                     "system_design": document_content(state, "SYSTEM_DESIGN"),
                     "tasks": tasks,
+                    "execution_plan": state["execution_plan"],
+                    "specialist_handoffs": state.get("specialist_handoffs", []),
+                    "quality_gate": state.get("quality_gate", {}),
                 },
                 ensure_ascii=False,
             ),
@@ -303,6 +532,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "product_prd": document_content(state, "PRD"),
                     "system_design": document_content(state, "SYSTEM_DESIGN"),
                     "project_plan": document_content(state, "PROJECT_PLAN"),
+                    "execution_plan": state.get("execution_plan", {}),
+                    "specialist_handoffs": state.get("specialist_handoffs", []),
+                    "quality_gate": state.get("quality_gate", {}),
                 },
                 ensure_ascii=False,
             ),
@@ -330,6 +562,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "architecture": state["architecture"],
                     "tasks": state["tasks"],
                     "tests": without_analysis(state["tests"]),
+                    "execution_plan": state.get("execution_plan", {}),
+                    "specialist_handoffs": state.get("specialist_handoffs", []),
+                    "quality_gate": state.get("quality_gate", {}),
                     "artifacts": {
                         document_type: document_content(state, document_type, limit=8000)
                         for document_type in ("PRD", "SYSTEM_DESIGN", "PROJECT_PLAN", "TEST_PLAN")
@@ -361,11 +596,22 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     def after_tester(state: WorkspaceGraphState) -> Literal["pause", "report"]:
         return "pause" if state.get("pause_before_report", True) else "report"
 
+    def after_quality_gate(state: WorkspaceGraphState) -> Literal["revise", "continue", "pause"]:
+        current_node = state.get("current_node")
+        if current_node == "specialists":
+            return "revise"
+        if current_node == "project_manager":
+            return "continue"
+        return "pause"
+
     builder = StateGraph(WorkspaceGraphState)
     builder.add_node("dispatch", dispatch_node)
     builder.add_node("requirement", requirement_node)
     builder.add_node("product", product_node)
     builder.add_node("architect", architect_node)
+    builder.add_node("planning", planning_node)
+    builder.add_node("specialists", specialists_node)
+    builder.add_node("quality_gate", quality_gate_node)
     builder.add_node("project_manager", project_manager_node)
     builder.add_node("tester", tester_node)
     builder.add_node("report", report_node)
@@ -377,6 +623,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "requirement": "requirement",
             "product": "product",
             "architect": "architect",
+            "planning": "planning",
+            "specialists": "specialists",
+            "quality_gate": "quality_gate",
             "project_manager": "project_manager",
             "tester": "tester",
             "report": "report",
@@ -385,7 +634,14 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     )
     builder.add_edge("requirement", "product")
     builder.add_edge("product", "architect")
-    builder.add_edge("architect", "project_manager")
+    builder.add_edge("architect", "planning")
+    builder.add_edge("planning", "specialists")
+    builder.add_edge("specialists", "quality_gate")
+    builder.add_conditional_edges(
+        "quality_gate",
+        after_quality_gate,
+        {"revise": "specialists", "continue": "project_manager", "pause": END},
+    )
     builder.add_edge("project_manager", "tester")
     builder.add_conditional_edges("tester", after_tester, {"pause": END, "report": "report"})
     builder.add_edge("report", END)
@@ -421,17 +677,32 @@ async def run_workspace_graph(
 
 
 async def continue_workspace_graph(db: Session, workflow: WorkflowRun, human_feedback: str = "") -> WorkflowRun:
-    if workflow.status != WorkflowStatus.paused or workflow.current_node != "report":
+    if workflow.status != WorkflowStatus.paused or workflow.current_node not in {"quality_review", "report"}:
         raise ValueError("Workflow is not waiting for human confirmation")
+    gate = workflow.current_node
+    pause_before_report = False
+    if gate == "quality_review":
+        persisted = json.loads(workflow.state_json or "{}")
+        persisted["revision_feedback"] = human_feedback.strip() or "请根据质量门禁问题补充证据并修订专业交接。"
+        persisted["manual_revision_count"] = int(persisted.get("manual_revision_count", 0)) + 1
+        workflow.state_json = json.dumps(persisted, ensure_ascii=False)
+        workflow.current_node = "specialists"
+        pause_before_report = True
     workflow.human_feedback = human_feedback
     workflow.status = WorkflowStatus.running
     workflow.lease_token = str(uuid4())
-    workflow.pause_before_report = False
+    workflow.pause_before_report = pause_before_report
     workflow.attempt_count += 1
     workflow.started_at = workflow.started_at or datetime.now(timezone.utc)
-    record_workflow_event(db, workflow, "CONTINUED", "Workflow continued after human review")
+    record_workflow_event(
+        db,
+        workflow,
+        "CONTINUED",
+        "Workflow continued after human review",
+        payload={"approval_gate": gate},
+    )
     db.commit()
-    return await execute_workspace_graph(db, workflow, pause_before_report=False)
+    return await execute_workspace_graph(db, workflow, pause_before_report=pause_before_report)
 
 
 async def execute_workspace_graph(db: Session, workflow: WorkflowRun, pause_before_report: bool) -> WorkflowRun:
@@ -454,9 +725,24 @@ async def execute_workspace_graph(db: Session, workflow: WorkflowRun, pause_befo
         workflow.status = WorkflowStatus.completed
         workflow.finished_at = datetime.now(timezone.utc)
         record_workflow_event(db, workflow, "COMPLETED", "Workflow completed")
+    elif workflow.current_node == "quality_review":
+        workflow.status = WorkflowStatus.paused
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow is waiting for quality revision direction",
+            payload={"approval_gate": "quality_review"},
+        )
     elif workflow.current_node == "report" and pause_before_report:
         workflow.status = WorkflowStatus.paused
-        record_workflow_event(db, workflow, "PAUSED", "Workflow is waiting for human review")
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow is waiting for final report approval",
+            payload={"approval_gate": "report"},
+        )
     else:
         raise RuntimeError(f"Workflow stopped in unexpected node: {workflow.current_node}")
     db.commit()

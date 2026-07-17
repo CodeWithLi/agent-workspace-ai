@@ -41,6 +41,7 @@ async def test_hybrid_search_ranks_relevant_owned_document(db: Session, monkeypa
     ]
     texts = [item[3] for item in documents]
     vectors = await get_llm().embed_many(texts)
+    document_ids: dict[str, int] = {}
     for index, ((user, item_project, filename, content), vector) in enumerate(zip(documents, vectors)):
         document = KnowledgeDocument(
             project_id=item_project.id,
@@ -53,6 +54,7 @@ async def test_hybrid_search_ranks_relevant_owned_document(db: Session, monkeypa
         )
         db.add(document)
         db.flush()
+        document_ids[filename] = document.id
         db.add(
             Embedding(
                 document_id=document.id,
@@ -65,7 +67,13 @@ async def test_hybrid_search_ranks_relevant_owned_document(db: Session, monkeypa
         )
     db.commit()
 
-    monkeypatch.setattr(vector_store, "hybrid_search", lambda *_args, **_kwargs: [])
+    hybrid_calls: list[dict] = []
+
+    def hybrid_search(*_args, **kwargs):
+        hybrid_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(vector_store, "hybrid_search", hybrid_search)
 
     async def fake_chat(*_args, **_kwargs):
         return "应执行每日增量备份并演练恢复。[backup.md#chunk-0]"
@@ -87,6 +95,7 @@ async def test_hybrid_search_ranks_relevant_owned_document(db: Session, monkeypa
     assert results[0]["dense_score"] > 0
     assert results[0]["tags"] == ["database"]
     assert results[0]["source_label"] == "runbook"
+    assert hybrid_calls[0]["document_ids"] == [document_ids["backup.md"]]
 
 
 @pytest.mark.asyncio
@@ -141,6 +150,55 @@ async def test_personal_search_excludes_documents_from_owned_projects(
     _, results = await search_knowledge(db, owner, "个人备忘录", project_id=None, top_k=5, min_score=0)
 
     assert [result["filename"] for result in results] == ["personal.md"]
+
+
+@pytest.mark.asyncio
+async def test_multi_vector_fallback_can_retrieve_by_parent_embedding(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = User(email="parent-vector@example.com", name="Parent Vector", password_hash="hash")
+    db.add(user)
+    db.flush()
+    document = KnowledgeDocument(
+        owner_id=user.id,
+        filename="recovery.md",
+        storage_path="recovery.md",
+        status="INDEXED",
+        active_index_version=1,
+    )
+    db.add(document)
+    db.flush()
+    db.add(
+        Embedding(
+            document_id=document.id,
+            content="Run the first isolated step.",
+            parent_content="The disaster recovery procedure restores the primary database.",
+            chunk_index=0,
+            vector_id="parent-vector",
+            vector_json=json.dumps([0.0, 1.0]),
+            parent_vector_json=json.dumps([1.0, 0.0]),
+            index_version=1,
+        )
+    )
+    db.commit()
+
+    monkeypatch.setattr(vector_store, "hybrid_search", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.rag.service.settings.rag_multi_vector_enabled", True)
+
+    async def embed_many(_texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0]]
+
+    async def fake_chat(*_args, **_kwargs) -> str:
+        return "Restore the primary database. [recovery.md#chunk-0]"
+
+    monkeypatch.setattr(get_llm(), "embed_many", embed_many)
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    answer, results = await search_knowledge(db, user, "disaster recovery", min_score=0)
+
+    assert [result["filename"] for result in results] == ["recovery.md"]
+    assert results[0]["dense_score"] == 1.0
+    assert "recovery.md#chunk-0" in answer
 
 
 def test_parent_context_is_deduplicated_bounded_and_citations_are_validated() -> None:

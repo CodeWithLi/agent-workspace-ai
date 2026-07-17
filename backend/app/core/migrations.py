@@ -99,6 +99,8 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     embedding_columns = columns("embeddings")
     if "embeddings" in tables and "vector_json" not in embedding_columns:
         statements.append("ALTER TABLE embeddings ADD COLUMN vector_json TEXT DEFAULT '[]'")
+    if "embeddings" in tables and "parent_vector_json" not in embedding_columns:
+        statements.append("ALTER TABLE embeddings ADD COLUMN parent_vector_json TEXT DEFAULT '[]'")
     embedding_additions = {
         "stable_id": "VARCHAR(64) DEFAULT ''",
         "index_version": "INTEGER DEFAULT 0",

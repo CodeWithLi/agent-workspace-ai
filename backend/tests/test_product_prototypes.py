@@ -1,4 +1,7 @@
+import json
+
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -7,16 +10,37 @@ from starlette.requests import Request
 from app.agent.service import ensure_default_agents
 from app.api.routes.prototypes import (
     activate_prototype_version,
+    add_prototype_comment,
     generate_prototype,
     get_prototype,
     list_prototypes,
+    list_prototype_comments,
+    materialize_prototype,
     regenerate_prototype,
+    update_prototype,
+    update_prototype_comment,
 )
-from app.models import ProductPrototypeVersion, Project, ProjectMember, ProjectMemberRole, Requirement, User
+from app.models import (
+    ProductPrototype,
+    ProductPrototypeMaterialization,
+    ProductPrototypeVersion,
+    PrototypeReviewComment,
+    PrototypeTestCase,
+    Project,
+    ProjectMember,
+    ProjectMemberRole,
+    Requirement,
+    Task,
+    User,
+)
 from app.prototypes.schemas import (
+    PrototypeCommentCreate,
+    PrototypeCommentUpdate,
     PrototypeGenerateRequest,
+    PrototypeMaterializeRequest,
     PrototypeRegenerateRequest,
     PrototypeSpecification,
+    PrototypeUpdateRequest,
 )
 from app.prototypes.service import build_fallback_spec, evaluate_specification
 
@@ -145,6 +169,10 @@ async def test_multi_agent_generation_persists_versions_and_allows_restore(
         )
     ) == 2
 
+    stored = db.get(ProductPrototype, created.id)
+    assert stored is not None
+    stored.status = "APPROVED"
+    db.commit()
     restored = activate_prototype_version(
         created.id,
         1,
@@ -154,5 +182,103 @@ async def test_multi_agent_generation_persists_versions_and_allows_restore(
     )
     assert restored.active_version == 1
     assert restored.current.version == 1
+    assert restored.status == "DRAFT"
     assert get_prototype(created.id, user, db).current.version == 1
     assert [item.id for item in list_prototypes(project.id, requirement.id, user, db)] == [created.id]
+
+
+def test_review_gate_and_materialization_are_traceable_and_idempotent(db: Session) -> None:
+    user, project, requirement = prototype_context(db)
+    specification = build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接")
+    prototype = ProductPrototype(
+        project_id=project.id,
+        requirement_id=requirement.id,
+        created_by_user_id=user.id,
+        title="评审中的产品原型",
+        summary=specification.summary,
+        status="REVIEW",
+        active_version=1,
+    )
+    db.add(prototype)
+    db.flush()
+    db.add(
+        ProductPrototypeVersion(
+            prototype_id=prototype.id,
+            version=1,
+            source_prompt="生成认证与邀请原型",
+            specification_json=specification.model_dump_json(),
+            agent_trace_json="[]",
+            quality_json=json.dumps({"score": 100, "passed": True, "checks": [], "issues": []}),
+            generation_mode="MULTI_AGENT",
+            created_by_user_id=user.id,
+        )
+    )
+    db.commit()
+
+    comment = add_prototype_comment(
+        prototype.id,
+        PrototypeCommentCreate(screen_id="register", body="请补充手机号格式错误状态。"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/comments"),
+        user,
+        db,
+    )
+    assert comment.status == "OPEN"
+    assert [item.id for item in list_prototype_comments(prototype.id, None, user, db)] == [comment.id]
+
+    with pytest.raises(HTTPException) as approval_error:
+        update_prototype(
+            prototype.id,
+            PrototypeUpdateRequest(status="APPROVED"),
+            http_request(f"/api/v1/prototypes/{prototype.id}"),
+            user,
+            db,
+        )
+    assert approval_error.value.status_code == 409
+
+    resolved = update_prototype_comment(
+        prototype.id,
+        comment.id,
+        PrototypeCommentUpdate(status="RESOLVED"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/comments/{comment.id}"),
+        user,
+        db,
+    )
+    assert resolved.status == "RESOLVED"
+    approved = update_prototype(
+        prototype.id,
+        PrototypeUpdateRequest(status="APPROVED"),
+        http_request(f"/api/v1/prototypes/{prototype.id}"),
+        user,
+        db,
+    )
+    assert approved.status == "APPROVED"
+
+    first = materialize_prototype(
+        prototype.id,
+        PrototypeMaterializeRequest(request_id="prototype-materialize-001"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/materialize"),
+        user,
+        db,
+    )
+    repeated = materialize_prototype(
+        prototype.id,
+        PrototypeMaterializeRequest(request_id="prototype-materialize-002"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/materialize"),
+        user,
+        db,
+    )
+
+    assert repeated.id == first.id
+    assert first.prototype_version == 1
+    assert len(first.task_ids) == len(specification.screens)
+    assert len(first.test_cases) > len(specification.screens)
+    assert db.scalar(select(func.count(Task.id)).where(Task.source_prototype_id == prototype.id)) == len(first.task_ids)
+    assert db.scalar(select(func.count(PrototypeTestCase.id)).where(PrototypeTestCase.prototype_id == prototype.id)) == len(first.test_cases)
+    assert db.scalar(
+        select(func.count(ProductPrototypeMaterialization.id)).where(
+            ProductPrototypeMaterialization.prototype_id == prototype.id
+        )
+    ) == 1
+    db.refresh(prototype)
+    assert prototype.status == "APPROVED"
+    assert db.get(PrototypeReviewComment, comment.id).resolved_by_user_id == user.id

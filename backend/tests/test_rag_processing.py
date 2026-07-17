@@ -1,9 +1,10 @@
 from io import BytesIO
+from types import SimpleNamespace
 
 import pytest
 from docx import Document
 
-from app.rag.chunking import ChunkingConfig, StructuralChunker, TokenCounter
+from app.rag.chunking import ChunkingConfig, SemanticStructuralChunker, StructuralChunker, TokenCounter, build_chunker
 from app.rag.parsers import DocumentParseError, parse_document_elements, validate_document_container
 
 
@@ -126,3 +127,60 @@ def test_chunk_marks_suspected_prompt_injection_without_dropping_evidence() -> N
 
     assert chunk.metadata["prompt_injection_suspected"] is True
     assert "Ignore previous instructions" in chunk.content
+
+
+def test_long_table_chunks_repeat_header_and_preserve_all_rows() -> None:
+    rows = "\n".join(f"| step-{index} | owner-{index} |" for index in range(30))
+    source = f"# Runbook\n\n| Step | Owner |\n| --- | --- |\n{rows}".encode()
+    parsed = parse_document_elements("table.md", source)
+    config = ChunkingConfig(child_tokens=96, parent_tokens=240, overlap_tokens=16, min_chunk_tokens=8)
+
+    chunks = StructuralChunker(config).chunk(parsed)
+    table_chunks = [chunk for chunk in chunks if "table" in chunk.element_kinds]
+
+    assert len(table_chunks) > 1
+    assert all("| Step | Owner |" in chunk.content for chunk in table_chunks)
+    assert all("| --- | --- |" in chunk.content for chunk in table_chunks)
+    assert all(chunk.token_count <= config.child_tokens for chunk in table_chunks)
+    combined = "\n".join(chunk.content for chunk in table_chunks)
+    assert all(f"step-{index}" in combined for index in range(30))
+
+
+def test_semantic_strategy_keeps_heading_and_element_traceability() -> None:
+    parsed = parse_document_elements(
+        "semantic.md",
+        b"# Recovery\n\nAlpha backup preparation.\n\nBeta snapshot validation.\n\nGamma restore execution.",
+    )
+
+    class FakeSemanticChunker:
+        def chunk(self, text: str) -> list[SimpleNamespace]:
+            split = text.index("Gamma")
+            return [
+                SimpleNamespace(text=text[:split], start_index=0, end_index=split),
+                SimpleNamespace(text=text[split:], start_index=split, end_index=len(text)),
+            ]
+
+    chunker = SemanticStructuralChunker(
+        FakeSemanticChunker(),
+        ChunkingConfig(child_tokens=96, parent_tokens=240, overlap_tokens=16, min_chunk_tokens=5),
+    )
+    chunks = chunker.chunk(parsed)
+
+    assert len(chunks) == 2
+    assert all(chunk.heading_path == ("Recovery",) for chunk in chunks)
+    assert all(chunk.metadata["chunker"] == "semantic-structural-parent-child" for chunk in chunks)
+    assert set(chunks[0].element_indexes) == {1, 2}
+    assert chunks[1].element_indexes == (3,)
+    assert "Gamma restore execution" in chunks[1].content
+
+
+def test_semantic_strategy_requires_external_embedding_credentials() -> None:
+    with pytest.raises(ValueError, match="external embedding API key"):
+        build_chunker(
+            ChunkingConfig(),
+            strategy="semantic",
+            semantic_threshold=0.8,
+            embedding_model="embedding-model",
+            embedding_api_key=None,
+            embedding_base_url="https://embedding.invalid/v1",
+        )

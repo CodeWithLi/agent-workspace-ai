@@ -59,6 +59,9 @@ CONFIG_DEFINITIONS = {
         ConfigDefinition("rag_parent_chunk_tokens", "Parent Chunk Tokens", "rag", int, minimum=128, maximum=8000),
         ConfigDefinition("rag_chunk_overlap_tokens", "Chunk Overlap Tokens", "rag", int, minimum=0, maximum=500),
         ConfigDefinition("rag_min_chunk_tokens", "Minimum Chunk Tokens", "rag", int, minimum=1, maximum=500),
+        ConfigDefinition("rag_chunk_strategy", "Chunk Strategy", "rag", str),
+        ConfigDefinition("rag_semantic_threshold", "Semantic Similarity Threshold", "rag", float, minimum=0, maximum=1),
+        ConfigDefinition("rag_multi_vector_enabled", "Parent Multi-vector Retrieval", "rag", bool),
         ConfigDefinition("rag_context_max_tokens", "Context Maximum Tokens", "rag", int, minimum=256, maximum=32000),
         ConfigDefinition("rag_min_query_coverage", "Minimum Query Coverage", "rag", float, minimum=0, maximum=1),
         ConfigDefinition("rag_dense_override_score", "Dense Override Score", "rag", float, minimum=0, maximum=1),
@@ -207,6 +210,9 @@ def update_runtime_settings(db: Session, values: dict[str, Any], user_id: int) -
         raise ValueError("RAG token overlap must be smaller than child token budget")
     if minimum_tokens > child_tokens:
         raise ValueError("RAG minimum chunk tokens must not exceed child token budget")
+    chunk_strategy = normalized.get("rag_chunk_strategy", settings.rag_chunk_strategy)
+    if chunk_strategy not in {"structural", "semantic"}:
+        raise ValueError("RAG chunk strategy must be structural or semantic")
     parser_backend = normalized.get("rag_parser_backend", settings.rag_parser_backend)
     if parser_backend not in {"native", "auto", "docling"}:
         raise ValueError("RAG parser backend must be native, auto or docling")

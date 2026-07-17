@@ -45,4 +45,5 @@ def test_readiness_policy_and_prometheus_output() -> None:
     assert b"agent_workspace_http_requests_total" in content
     assert b"agent_workspace_rag_search_duration_seconds" in content
     assert b"agent_workspace_rag_index_duration_seconds" in content
+    assert b"agent_workspace_rag_embedding_chunks_total" in content
     assert "text/plain" in content_type

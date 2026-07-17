@@ -1,2 +1,1 @@
 -r requirements.txt
-chonkie==1.7.0
