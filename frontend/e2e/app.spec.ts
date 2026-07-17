@@ -404,6 +404,7 @@ async function mockApi(page: Page) {
         updated_at: '2026-07-17T03:00:00Z'
       }
       mockPrototypeComments.unshift(comment)
+      if (detail?.status === 'APPROVED') detail.status = 'REVIEW'
       body = comment
     } else if (method === 'PATCH' && /^\/prototypes\/\d+\/comments\/\d+$/.test(path)) {
       const commentId = Number(path.split('/').pop())
@@ -757,6 +758,11 @@ test('reviews, approves and converts a prototype into delivery evidence', async 
   await expect(deliverySummary.getByText('实现任务', { exact: true })).toBeVisible()
   await expect(deliverySummary.getByText('验收用例', { exact: true })).toBeVisible()
   await expect(deliveryDialog.getByText('校验注册页必填字段', { exact: true })).toBeVisible()
+  await deliveryDialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await page.getByLabel('原型评审评论').fill('交付后发现新的边界场景')
+  await page.getByRole('button', { name: '添加评论', exact: true }).click()
+  await expect(page.getByText('评审评论已添加，原型已回到评审中')).toBeVisible()
+  await expect(page.getByRole('button', { name: '生成交付清单', exact: true })).toHaveCount(0)
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
 })

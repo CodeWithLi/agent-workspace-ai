@@ -99,7 +99,7 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `PATCH /prototypes/{prototype_id}/comments/{comment_id}`：解决或重新打开评审意见。
 - `POST /prototypes/{prototype_id}/materialize`：将已批准版本幂等转换为实现任务和结构化验收用例。
 
-批准要求当前版本通过自动质量门禁且没有待处理评审意见。`materialize` 要求客户端提供唯一 `request_id`；同一原型版本重复调用返回已有交付结果，不重复创建任务或用例。
+批准要求当前版本通过自动质量门禁且没有待处理评审意见。创建或重新打开当前版本的评审意见要求 `projects:write` 和非 viewer 项目角色；对已批准版本执行该操作会原子撤销批准并回到 `REVIEW`，归档版本禁止修改评审。`materialize` 要求客户端提供唯一 `request_id`；幂等键绑定原型及其具体版本，同一版本重复调用返回已有交付结果，不重复创建任务或用例，跨版本复用返回 `409`。
 
 ## Token 钱包
 

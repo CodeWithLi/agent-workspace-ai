@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -55,6 +55,14 @@ def get_prototype_for_user(
     if not prototype:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prototype not found")
     get_project_for_user(prototype.project_id, current_user, db, write=write)
+    if write:
+        prototype = db.scalar(
+            select(ProductPrototype)
+            .where(ProductPrototype.id == prototype_id)
+            .with_for_update()
+        )
+        if not prototype:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prototype not found")
     return prototype
 
 
@@ -73,8 +81,12 @@ def current_version(db: Session, prototype: ProductPrototype) -> ProductPrototyp
     return item
 
 
-def prototype_out(db: Session, prototype: ProductPrototype) -> PrototypeOut:
-    version = current_version(db, prototype)
+def prototype_out(
+    db: Session,
+    prototype: ProductPrototype,
+    version: ProductPrototypeVersion | None = None,
+) -> PrototypeOut:
+    version = version or current_version(db, prototype)
     specification = json.loads(version.specification_json)
     quality = json.loads(version.quality_json or "{}")
     return PrototypeOut(
@@ -107,7 +119,7 @@ def prototype_detail(db: Session, prototype: ProductPrototype) -> PrototypeDetai
             status_code=status.HTTP_409_CONFLICT,
             detail="Prototype active version is unavailable",
         )
-    summary = prototype_out(db, prototype)
+    summary = prototype_out(db, prototype, active)
     return PrototypeDetailOut(
         **summary.model_dump(),
         current=version_out(active),
@@ -115,15 +127,21 @@ def prototype_detail(db: Session, prototype: ProductPrototype) -> PrototypeDetai
     )
 
 
-def comment_out(db: Session, item: PrototypeReviewComment) -> PrototypeCommentOut:
-    author = db.get(User, item.user_id)
+def comment_out(
+    db: Session,
+    item: PrototypeReviewComment,
+    user_name: str | None = None,
+) -> PrototypeCommentOut:
+    if user_name is None:
+        author = db.get(User, item.user_id)
+        user_name = author.name if author else "Unknown"
     return PrototypeCommentOut(
         id=item.id,
         prototype_id=item.prototype_id,
         prototype_version=item.prototype_version,
         screen_id=item.screen_id,
         user_id=item.user_id,
-        user_name=author.name if author else "Unknown",
+        user_name=user_name,
         body=item.body,
         status=item.status,
         resolved_by_user_id=item.resolved_by_user_id,
@@ -193,14 +211,24 @@ def list_prototypes(
     project_ids = accessible_project_ids(current_user, db)
     if not project_ids:
         return []
-    stmt = select(ProductPrototype).where(ProductPrototype.project_id.in_(project_ids))
+    stmt = (
+        select(ProductPrototype, ProductPrototypeVersion)
+        .outerjoin(
+            ProductPrototypeVersion,
+            and_(
+                ProductPrototypeVersion.prototype_id == ProductPrototype.id,
+                ProductPrototypeVersion.version == ProductPrototype.active_version,
+            ),
+        )
+        .where(ProductPrototype.project_id.in_(project_ids))
+    )
     if project_id is not None:
         get_project_for_user(project_id, current_user, db)
         stmt = stmt.where(ProductPrototype.project_id == project_id)
     if requirement_id is not None:
         stmt = stmt.where(ProductPrototype.requirement_id == requirement_id)
-    items = list(db.scalars(stmt.order_by(ProductPrototype.updated_at.desc()).limit(100)))
-    return [prototype_out(db, item) for item in items]
+    rows = db.execute(stmt.order_by(ProductPrototype.updated_at.desc()).limit(100)).all()
+    return [prototype_out(db, prototype, version) for prototype, version in rows]
 
 
 @router.post("/generate", response_model=PrototypeDetailOut, status_code=status.HTTP_201_CREATED)
@@ -277,7 +305,7 @@ def update_prototype(
     ensure_permission(current_user, "projects:write")
     prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
     values = payload.model_dump(exclude_unset=True)
-    if values.get("status") == "APPROVED" and prototype.status != "APPROVED":
+    if values.get("status") == "APPROVED":
         active = current_version(db, prototype)
         quality = json.loads(active.quality_json or "{}")
         if not quality.get("passed"):
@@ -412,7 +440,14 @@ def list_prototype_comments(
     if version is not None:
         stmt = stmt.where(PrototypeReviewComment.prototype_version == version)
     items = list(db.scalars(stmt.order_by(PrototypeReviewComment.created_at.desc())))
-    return [comment_out(db, item) for item in items]
+    user_names = dict(
+        db.execute(
+            select(User.id, User.name).where(
+                User.id.in_({item.user_id for item in items})
+            )
+        ).all()
+    ) if items else {}
+    return [comment_out(db, item, user_names.get(item.user_id, "Unknown")) for item in items]
 
 
 @router.post(
@@ -427,7 +462,13 @@ def add_prototype_comment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PrototypeCommentOut:
-    prototype = get_prototype_for_user(prototype_id, current_user, db)
+    ensure_permission(current_user, "projects:write")
+    prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
+    if prototype.status == "ARCHIVED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="已归档原型不能新增评审意见",
+        )
     version = current_version(db, prototype)
     specification = PrototypeSpecification.model_validate_json(version.specification_json)
     if payload.screen_id and not any(
@@ -445,6 +486,9 @@ def add_prototype_comment(
         body=payload.body.strip(),
         status="OPEN",
     )
+    previous_status = prototype.status
+    if prototype.status == "APPROVED":
+        prototype.status = "REVIEW"
     db.add(item)
     db.flush()
     record_audit(
@@ -458,6 +502,7 @@ def add_prototype_comment(
             "prototype_id": prototype.id,
             "version": prototype.active_version,
             "screen_id": item.screen_id,
+            "approval_revoked": previous_status == "APPROVED",
         },
         request,
     )
@@ -480,6 +525,11 @@ def update_prototype_comment(
 ) -> PrototypeCommentOut:
     ensure_permission(current_user, "projects:write")
     prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
+    if prototype.status == "ARCHIVED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="已归档原型不能修改评审意见",
+        )
     item = db.get(PrototypeReviewComment, comment_id)
     if not item or item.prototype_id != prototype.id:
         raise HTTPException(
@@ -493,6 +543,11 @@ def update_prototype_comment(
     else:
         item.resolved_by_user_id = None
         item.resolved_at = None
+        if (
+            item.prototype_version == prototype.active_version
+            and prototype.status == "APPROVED"
+        ):
+            prototype.status = "REVIEW"
     record_audit(
         db,
         "prototype.comment_update",
@@ -528,7 +583,10 @@ def materialize_prototype(
         )
     )
     if existing_request:
-        if existing_request.prototype_id != prototype.id:
+        if (
+            existing_request.prototype_id != prototype.id
+            or existing_request.prototype_version != prototype.active_version
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="该交付请求 ID 已被使用",

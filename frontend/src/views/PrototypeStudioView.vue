@@ -149,7 +149,7 @@
               </el-tab-pane>
 
               <el-tab-pane :label="`评审 ${openReviewCount}`" name="reviews">
-                <div class="review-composer">
+                <div v-if="canEdit && activePrototype.status !== 'ARCHIVED'" class="review-composer">
                   <el-select v-model="commentScreenId" aria-label="评审评论所属界面">
                     <el-option label="整个原型" value="" />
                     <el-option v-for="screen in activePrototype.current.specification.screens" :key="screen.id" :label="screen.name" :value="screen.id" />
@@ -609,13 +609,20 @@ async function addReviewComment() {
   if (!activePrototype.value || !commentDraft.value.trim()) return
   postingComment.value = true
   try {
+    const approvalRevoked = activePrototype.value.status === 'APPROVED'
     const { data } = await api.post<PrototypeReviewComment>(`/prototypes/${activePrototype.value.id}/comments`, {
       screen_id: commentScreenId.value || null,
       body: commentDraft.value.trim()
     })
     reviewComments.value.unshift(data)
     commentDraft.value = ''
-    ElMessage.success('评审评论已添加')
+    if (approvalRevoked) {
+      activePrototype.value.status = 'REVIEW'
+      mergePrototypeSummary(activePrototype.value)
+      ElMessage.warning('评审评论已添加，原型已回到评审中')
+    } else {
+      ElMessage.success('评审评论已添加')
+    }
   } finally {
     postingComment.value = false
   }

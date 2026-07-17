@@ -3,7 +3,7 @@ import json
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
@@ -282,3 +282,186 @@ def test_review_gate_and_materialization_are_traceable_and_idempotent(db: Sessio
     db.refresh(prototype)
     assert prototype.status == "APPROVED"
     assert db.get(PrototypeReviewComment, comment.id).resolved_by_user_id == user.id
+
+
+def test_review_writes_require_editor_access_and_reopen_approval(db: Session) -> None:
+    user, project, requirement = prototype_context(db)
+    specification = build_fallback_spec("评审权限", "手机号注册登录和邀请链接")
+    prototype = ProductPrototype(
+        project_id=project.id,
+        requirement_id=requirement.id,
+        created_by_user_id=user.id,
+        title="已批准原型",
+        summary=specification.summary,
+        status="APPROVED",
+        active_version=1,
+    )
+    db.add(prototype)
+    db.flush()
+    db.add(
+        ProductPrototypeVersion(
+            prototype_id=prototype.id,
+            version=1,
+            source_prompt="生成评审权限原型",
+            specification_json=specification.model_dump_json(),
+            agent_trace_json="[]",
+            quality_json=json.dumps({"score": 100, "passed": True, "checks": [], "issues": []}),
+            generation_mode="MULTI_AGENT",
+            created_by_user_id=user.id,
+        )
+    )
+    viewer = User(
+        email="prototype-viewer@example.com",
+        name="Prototype Viewer",
+        password_hash="hash",
+        permissions="projects:write",
+    )
+    db.add(viewer)
+    db.flush()
+    db.add(ProjectMember(project_id=project.id, user_id=viewer.id, role=ProjectMemberRole.viewer))
+    db.commit()
+
+    with pytest.raises(HTTPException) as viewer_error:
+        add_prototype_comment(
+            prototype.id,
+            PrototypeCommentCreate(body="viewer 不应能写入"),
+            http_request(f"/api/v1/prototypes/{prototype.id}/comments"),
+            viewer,
+            db,
+        )
+    assert viewer_error.value.status_code == 403
+
+    comment = add_prototype_comment(
+        prototype.id,
+        PrototypeCommentCreate(screen_id="register", body="补充批准后的边界场景"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/comments"),
+        user,
+        db,
+    )
+    db.refresh(prototype)
+    assert prototype.status == "REVIEW"
+
+    update_prototype_comment(
+        prototype.id,
+        comment.id,
+        PrototypeCommentUpdate(status="RESOLVED"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/comments/{comment.id}"),
+        user,
+        db,
+    )
+    update_prototype(
+        prototype.id,
+        PrototypeUpdateRequest(status="APPROVED"),
+        http_request(f"/api/v1/prototypes/{prototype.id}"),
+        user,
+        db,
+    )
+    update_prototype_comment(
+        prototype.id,
+        comment.id,
+        PrototypeCommentUpdate(status="OPEN"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/comments/{comment.id}"),
+        user,
+        db,
+    )
+    db.refresh(prototype)
+    assert prototype.status == "REVIEW"
+
+
+def test_materialization_request_id_cannot_be_reused_for_another_version(db: Session) -> None:
+    user, project, requirement = prototype_context(db)
+    specification = build_fallback_spec("交付幂等", "手机号注册登录和邀请链接")
+    prototype = ProductPrototype(
+        project_id=project.id,
+        requirement_id=requirement.id,
+        created_by_user_id=user.id,
+        title="多版本交付原型",
+        summary=specification.summary,
+        status="APPROVED",
+        active_version=1,
+    )
+    db.add(prototype)
+    db.flush()
+    for version in (1, 2):
+        db.add(
+            ProductPrototypeVersion(
+                prototype_id=prototype.id,
+                version=version,
+                source_prompt=f"生成交付原型 v{version}",
+                specification_json=specification.model_dump_json(),
+                agent_trace_json="[]",
+                quality_json=json.dumps({"score": 100, "passed": True, "checks": [], "issues": []}),
+                generation_mode="MULTI_AGENT",
+                created_by_user_id=user.id,
+            )
+        )
+    db.commit()
+
+    materialize_prototype(
+        prototype.id,
+        PrototypeMaterializeRequest(request_id="prototype-version-request"),
+        http_request(f"/api/v1/prototypes/{prototype.id}/materialize"),
+        user,
+        db,
+    )
+    prototype.active_version = 2
+    prototype.status = "APPROVED"
+    db.commit()
+
+    with pytest.raises(HTTPException) as request_error:
+        materialize_prototype(
+            prototype.id,
+            PrototypeMaterializeRequest(request_id="prototype-version-request"),
+            http_request(f"/api/v1/prototypes/{prototype.id}/materialize"),
+            user,
+            db,
+        )
+    assert request_error.value.status_code == 409
+
+
+def test_list_prototypes_fetches_all_active_versions_without_n_plus_one(db: Session) -> None:
+    user, project, requirement = prototype_context(db)
+    specification = build_fallback_spec("列表性能", "手机号注册登录和邀请链接")
+    for index in range(5):
+        prototype = ProductPrototype(
+            project_id=project.id,
+            requirement_id=requirement.id,
+            created_by_user_id=user.id,
+            title=f"列表原型 {index}",
+            summary=specification.summary,
+            status="DRAFT",
+            active_version=1,
+        )
+        db.add(prototype)
+        db.flush()
+        db.add(
+            ProductPrototypeVersion(
+                prototype_id=prototype.id,
+                version=1,
+                source_prompt="生成列表性能原型",
+                specification_json=specification.model_dump_json(),
+                agent_trace_json="[]",
+                quality_json=json.dumps({"score": 100, "passed": True, "checks": [], "issues": []}),
+                generation_mode="MULTI_AGENT",
+                created_by_user_id=user.id,
+            )
+        )
+    db.commit()
+    user_id = user.id
+    assert user_id > 0
+
+    statement_count = 0
+
+    def count_statement(*_args) -> None:
+        nonlocal statement_count
+        statement_count += 1
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        items = list_prototypes(None, None, user, db)
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert len(items) == 5
+    assert statement_count == 2
