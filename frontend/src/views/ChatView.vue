@@ -32,46 +32,85 @@
     </aside>
 
     <main class="chat-window">
-      <div ref="messagePane" class="messages">
-        <div v-if="!messages.length" class="chat-empty">
-          <h3>{{ selectedAgent?.name || '自动分配 AI 员工' }}</h3>
-          <p>描述你希望完成的工作。关联项目后，Agent 可以读取项目上下文并执行获准工具。</p>
+      <header class="chat-context-bar">
+        <div class="chat-context-agent">
+          <span class="online-dot" />
+          <strong>{{ activeAgentName }}</strong>
+          <span>AI 员工</span>
         </div>
-        <div v-for="(message, index) in messages" :key="message.id || index" class="message" :class="message.role">
-          <strong>{{ message.role === 'user' ? '我' : activeAgentName }}</strong>
-          <MarkdownRenderer :content="message.content" />
+        <span v-if="selectedProjectName" class="chat-context-project">{{ selectedProjectName }}</span>
+      </header>
+
+      <div ref="messagePane" class="messages">
+        <div class="messages-inner">
+          <div v-if="!messages.length" class="chat-empty">
+            <span class="chat-empty-icon"><el-icon><Cpu /></el-icon></span>
+            <h1>{{ selectedAgent?.name || 'AI 协作助手' }}</h1>
+            <p>{{ selectedAgent?.description || '准备好开始新的协作。' }}</p>
+          </div>
+          <article v-for="(message, index) in messages" :key="message.id || index" class="message" :class="message.role">
+            <span v-if="message.role !== 'user'" class="message-avatar"><el-icon><Cpu /></el-icon></span>
+            <div class="message-content">
+              <div v-if="message.role !== 'user'" class="message-author">
+                <strong>{{ activeAgentName }}</strong>
+                <span>AI 员工</span>
+              </div>
+              <div class="message-bubble">
+                <MarkdownRenderer v-if="message.content" :content="message.content" />
+                <span v-else-if="sending && index === messages.length - 1" class="typing-indicator" aria-label="正在生成">
+                  <i /><i /><i />
+                </span>
+              </div>
+            </div>
+          </article>
+
+          <el-collapse v-if="thinking || toolCalls.length" class="trace-panel">
+            <el-collapse-item title="执行记录" name="trace">
+              <p>{{ thinking }}</p>
+              <div v-for="(tool, index) in toolCalls" :key="index" class="tool-trace">
+                <div class="tool-trace-head">
+                  <strong>{{ String(tool.name || 'tool') }}</strong>
+                  <el-tag v-if="pendingActionId(tool)" :type="pendingActionStatus(tool) === 'PENDING_APPROVAL' ? 'warning' : 'success'" size="small">
+                    {{ actionStatusLabel(pendingActionStatus(tool)) }}
+                  </el-tag>
+                </div>
+                <pre>{{ JSON.stringify(tool, null, 2) }}</pre>
+                <div v-if="pendingActionId(tool) && pendingActionStatus(tool) === 'PENDING_APPROVAL'" class="inline-actions">
+                  <el-button type="primary" :icon="Check" :loading="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'approve')">批准执行</el-button>
+                  <el-button :icon="Close" :disabled="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'reject')">拒绝</el-button>
+                </div>
+              </div>
+            </el-collapse-item>
+          </el-collapse>
         </div>
       </div>
-      <el-collapse v-if="thinking || toolCalls.length" class="trace-panel">
-        <el-collapse-item title="执行记录" name="trace">
-          <p>{{ thinking }}</p>
-          <div v-for="(tool, index) in toolCalls" :key="index" class="tool-trace">
-            <div class="tool-trace-head">
-              <strong>{{ String(tool.name || 'tool') }}</strong>
-              <el-tag v-if="pendingActionId(tool)" :type="pendingActionStatus(tool) === 'PENDING_APPROVAL' ? 'warning' : 'success'" size="small">
-                {{ actionStatusLabel(pendingActionStatus(tool)) }}
-              </el-tag>
-            </div>
-            <pre>{{ JSON.stringify(tool, null, 2) }}</pre>
-            <div v-if="pendingActionId(tool) && pendingActionStatus(tool) === 'PENDING_APPROVAL'" class="inline-actions">
-              <el-button type="primary" :icon="Check" :loading="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'approve')">批准执行</el-button>
-              <el-button :icon="Close" :disabled="decidingActionId === pendingActionId(tool)" @click="decideAction(tool, 'reject')">拒绝</el-button>
-            </div>
-          </div>
-        </el-collapse-item>
-      </el-collapse>
-      <div class="composer">
-        <el-input v-model="input" type="textarea" :rows="3" placeholder="输入需求或问题，Ctrl + Enter 发送" @keydown.ctrl.enter.prevent="send" />
-        <el-button type="primary" :icon="Promotion" :loading="sending" :disabled="!input.trim()" @click="send">发送</el-button>
+
+      <div class="composer-shell">
+        <div class="composer">
+          <el-input
+            v-model="input"
+            type="textarea"
+            :autosize="{ minRows: 1, maxRows: 6 }"
+            resize="none"
+            aria-label="发送给 AI 员工的消息"
+            placeholder="向 AI 员工发送消息"
+            @keydown.ctrl.enter.prevent="send"
+          />
+          <el-button type="primary" :icon="Promotion" circle aria-label="发送消息" title="发送" :loading="sending" :disabled="!input.trim()" @click="send" />
+        </div>
+        <div class="composer-meta">
+          <span>{{ selectedProjectName || '未关联项目' }}</span>
+          <span>AI 生成内容，请核对重要信息</span>
+        </div>
       </div>
     </main>
   </section>
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Check, Close, Plus, Promotion } from '@element-plus/icons-vue'
+import { Check, Close, Cpu, Plus, Promotion } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api, apiBaseURL, refreshAccessToken } from '../api/client'
@@ -96,6 +135,7 @@ const messagePane = ref<HTMLElement | null>(null)
 const suppressProjectWatch = ref(false)
 const auth = useAuthStore()
 const router = useRouter()
+const selectedProjectName = computed(() => projects.value.find((item) => item.id === selectedProjectId.value)?.name || '')
 
 async function loadBaseData() {
   const [agentResponse, projectResponse] = await Promise.all([
