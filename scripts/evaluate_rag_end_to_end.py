@@ -17,6 +17,7 @@ from app.core.llm_usage import calculate_cost_micros, estimate_tokens  # noqa: E
 from app.rag.chunking import ChunkingConfig, build_chunker  # noqa: E402
 from app.rag.evaluation import (  # noqa: E402
     answer_citations,
+    compare_end_to_end_reports,
     deterministic_citation_score,
     load_cases,
     load_documents,
@@ -33,6 +34,7 @@ from app.rag.service import (  # noqa: E402
     rewrite_query,
     select_diverse_results,
     sparse_scores,
+    split_text,
 )
 
 
@@ -57,22 +59,46 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
         overlap_tokens=settings.rag_chunk_overlap_tokens,
         min_chunk_tokens=settings.rag_min_chunk_tokens,
     )
-    chunker = build_chunker(
-        config,
-        strategy=strategy,
-        semantic_threshold=settings.rag_semantic_threshold,
-        embedding_model=settings.embedding_model,
-        embedding_api_key=settings.embedding_api_key or gateway.api_key,
-        embedding_base_url=settings.embedding_base_url or gateway.base_url,
-    )
+    chunker = None
+    if strategy != "legacy":
+        chunker = build_chunker(
+            config,
+            strategy=strategy,
+            semantic_threshold=settings.rag_semantic_threshold,
+            embedding_model=settings.embedding_model,
+            embedding_api_key=settings.embedding_api_key or gateway.api_key,
+            embedding_base_url=settings.embedding_base_url or gateway.base_url,
+        )
     rows: list[dict] = []
     semantic_boundary_tokens = 0
     for document_id, (filename, data) in enumerate(documents.items(), start=1):
         parsed = parse_document_elements(filename, data)
+        if strategy == "legacy":
+            chunks = split_text(parsed.text, chunk_size=900, overlap=140)
+            for chunk_index, content in enumerate(chunks):
+                rows.append(
+                    {
+                        "vector_id": f"legacy-{document_id}-{chunk_index}",
+                        "document_id": document_id,
+                        "filename": filename,
+                        "chunk_index": chunk_index,
+                        "content": content,
+                        "citation": f"{filename}#chunk-{chunk_index}",
+                        "stable_id": f"legacy-{document_id}-{chunk_index}",
+                        "parent_stable_id": f"legacy-{document_id}-{chunk_index}",
+                        "parent_content": content,
+                        "heading_path": [],
+                        "page_start": None,
+                        "page_end": None,
+                    }
+                )
+            continue
         if strategy == "semantic":
             semantic_boundary_tokens += estimate_tokens(parsed.text)
+            assert chunker is not None
             chunks = await asyncio.to_thread(chunker.chunk, parsed)
         else:
+            assert chunker is not None
             chunks = chunker.chunk(parsed)
         for chunk in chunks:
             rows.append(
@@ -124,6 +150,18 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     if configuration_errors:
         return {"status": "configuration_error", "errors": configuration_errors}, 2
 
+    baseline_queries: dict[str, list[str]] = {}
+    if args.baseline_report:
+        try:
+            baseline_payload = json.loads(args.baseline_report.read_text(encoding="utf-8"))
+            for case_result in baseline_payload.get("cases", []):
+                if isinstance(case_result, dict) and isinstance(case_result.get("queries"), list):
+                    baseline_queries[str(case_result.get("name"))] = [
+                        query for query in case_result["queries"] if isinstance(query, str) and query
+                    ]
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            return {"status": "configuration_error", "errors": [f"invalid baseline report: {exc}"]}, 2
+
     if args.require_reranker:
         try:
             await reranker.healthcheck()
@@ -132,6 +170,13 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
     cases = load_cases(ROOT / "backend" / "tests" / "rag_eval_cases.json")
     documents = load_documents(cases, ROOT / "backend" / "tests" / "rag_eval_documents")
+    if args.baseline_report:
+        missing_queries = [case.name for case in cases if not baseline_queries.get(case.name)]
+        if missing_queries:
+            return {
+                "status": "configuration_error",
+                "errors": [f"baseline report is missing queries for: {', '.join(missing_queries)}"],
+            }, 2
     try:
         candidates, semantic_boundary_tokens = await candidate_rows(
             documents,
@@ -180,7 +225,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
     for case in cases:
         case_started = perf_counter()
-        queries = await rewrite_query(case.query)
+        queries = baseline_queries.get(case.name) or await rewrite_query(case.query)
         query_vectors = await gateway.embed_many(queries)
         embedding_tokens += sum(estimate_tokens(query) for query in queries)
         query_vector = average_vectors(query_vectors)
@@ -300,6 +345,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             {
                 "name": case.name,
                 "answerable": case.answerable,
+                "queries": queries,
                 "retrieved": [row["citation"] for row in selected],
                 "answer": answer,
                 "deterministic_citation_score": deterministic_score,
@@ -380,6 +426,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             "metrics": metrics,
             "cost": costs,
             "gates": {"passed": not gate_failures, "failures": gate_failures, "thresholds": thresholds},
+            "evaluation_errors": judge_errors,
             "cases": results,
         },
         1 if args.enforce_gates and gate_failures else 0,
@@ -392,7 +439,10 @@ def main() -> int:
     parser.add_argument("--judge-model")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--min-score", type=float, default=0.2)
-    parser.add_argument("--chunk-strategy", choices=("structural", "semantic"), default="structural")
+    parser.add_argument("--chunk-strategy", choices=("legacy", "structural", "semantic"), default="structural")
+    parser.add_argument("--baseline-report", type=Path)
+    parser.add_argument("--min-ab-primary-gain", type=float, default=0.05)
+    parser.add_argument("--ab-regression-tolerance", type=float, default=0.01)
     parser.add_argument("--require-reranker", action="store_true")
     parser.add_argument("--enforce-gates", action="store_true")
     parser.add_argument("--min-recall", type=float, default=0.8)
@@ -405,6 +455,22 @@ def main() -> int:
         payload, exit_code = asyncio.run(evaluate(args))
     except LLMGatewayError as exc:
         payload, exit_code = {"status": "provider_error", "errors": [str(exc)]}, 2
+    if args.baseline_report and payload.get("status") == "completed":
+        try:
+            baseline = json.loads(args.baseline_report.read_text(encoding="utf-8"))
+            comparison = compare_end_to_end_reports(
+                baseline,
+                payload,
+                min_primary_gain=args.min_ab_primary_gain,
+                regression_tolerance=args.ab_regression_tolerance,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            comparison = {"passed": False, "failures": [str(exc)]}
+        payload["ab_comparison"] = comparison
+        payload["gates"]["failures"].extend(comparison["failures"])
+        payload["gates"]["passed"] = not payload["gates"]["failures"]
+        if args.enforce_gates and not comparison["passed"]:
+            exit_code = 1
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -112,6 +112,63 @@ def deterministic_citation_score(answer: str, allowed: set[str], *, answerable: 
     return 1.0 if citations.issubset(allowed) else 0.0
 
 
+def compare_end_to_end_reports(
+    baseline: dict,
+    candidate: dict,
+    *,
+    min_primary_gain: float = 0.05,
+    regression_tolerance: float = 0.01,
+) -> dict:
+    baseline_metrics = baseline.get("metrics")
+    candidate_metrics = candidate.get("metrics")
+    if not isinstance(baseline_metrics, dict) or not isinstance(candidate_metrics, dict):
+        raise ValueError("baseline and candidate reports must contain metrics")
+    if baseline.get("evaluation_errors"):
+        raise ValueError("baseline report contains evaluation errors")
+    if candidate.get("evaluation_errors"):
+        raise ValueError("candidate report contains evaluation errors")
+
+    guarded_metrics = (
+        "recall_at_k",
+        "mrr",
+        "ndcg_at_k",
+        "context_precision_at_k",
+        "citation_target_accuracy",
+        "faithfulness",
+        "answer_relevance",
+        "deterministic_citation_validity",
+        "judge_citation_correctness",
+        "refusal_accuracy",
+    )
+    deltas: dict[str, float] = {}
+    failures: list[str] = []
+    for metric in guarded_metrics:
+        baseline_value = baseline_metrics.get(metric)
+        candidate_value = candidate_metrics.get(metric)
+        if not isinstance(baseline_value, (int, float)) or not isinstance(candidate_value, (int, float)):
+            raise ValueError(f"report metric {metric} must be numeric")
+        delta = float(candidate_value) - float(baseline_value)
+        deltas[metric] = round(delta, 4)
+        if delta < -regression_tolerance:
+            failures.append(
+                f"{metric} regressed by {abs(delta):.4f}, tolerance is {regression_tolerance:.4f}"
+            )
+
+    primary_metrics = ("recall_at_k", "mrr", "ndcg_at_k", "context_precision_at_k")
+    best_primary_gain = max(deltas[metric] for metric in primary_metrics)
+    if best_primary_gain < min_primary_gain:
+        failures.append(
+            f"best primary retrieval gain {best_primary_gain:.4f} < {min_primary_gain:.4f}"
+        )
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "deltas": deltas,
+        "min_primary_gain": min_primary_gain,
+        "regression_tolerance": regression_tolerance,
+    }
+
+
 def load_cases(path: Path) -> list[RetrievalCase]:
     rows = json.loads(path.read_text(encoding="utf-8"))
     return [RetrievalCase(**row) for row in rows]

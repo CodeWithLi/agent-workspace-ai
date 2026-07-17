@@ -4,6 +4,7 @@ from app.rag.chunking import StructuralChunker
 import pytest
 
 from app.rag.evaluation import (
+    compare_end_to_end_reports,
     deterministic_citation_score,
     evaluate_candidates,
     legacy_candidates,
@@ -73,3 +74,36 @@ def test_answer_judge_parser_and_citation_gate_are_strict() -> None:
             '{"faithfulness":1.1,"answer_relevance":1,"citation_correctness":1,'
             '"refusal_correct":false,"reason":"invalid"}'
         )
+
+
+def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> None:
+    baseline_metrics = {
+        "recall_at_k": 0.7,
+        "mrr": 0.7,
+        "ndcg_at_k": 0.7,
+        "context_precision_at_k": 0.4,
+        "citation_target_accuracy": 0.9,
+        "faithfulness": 0.9,
+        "answer_relevance": 0.9,
+        "deterministic_citation_validity": 1.0,
+        "judge_citation_correctness": 0.95,
+        "refusal_accuracy": 1.0,
+    }
+    candidate_metrics = {**baseline_metrics, "recall_at_k": 0.76}
+
+    passed = compare_end_to_end_reports(
+        {"metrics": baseline_metrics, "evaluation_errors": []},
+        {"metrics": candidate_metrics, "evaluation_errors": []},
+    )
+    regressed = compare_end_to_end_reports(
+        {"metrics": baseline_metrics, "evaluation_errors": []},
+        {
+            "metrics": {**candidate_metrics, "citation_target_accuracy": 0.7},
+            "evaluation_errors": [],
+        },
+    )
+
+    assert passed["passed"] is True
+    assert passed["deltas"]["recall_at_k"] == 0.06
+    assert regressed["passed"] is False
+    assert any("citation_target_accuracy regressed" in failure for failure in regressed["failures"])

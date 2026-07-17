@@ -45,7 +45,7 @@ MILVUS_COLLECTION=knowledge_chunks_v4
 
 1. `python scripts/evaluate_rag_chunking.py --enforce-gates` 使用固化的真实仓库文档快照，对比旧 `900/140` 与结构化分块，阻止 Recall/MRR/nDCG/引用退化、Context Precision 提升不足、token 膨胀和本地 p95 越线。
 2. 普通 CI 的 `rag-integration` 作业启动真实 PostgreSQL、MinIO、etcd 和 Milvus，执行 v4 BM25+child dense+parent dense hybrid、4 并发 p95 门禁，并验证两个个人知识库 owner 之间没有泄漏。
-3. `RAG External Quality Gate` 手动工作流使用真实多语 child/parent embedding、查询改写、Cross-Encoder reranker、回答模型和 judge 模型，衡量答案忠实度、答案相关性、引用正确率、拒答、端到端 p95 与估算成本。父内容去重后单独计入 embedding token 与成本。该脚本要求 `LLM_FALLBACK_ENABLED=false`，缺少外部配置时以退出码 `2` 拒绝评测。
+3. `RAG External Quality Gate` 手动工作流先运行旧 `900/140` 基线，再以相同语料和外部服务运行真实多语 child/parent embedding、语义分块、查询改写、Cross-Encoder reranker、回答模型和 judge 模型。候选方案的 Recall/MRR/nDCG/Context Precision 不得显著退化，且至少一个主检索指标需提升 `0.05`；同时衡量答案忠实度、答案相关性、引用正确率、拒答、端到端 p95 与估算成本。父内容去重后单独计入 embedding token 与成本。该脚本要求 `LLM_FALLBACK_ENABLED=false`，缺少外部配置时以退出码 `2` 拒绝评测。
 4. `RAG Docling Integration` 每周使用真实 Docling Serve CPU 镜像验证 DOCX 标题/表格和图片型 PDF OCR。模型、镜像或 OCR 失败会阻断该工作流，不允许原生 parser fallback 掩盖问题。
 
 外部答案门禁命令：

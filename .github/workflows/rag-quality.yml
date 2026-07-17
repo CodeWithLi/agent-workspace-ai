@@ -50,18 +50,27 @@ jobs:
           test -n "$RERANKER_BASE_URL"
           test -n "$RERANKER_MODEL"
       - run: pip install -r backend/requirements.txt
-      - name: Run external answer-quality gate
+      - name: Run legacy external baseline
+        run: >-
+          RAG_MULTI_VECTOR_ENABLED=false python scripts/evaluate_rag_end_to_end.py
+          --require-reranker
+          --chunk-strategy legacy
+          --judge-model "${{ secrets.RAG_EVAL_JUDGE_MODEL }}"
+          --output .run/rag-end-to-end-baseline.json
+      - name: Run external answer-quality A/B gate
         run: >-
           python scripts/evaluate_rag_end_to_end.py
           --require-reranker
           --chunk-strategy semantic
           --enforce-gates
+          --baseline-report .run/rag-end-to-end-baseline.json
+          --min-ab-primary-gain 0.05
           --judge-model "${{ secrets.RAG_EVAL_JUDGE_MODEL }}"
           --output .run/rag-end-to-end.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rag-end-to-end-${{ github.run_id }}
-          path: .run/rag-end-to-end.json
+          path: .run/rag-end-to-end*.json
           if-no-files-found: warn
           retention-days: 30
