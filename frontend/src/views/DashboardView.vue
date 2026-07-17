@@ -1,48 +1,84 @@
 <template>
-  <section class="page">
-    <div class="page-head">
+  <section class="page dashboard-page">
+    <div class="page-head dashboard-heading">
       <div>
-        <h2>工作台</h2>
-        <p>管理项目空间和默认 AI 员工。</p>
+        <span class="page-kicker">今日工作概览</span>
+        <h1>{{ greeting }}，{{ auth.user?.name || '你好' }}</h1>
+        <p>查看项目进展、Agent 团队和待处理事项。</p>
       </div>
       <el-button v-if="auth.hasPermission('projects:write')" type="primary" :icon="Plus" @click="createDialog = true">新建项目</el-button>
     </div>
 
-    <el-row :gutter="20">
-      <el-col :span="24">
-        <div class="stat-grid">
-          <div class="stat-card"><strong>{{ stats?.projects || 0 }}</strong><span>我的项目</span></div>
-          <div class="stat-card"><strong>{{ stats?.agents || 0 }}</strong><span>AI员工</span></div>
-          <div class="stat-card"><strong>{{ stats?.documents || 0 }}</strong><span>知识库文档</span></div>
-          <div ref="chartEl" class="chart-card" />
+    <div class="metric-grid">
+      <article class="metric-card">
+        <span class="metric-icon"><Folder /></span>
+        <div><span>我的项目</span><strong>{{ stats?.projects || 0 }}</strong></div>
+      </article>
+      <article class="metric-card">
+        <span class="metric-icon"><Cpu /></span>
+        <div><span>AI 员工</span><strong>{{ stats?.agents || 0 }}</strong></div>
+      </article>
+      <article class="metric-card">
+        <span class="metric-icon"><Tickets /></span>
+        <div><span>项目任务</span><strong>{{ taskTotal }}</strong></div>
+      </article>
+      <article class="metric-card">
+        <span class="metric-icon"><Files /></span>
+        <div><span>知识文档</span><strong>{{ stats?.documents || 0 }}</strong></div>
+      </article>
+    </div>
+
+    <div class="dashboard-grid">
+      <section class="dashboard-section project-section">
+        <div class="section-heading">
+          <div><h2>我的项目</h2><p>最近创建和参与的项目空间</p></div>
+          <el-button link type="primary" @click="router.push('/projects')">查看全部<el-icon><ArrowRight /></el-icon></el-button>
         </div>
-      </el-col>
-      <el-col :span="14">
-        <h3>我的项目</h3>
-        <div class="item-grid">
-          <article v-for="project in projects" :key="project.id" class="item-card" @click="router.push(`/projects/${project.id}`)">
-            <h4>{{ project.name }}</h4>
-            <p>{{ project.description || '暂无描述' }}</p>
-            <span>{{ new Date(project.created_at).toLocaleString() }}</span>
-          </article>
+        <div class="project-list">
+          <button v-for="project in projects.slice(0, 5)" :key="project.id" class="project-row" @click="router.push(`/projects/${project.id}`)">
+            <span class="project-symbol"><Folder /></span>
+            <span class="project-summary"><strong>{{ project.name }}</strong><small>{{ project.description || '暂无项目描述' }}</small></span>
+            <span class="project-date">{{ formatDate(project.created_at) }}</span>
+            <el-icon><ArrowRight /></el-icon>
+          </button>
+          <el-empty v-if="!projects.length" description="还没有项目，创建一个项目开始协作" :image-size="64" />
         </div>
-      </el-col>
-      <el-col :span="10">
-        <h3>AI员工</h3>
-        <div class="agent-list">
-          <div v-for="agent in agents" :key="agent.id" class="agent-row">
-            <strong>{{ agent.name }}</strong>
-            <span>{{ agent.description }}</span>
+      </section>
+
+      <section class="dashboard-section chart-section">
+        <div class="section-heading"><div><h2>任务状态</h2><p>当前项目任务分布</p></div></div>
+        <div ref="chartEl" class="chart-card" role="img" :aria-label="taskChartLabel" />
+        <div class="task-legend">
+          <span v-for="item in taskLegend" :key="item.key"><i :class="`legend-${item.key.toLowerCase()}`" />{{ item.label }} <strong>{{ item.value }}</strong></span>
+        </div>
+      </section>
+    </div>
+
+    <div class="dashboard-grid secondary-grid">
+      <section class="dashboard-section team-section">
+        <div class="section-heading">
+          <div><h2>AI 团队</h2><p>当前可调度的数字员工</p></div>
+          <el-button link type="primary" @click="router.push('/agents')">管理团队<el-icon><ArrowRight /></el-icon></el-button>
+        </div>
+        <div class="team-list">
+          <button v-for="agent in agents.slice(0, 6)" :key="agent.id" class="team-member" @click="router.push('/chat')">
+            <span class="team-avatar"><Cpu /></span>
+            <span><strong>{{ agent.name }}</strong><small>{{ agent.description }}</small></span>
+            <span class="online-dot" title="可用" />
+          </button>
+        </div>
+      </section>
+
+      <section class="dashboard-section activity-section">
+        <div class="section-heading"><div><h2>最近活动</h2><p>项目和 Agent 的最新变化</p></div></div>
+        <div class="activity-list">
+          <div v-for="activity in stats?.recent_activities || []" :key="activity" class="activity-row">
+            <span class="activity-icon"><Clock /></span><span>{{ activity }}</span>
           </div>
+          <el-empty v-if="!stats?.recent_activities?.length" description="暂无最近活动" :image-size="56" />
         </div>
-      </el-col>
-      <el-col :span="24">
-        <h3>最近活动</h3>
-        <div class="agent-list">
-          <div v-for="activity in stats?.recent_activities || []" :key="activity" class="agent-row">{{ activity }}</div>
-        </div>
-      </el-col>
-    </el-row>
+      </section>
+    </div>
 
     <el-dialog v-model="createDialog" title="创建项目" width="480">
       <el-form label-position="top">
@@ -62,9 +98,9 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus } from '@element-plus/icons-vue'
+import { ArrowRight, Clock, Cpu, Files, Folder, Plus, Tickets } from '@element-plus/icons-vue'
 import { PieChart } from 'echarts/charts'
 import { TooltipComponent } from 'echarts/components'
 import * as echarts from 'echarts/core'
@@ -82,6 +118,21 @@ const chartEl = ref<HTMLDivElement>()
 const createDialog = ref(false)
 const form = reactive({ name: '', description: '', members: '' })
 let chart: echarts.ECharts | undefined
+
+const greeting = computed(() => {
+  const hour = new Date().getHours()
+  if (hour < 12) return '早上好'
+  if (hour < 18) return '下午好'
+  return '晚上好'
+})
+const taskTotal = computed(() => Object.values(stats.value?.tasks || {}).reduce((sum, value) => sum + value, 0))
+const taskLegend = computed(() => [
+  { key: 'TODO', label: '待办', value: stats.value?.tasks.TODO || 0 },
+  { key: 'RUNNING', label: '进行中', value: stats.value?.tasks.RUNNING || 0 },
+  { key: 'DONE', label: '已完成', value: stats.value?.tasks.DONE || 0 },
+  { key: 'FAILED', label: '失败', value: stats.value?.tasks.FAILED || 0 }
+])
+const taskChartLabel = computed(() => taskLegend.value.map((item) => `${item.label} ${item.value}`).join('，'))
 
 echarts.use([PieChart, TooltipComponent, CanvasRenderer])
 
@@ -101,16 +152,26 @@ async function load() {
   if (chartEl.value) {
     chart ||= echarts.init(chartEl.value)
     chart.setOption({
-      tooltip: {},
+      color: ['#94a3b8', '#2563eb', '#16a34a', '#dc2626'],
+      tooltip: { trigger: 'item' },
       series: [
         {
           type: 'pie',
-          radius: ['45%', '70%'],
-          data: Object.entries(stats.value.tasks).map(([name, value]) => ({ name, value }))
+          radius: ['56%', '78%'],
+          center: ['50%', '48%'],
+          avoidLabelOverlap: true,
+          itemStyle: { borderColor: '#ffffff', borderWidth: 3 },
+          label: { show: false },
+          emphasis: { scale: false },
+          data: taskLegend.value.map((item) => ({ name: item.label, value: item.value }))
         }
       ]
     })
   }
+}
+
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(new Date(value))
 }
 
 function resizeChart() {

@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>需求中心</h2>
+        <h1>需求中心</h1>
         <p>把模糊想法沉淀为需求卡片、PRD要点和验收标准。</p>
       </div>
       <el-button type="primary" @click="dialog = true">创建需求</el-button>

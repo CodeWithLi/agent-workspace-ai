@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>用户与权限</h2>
+        <h1>用户与权限</h1>
         <p>管理账号状态、系统角色与最小权限。</p>
       </div>
       <el-button :icon="Refresh" @click="load">刷新</el-button>
@@ -28,7 +28,7 @@
         </template>
       </el-table-column>
       <el-table-column label="操作" width="130" fixed="right">
-        <template #default="{ row }"><el-button :icon="Edit" circle title="编辑权限" @click="openEditRow(row)" /></template>
+        <template #default="{ row }"><el-button :icon="Edit" circle aria-label="编辑权限" title="编辑权限" @click="openEditRow(row)" /></template>
       </el-table-column>
     </el-table>
 

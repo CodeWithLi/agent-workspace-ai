@@ -2,14 +2,14 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>项目报告</h2>
+        <h1>项目报告</h1>
         <p>生成日报、周报、风险报告和进度报告。</p>
       </div>
       <div class="inline-actions">
-        <el-select v-model="projectId" placeholder="项目" style="width: 220px">
+        <el-select v-model="projectId" placeholder="项目" class="page-select compact-select">
           <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
         </el-select>
-        <el-select v-model="reportType" style="width: 140px">
+        <el-select v-model="reportType" class="page-select type-select">
           <el-option label="日报" value="daily" />
           <el-option label="周报" value="weekly" />
           <el-option label="风险报告" value="risk" />

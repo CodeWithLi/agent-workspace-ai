@@ -3,7 +3,7 @@
     <aside class="agent-pane">
       <div class="pane-heading">
         <h3>AI 员工</h3>
-        <el-button :icon="Plus" circle title="新会话" @click="startNewConversation(selectedAgent)" />
+        <el-button :icon="Plus" circle aria-label="新会话" title="新会话" @click="startNewConversation(selectedAgent)" />
       </div>
       <el-select v-model="selectedProjectId" clearable placeholder="关联项目（可选）" class="project-select">
         <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />

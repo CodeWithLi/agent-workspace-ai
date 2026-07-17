@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>知识库</h2>
+        <h1>知识库</h1>
         <p>上传 PDF、Word、Markdown，并进行上下文增强搜索。</p>
       </div>
       <el-upload v-if="auth.hasPermission('knowledge:write')" :http-request="upload" :show-file-list="false">
@@ -16,8 +16,8 @@
     </div>
 
     <el-row :gutter="20">
-      <el-col :span="10">
-        <h3>文档</h3>
+      <el-col :xs="24" :lg="10">
+        <h2 class="section-title">文档</h2>
         <el-table :data="documents" class="data-table">
           <el-table-column prop="filename" label="文件名" />
           <el-table-column prop="status" label="状态" width="90" />
@@ -28,8 +28,8 @@
           </el-table-column>
         </el-table>
       </el-col>
-      <el-col :span="14">
-        <h3>搜索结果</h3>
+      <el-col :xs="24" :lg="14">
+        <h2 class="section-title">搜索结果</h2>
         <div class="answer">{{ answer }}</div>
         <div v-for="result in results" :key="`${result.document_id}-${result.content}`" class="result-row">
           <strong>{{ result.filename }}</strong>

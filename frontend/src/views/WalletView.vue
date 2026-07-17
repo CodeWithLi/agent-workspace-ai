@@ -1,7 +1,7 @@
 <template>
   <section class="page narrow-page">
     <div class="page-head">
-      <div><h2>Token 钱包</h2><p>AI 员工与多 Agent 工作流用量。</p></div>
+      <div><h1>Token 钱包</h1><p>AI 员工与多 Agent 工作流用量。</p></div>
       <el-tag type="warning">模拟充值</el-tag>
     </div>
 

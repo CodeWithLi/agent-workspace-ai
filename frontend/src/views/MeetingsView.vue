@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>会议中心</h2>
+        <h1>会议中心</h1>
         <p>输入会议记录，AI自动生成会议纪要、TODO、负责人和时间。</p>
       </div>
       <el-button type="primary" :loading="loading" @click="createMeeting">生成纪要</el-button>

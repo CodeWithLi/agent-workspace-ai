@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>通知中心</h2>
+        <h1>通知中心</h1>
         <p>站内通知与邮件</p>
       </div>
       <el-button type="primary" :icon="Plus" @click="dialog = true">新建通知</el-button>
@@ -23,8 +23,8 @@
       </el-table-column>
       <el-table-column label="操作" width="150">
         <template #default="{ row }">
-          <el-button v-if="['DRAFT', 'FAILED', 'CANCELLED'].includes(row.status)" :icon="Promotion" circle title="立即发送" @click="sendNow(row.id)" />
-          <el-button v-if="['DRAFT', 'SCHEDULED'].includes(row.status)" :icon="Close" circle title="取消" @click="cancel(row.id)" />
+          <el-button v-if="['DRAFT', 'FAILED', 'CANCELLED'].includes(row.status)" :icon="Promotion" circle aria-label="立即发送" title="立即发送" @click="sendNow(row.id)" />
+          <el-button v-if="['DRAFT', 'SCHEDULED'].includes(row.status)" :icon="Close" circle aria-label="取消通知" title="取消" @click="cancel(row.id)" />
         </template>
       </el-table-column>
     </el-table>

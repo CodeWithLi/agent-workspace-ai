@@ -2,27 +2,32 @@
   <section class="page narrow-page">
     <div class="page-head">
       <div>
-        <h2>AI 员工</h2>
-        <p>查看角色能力、模型、工具权限与执行安全策略。</p>
+        <span class="page-kicker">数字员工团队</span>
+        <h1>AI 员工</h1>
+        <p>配置职责、Prompt、模型、工具权限与人工确认策略。</p>
       </div>
+      <span class="page-count">{{ agents.length }} 名员工</span>
     </div>
 
     <div class="agent-card-grid">
       <article v-for="agent in agents" :key="agent.id" class="employee-card">
-        <div class="employee-title">
-          <el-icon><Briefcase /></el-icon>
-          <h3>{{ agent.name }}</h3>
+        <div class="employee-card-head">
+          <div class="employee-title">
+            <span class="employee-icon"><el-icon><Cpu /></el-icon></span>
+            <div><h2>{{ agent.name }}</h2><span>{{ roleLabel(agent.role) }}</span></div>
+          </div>
+          <el-button v-if="auth.user?.role === 'admin'" class="employee-config" :icon="Setting" circle aria-label="配置 AI 员工" title="配置" @click="openConfig(agent)" />
         </div>
         <p>{{ agent.description }}</p>
         <div class="employee-meta">
-          <span>模型：<strong>{{ agent.model }}</strong></span>
-          <span>人工确认：<strong>{{ agent.human_approval_required ? '需要' : '不需要' }}</strong></span>
-          <span>Memory：<strong>{{ agent.memory_enable ? '启用' : '关闭' }}</strong></span>
+          <span><small>模型</small><strong>{{ agent.model }}</strong></span>
+          <span><small>人工确认</small><strong>{{ agent.human_approval_required ? '需要' : '不需要' }}</strong></span>
+          <span><small>Memory</small><strong>{{ agent.memory_enable ? '启用' : '关闭' }}</strong></span>
         </div>
+        <div class="employee-tools-label"><span>已授权工具</span><small>{{ tools(agent).length }}</small></div>
         <div class="tool-tags">
-          <el-tag v-for="tool in tools(agent)" :key="tool" size="small">{{ tool }}</el-tag>
+          <el-tag v-for="tool in tools(agent)" :key="tool" size="small" effect="plain">{{ tool }}</el-tag>
         </div>
-        <el-button v-if="auth.user?.role === 'admin'" class="card-action" :icon="Setting" @click="openConfig(agent)">配置</el-button>
       </article>
     </div>
 
@@ -69,7 +74,7 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Briefcase, Setting } from '@element-plus/icons-vue'
+import { Cpu, Setting } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
@@ -99,6 +104,19 @@ const form = reactive({
 
 function tools(agent: Agent) {
   return agent.tools.split(',').map((item) => item.trim()).filter(Boolean)
+}
+
+function roleLabel(role: string) {
+  return {
+    product_manager: '产品与需求',
+    project_manager: '项目交付',
+    architect: '技术架构',
+    test_engineer: '质量保障',
+    meeting_summarizer: '会议协作',
+    knowledge_admin: '企业知识',
+    notification_secretary: '消息触达',
+    operations_analyst: '运营洞察'
+  }[role] || '专业 Agent'
 }
 
 async function loadAgents() {

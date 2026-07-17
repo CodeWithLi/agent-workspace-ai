@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>系统设置</h2>
+        <h1>系统设置</h1>
         <p>查看当前 LLM Gateway、Embedding、Milvus 配置。</p>
       </div>
       <el-button type="primary" @click="openPythonAdmin">打开 Python 管理后台</el-button>

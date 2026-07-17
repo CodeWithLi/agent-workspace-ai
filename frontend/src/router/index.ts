@@ -55,4 +55,8 @@ router.beforeEach(async (to) => {
   return true
 })
 
+router.afterEach(() => {
+  window.requestAnimationFrame(() => document.getElementById('main-content')?.focus({ preventScroll: true }))
+})
+
 export default router

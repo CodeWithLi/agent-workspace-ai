@@ -2,16 +2,16 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>任务看板</h2>
+        <h1>任务看板</h1>
         <p>按项目查看 TODO、RUNNING、DONE、FAILED 状态。</p>
       </div>
-      <el-select v-model="projectId" placeholder="选择项目" style="width: 260px" @change="loadTasks">
+      <el-select v-model="projectId" placeholder="选择项目" class="page-select" @change="loadTasks">
         <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
       </el-select>
     </div>
     <div class="kanban">
       <section v-for="status in statuses" :key="status" class="kanban-col">
-        <h3>{{ status }}</h3>
+        <div class="kanban-heading"><h2>{{ statusLabel(status) }}</h2><span>{{ grouped[status].length }}</span></div>
         <article v-for="task in grouped[status]" :key="task.id" class="task-card">
           <strong>{{ task.title }}</strong>
           <p>{{ task.description }}</p>
@@ -39,6 +39,10 @@ const grouped = computed<Record<string, Task[]>>(() => {
   tasks.value.forEach((task) => result[task.status]?.push(task))
   return result
 })
+
+function statusLabel(status: string) {
+  return { TODO: '待办', RUNNING: '进行中', DONE: '已完成', FAILED: '失败' }[status] || status
+}
 
 async function loadTasks() {
   if (!projectId.value) return

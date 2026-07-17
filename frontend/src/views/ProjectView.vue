@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>{{ project?.name || '项目空间' }}</h2>
+        <h1>{{ project?.name || '项目空间' }}</h1>
         <p>{{ project?.description }}</p>
       </div>
       <div class="inline-actions">
@@ -12,16 +12,16 @@
     </div>
 
     <el-row :gutter="20">
-      <el-col :span="14">
-        <h3>任务列表</h3>
+      <el-col :xs="24" :lg="14">
+        <h2 class="section-title">任务列表</h2>
         <el-table :data="tasks" class="data-table">
           <el-table-column prop="title" label="任务" min-width="180" />
           <el-table-column prop="priority" label="优先级" width="100" />
           <el-table-column prop="status" label="状态" width="120" />
         </el-table>
       </el-col>
-      <el-col :span="10">
-        <h3>AI员工</h3>
+      <el-col :xs="24" :lg="10">
+        <h2 class="section-title">AI 员工</h2>
         <div class="agent-list">
           <div v-for="agent in agents" :key="agent.id" class="agent-row">
             <strong>{{ agent.name }}</strong>
@@ -47,7 +47,7 @@
         </el-table-column>
         <el-table-column v-if="project?.current_user_role === 'owner'" label="操作" width="90">
           <template #default="{ row }">
-            <el-button v-if="row.role !== 'owner'" :icon="Delete" circle title="移除成员" @click="removeMemberRow(row)" />
+            <el-button v-if="row.role !== 'owner'" :icon="Delete" circle aria-label="移除成员" title="移除成员" @click="removeMemberRow(row)" />
           </template>
         </el-table-column>
       </el-table>

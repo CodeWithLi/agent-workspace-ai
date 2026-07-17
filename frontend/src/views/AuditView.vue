@@ -2,7 +2,7 @@
   <section class="page">
     <div class="page-head">
       <div>
-        <h2>审计日志</h2>
+        <h1>审计日志</h1>
         <p>查看认证、权限、Agent 工具、知识库和工作流的关键操作记录。</p>
       </div>
       <el-button :icon="Refresh" @click="load">刷新</el-button>
