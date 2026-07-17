@@ -52,6 +52,20 @@ EMBEDDING_MODEL=embedding-3
 
 ## 本地开发
 
+本机单独安装 PostgreSQL、Redis、Milvus 和 MinIO 时，使用精简依赖配置：
+
+```powershell
+Copy-Item backend/dependencies.env.example backend/dependencies.env
+```
+
+Linux/macOS：
+
+```bash
+cp backend/dependencies.env.example backend/dependencies.env
+```
+
+通常只需修改文件中的 `CHANGE_ME`。Redis、Milvus 使用默认本机端口；需要邮件通知时再填写四项 SMTP 配置。`dependencies.env` 已被 Git 忽略，后端会在 `.env` 之后自动读取它。
+
 ```bash
 cd backend
 pip install -r requirements.txt
