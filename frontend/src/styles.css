@@ -1675,23 +1675,39 @@ h4 {
 }
 
 .login-page {
+  position: relative;
+  isolation: isolate;
   display: grid;
   min-height: 100vh;
+  overflow: hidden;
   place-items: center;
   padding: 24px;
-  background: #f3f4f6;
+  background-color: #dfe5eb;
+  background-image: url("/assets/login-workspace.webp");
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+.login-page::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: rgba(238, 242, 246, 0.72);
+  content: "";
 }
 
 .login-shell {
+  position: relative;
   display: grid;
   width: min(980px, 100%);
   min-height: 620px;
   grid-template-columns: minmax(0, 1.05fr) minmax(380px, 0.95fr);
   overflow: hidden;
-  border: 1px solid var(--color-border);
+  border: 1px solid rgba(255, 255, 255, 0.78);
   border-radius: var(--radius-lg);
   background: var(--color-surface);
-  box-shadow: 0 24px 64px rgba(17, 24, 39, 0.12);
+  box-shadow: 0 28px 80px rgba(17, 24, 39, 0.22);
 }
 
 .login-context {
