@@ -19,8 +19,8 @@
       <el-button :icon="Search" type="primary" :loading="searching" :disabled="!query.trim()" @click="search">搜索</el-button>
     </div>
 
-    <el-row :gutter="20">
-      <el-col :xs="24" :lg="11">
+    <el-row :gutter="20" class="knowledge-grid">
+      <el-col :xs="24" :lg="12">
         <h2 class="section-title">文档</h2>
         <div class="compact-filter-bar" aria-label="文档筛选">
           <el-input v-model="documentQuery" clearable placeholder="搜索文件名、来源或标签" aria-label="搜索文档" />
@@ -28,7 +28,7 @@
             <el-option v-for="status in documentStatuses" :key="status" :label="statusLabel(status)" :value="status" />
           </el-select>
         </div>
-        <el-table v-loading="loading" :data="pagedDocuments" class="data-table">
+        <el-table v-loading="loading" :data="pagedDocuments" class="data-table knowledge-document-table">
           <el-table-column label="文档" min-width="190">
             <template #default="{ row }">
               <strong>{{ row.filename }}</strong>
@@ -53,10 +53,26 @@
             </template>
           </el-table-column>
         </el-table>
+        <div v-loading="loading" class="knowledge-document-list">
+          <article v-for="row in pagedDocuments" :key="row.id" class="knowledge-document-row">
+            <div class="knowledge-document-summary">
+              <strong>{{ row.filename }}</strong>
+              <el-tag :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+              <div class="document-meta">{{ row.source_label }} · 文档 v{{ row.version }} · 索引 v{{ row.active_index_version }}</div>
+              <div class="document-meta">{{ row.parser_name || '等待解析' }} · {{ row.chunk_count }} chunks · {{ documentTags(row).join(' / ') || '无标签' }}</div>
+            </div>
+            <div v-if="auth.hasPermission('knowledge:write')" class="knowledge-document-actions">
+              <el-button v-if="row.status === 'FAILED'" link type="primary" @click="documentAction(row.id, 'retry')">重试</el-button>
+              <el-button v-if="['INDEXED', 'EMPTY', 'FAILED'].includes(row.status)" link @click="documentAction(row.id, 'reindex')">重建</el-button>
+              <el-button v-if="row.active_index_version > 0" link :icon="Clock" @click="openIndexVersions(row)">版本</el-button>
+              <el-button link type="danger" @click="remove(row.id)">删除</el-button>
+            </div>
+          </article>
+        </div>
         <el-empty v-if="!loading && !filteredDocuments.length" description="当前筛选条件下暂无文档" />
         <el-pagination v-if="filteredDocuments.length > documentPageSize" v-model:current-page="documentPage" class="page-pagination" background layout="prev, pager, next" :page-size="documentPageSize" :total="filteredDocuments.length" />
       </el-col>
-      <el-col :xs="24" :lg="13">
+      <el-col :xs="24" :lg="12">
         <h2 class="section-title">搜索结果</h2>
         <div v-if="answer" class="answer">{{ answer }}</div>
         <el-empty v-else-if="!searching && !results.length" description="输入关键词检索当前知识库" />
