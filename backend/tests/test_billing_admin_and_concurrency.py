@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -12,15 +13,16 @@ from app.agent import concurrency
 from app.agent.service import ensure_default_agents
 from app.api.routes.agents import create_agent_run
 from app.api.routes.billing import fake_recharge
-from app.api.routes.workflow import continue_workflow, run_workflow
+from app.api.routes.workflow import cancel_workflow, continue_workflow, retry_workflow, run_workflow
 from app.core.database import get_db
 from app.core.llm import get_llm
 from app.core.security import hash_password
-from app.models import Agent, AgentRole, AgentRun, Project, RechargeOrder, TokenTransaction, User, UserRole, WorkflowRun, WorkflowStatus
-from app.schemas import ChatRequest, RechargeRequest, WorkflowContinueRequest, WorkflowRequest
+from app.models import Agent, AgentRole, AgentRun, Project, RechargeOrder, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.schemas import ChatRequest, RechargeRequest, WorkflowContinueRequest, WorkflowRequest, WorkflowRetryRequest
 from app.services.agent_runs import fail_agent_run
 from app.services import agent_run_reaper as reaper_module
 from app.services.billing import InsufficientTokensError, apply_token_change, refund_consumption
+from app.services.workflows import process_workflow
 
 
 def http_request(path: str = "/") -> Request:
@@ -269,16 +271,29 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
         request_id="workflow-request-001",
     )
     response = await run_workflow(payload, http_request("/api/v1/workflow/run"), user, db)
-    assert response.status == WorkflowStatus.paused
+    assert response.status == WorkflowStatus.queued
     assert db.get(User, user.id).ai_token_balance == 900
     assert db.scalar(select(func.count(TokenTransaction.id)).where(TokenTransaction.transaction_type == "CONSUME")) == 1
-    assert {item["type"] for item in response.state["documents"]} >= {
+    assert len(prompts) == 0
+
+    await process_workflow(db, response.workflow_id)
+    db.expire_all()
+    workflow = db.get(WorkflowRun, response.workflow_id)
+    assert workflow.status == WorkflowStatus.paused
+    state = json.loads(workflow.state_json)
+    assert {item["type"] for item in state["documents"]} >= {
         "PRD",
         "SYSTEM_DESIGN",
         "PROJECT_PLAN",
         "TEST_PLAN",
     }
     assert len(prompts) == 5
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == response.workflow_id,
+            WorkflowEvent.event_type == "NODE_COMPLETED",
+        )
+    ) == 5
 
     repeated = await run_workflow(payload, http_request("/api/v1/workflow/run"), user, db)
     assert repeated.workflow_id == response.workflow_id
@@ -300,18 +315,22 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
         user,
         db,
     )
-    assert completed.status == WorkflowStatus.completed
+    assert completed.status == WorkflowStatus.queued
+    await process_workflow(db, response.workflow_id)
+    db.expire_all()
+    assert db.get(WorkflowRun, response.workflow_id).status == WorkflowStatus.completed
     assert len(prompts) == 6
 
 
 @pytest.mark.asyncio
-async def test_failed_workflow_continuation_refunds_original_charge(
+async def test_failed_workflow_refunds_once_and_can_be_retried(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user = User(
         email="workflow-refund@example.com",
         name="Workflow Refund",
         password_hash="hash",
+        permissions="projects:write",
         ai_token_balance=1000,
     )
     db.add(user)
@@ -319,7 +338,7 @@ async def test_failed_workflow_continuation_refunds_original_charge(
     project = Project(name="Refund Project", owner_id=user.id)
     db.add(project)
     db.flush()
-    apply_token_change(
+    debit = apply_token_change(
         db,
         user.id,
         -100,
@@ -335,21 +354,26 @@ async def test_failed_workflow_continuation_refunds_original_charge(
         current_node="report",
         state_json="{}",
         request_id="workflow-refund-request",
+        billing_transaction_id=debit.id,
+        pause_before_report=True,
+        max_attempts=1,
     )
     db.add(workflow)
     db.commit()
 
-    async def fail_continuation(*_args, **_kwargs):
+    queued = await continue_workflow(
+        WorkflowContinueRequest(workflow_id=workflow.id, human_feedback="批准"),
+        http_request("/api/v1/workflow/continue"),
+        user,
+        db,
+    )
+    assert queued.status == WorkflowStatus.queued
+
+    async def fail_execution(*_args, **_kwargs):
         raise RuntimeError("report provider unavailable")
 
-    monkeypatch.setattr("app.api.routes.workflow.continue_workspace_graph", fail_continuation)
-    with pytest.raises(RuntimeError, match="report provider unavailable"):
-        await continue_workflow(
-            WorkflowContinueRequest(workflow_id=workflow.id, human_feedback="批准"),
-            http_request("/api/v1/workflow/continue"),
-            user,
-            db,
-        )
+    monkeypatch.setattr("app.services.workflows.execute_workspace_graph", fail_execution)
+    await process_workflow(db, workflow.id)
 
     db.expire_all()
     assert db.get(User, user.id).ai_token_balance == 1000
@@ -357,6 +381,64 @@ async def test_failed_workflow_continuation_refunds_original_charge(
         select(func.count(TokenTransaction.id)).where(
             TokenTransaction.transaction_type == "REFUND",
             TokenTransaction.reference_id == "workflow-refund-request",
+        )
+    ) == 1
+
+    retried = retry_workflow(
+        workflow.id,
+        WorkflowRetryRequest(request_id="workflow-retry-request"),
+        http_request(f"/api/v1/workflow/{workflow.id}/retry"),
+        user,
+        db,
+    )
+    assert retried.status == WorkflowStatus.queued
+    assert db.get(User, user.id).ai_token_balance == 900
+
+
+@pytest.mark.asyncio
+async def test_queued_workflow_cancel_refunds_idempotently(db: Session) -> None:
+    user = User(
+        email="cancel@example.com",
+        name="Cancel",
+        password_hash="hash",
+        permissions="projects:write",
+        ai_token_balance=500,
+    )
+    db.add(user)
+    db.flush()
+    project = Project(name="Cancel Project", owner_id=user.id)
+    db.add(project)
+    db.commit()
+
+    response = await run_workflow(
+        WorkflowRequest(
+            project_id=project.id,
+            user_input="取消这个工作流",
+            request_id="workflow-cancel-request",
+        ),
+        http_request("/api/v1/workflow/run"),
+        user,
+        db,
+    )
+    cancelled = cancel_workflow(
+        response.workflow_id,
+        http_request(f"/api/v1/workflow/{response.workflow_id}/cancel"),
+        user,
+        db,
+    )
+    assert cancelled.status == WorkflowStatus.cancelled
+    assert db.get(User, user.id).ai_token_balance == 500
+    repeated = cancel_workflow(
+        response.workflow_id,
+        http_request(f"/api/v1/workflow/{response.workflow_id}/cancel"),
+        user,
+        db,
+    )
+    assert repeated.status == WorkflowStatus.cancelled
+    assert db.scalar(
+        select(func.count(TokenTransaction.id)).where(
+            TokenTransaction.transaction_type == "REFUND",
+            TokenTransaction.reference_id == "workflow-cancel-request",
         )
     ) == 1
 

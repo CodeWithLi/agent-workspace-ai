@@ -10,12 +10,14 @@ from app.agent.router import RouteDecision, route_agent
 from app.agent.concurrency import AgentLease
 from app.core.llm import get_llm
 from app.core.audit import record_audit
+from app.core.llm_usage import bind_llm_usage
 from app.core.database import SessionLocal
 from app.core.memory import get_user_preferences, load_project_memory, save_project_memory
 from app.models import Agent, AgentAction, AgentTool, Conversation, Message, Project, User
 from app.rag.service import search_knowledge
 from app.tools.registry import allowed_tools_for_role, run_tool
 from app.services.agent_runs import complete_agent_run, fail_agent_run
+from app.services.agent_versions import ensure_initial_agent_version
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ def ensure_default_agents(db: Session) -> None:
             agent = Agent(**item)
             db.add(agent)
             db.flush()
+        ensure_initial_agent_version(db, agent)
 
         existing_tools = {tool.name for tool in agent.tool_links}
         for tool_name in [name.strip() for name in item["tools"].split(",") if name.strip()]:
@@ -198,9 +201,11 @@ async def _prepare_chat(
     project: Project | None,
     conversation_id: int | None,
     route_reason: str,
-) -> tuple[Conversation, str, str, str, list[dict]]:
+) -> tuple[Conversation, str, str, str, list[dict], Message]:
     conversation = get_owned_conversation(db, user.id, conversation_id) if conversation_id else None
     if conversation:
+        if conversation.mode != "SINGLE":
+            raise ConversationAccessError("团队讨论不能作为单人会话继续")
         if conversation.agent_id != agent.id:
             raise ConversationAccessError("切换 AI 员工需要开启新会话")
         if conversation.project_id != (project.id if project else None):
@@ -211,6 +216,7 @@ async def _prepare_chat(
             project_id=project.id if project else None,
             agent_id=agent.id,
             user_id=user.id,
+            mode="SINGLE",
         )
         db.add(conversation)
         db.flush()
@@ -230,10 +236,11 @@ async def _prepare_chat(
         f"路由到：{agent.name}。{route_reason or '用户明确选择'}。"
         f"读取短期上下文 {len(recent_messages)} 条，按意图执行工具 {len(tool_calls)} 个。"
     )
-    db.add(Message(conversation_id=conversation.id, role="user", content=message))
+    user_message = Message(conversation_id=conversation.id, role="user", stage="request", content=message)
+    db.add(user_message)
     db.flush()
     prompt = f"历史上下文：\n{context}\n\n工具结果：\n{tool_context}\n\n用户输入：\n{message}"
-    return conversation, build_system_prompt(db, user, agent, project), prompt, thinking, tool_calls
+    return conversation, build_system_prompt(db, user, agent, project), prompt, thinking, tool_calls, user_message
 
 
 def _finalize_chat(
@@ -245,16 +252,21 @@ def _finalize_chat(
     answer: str,
     thinking: str,
     tool_calls: list[dict],
-) -> None:
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=answer,
-            thinking=thinking,
-            tool_calls=json.dumps(tool_calls, ensure_ascii=False, default=str),
-        )
+    parent_message_id: int,
+    regenerated_from_id: int | None = None,
+) -> Message:
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        agent_id=agent.id,
+        role="assistant",
+        stage="answer",
+        content=answer,
+        thinking=thinking,
+        tool_calls=json.dumps(tool_calls, ensure_ascii=False, default=str),
+        parent_message_id=parent_message_id,
+        regenerated_from_id=regenerated_from_id,
     )
+    db.add(assistant_message)
     if agent.memory_enable and project:
         save_project_memory(
             db,
@@ -275,6 +287,8 @@ def _finalize_chat(
             {"agent_id": agent.id, "tools": [call["name"] for call in tool_calls]},
         )
     db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
 
 
 async def chat_with_agent(
@@ -286,11 +300,11 @@ async def chat_with_agent(
     conversation_id: int | None,
     route_reason: str = "",
 ) -> tuple[Conversation, str, str, list[dict], list[Message]]:
-    conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
+    conversation, system_prompt, prompt, thinking, tool_calls, user_message = await _prepare_chat(
         db, user, agent, message, project, conversation_id, route_reason
     )
     answer = await get_llm().chat(system_prompt, prompt, agent.model)
-    _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
+    _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls, user_message.id)
     messages = list(db.scalars(select(Message).where(Message.conversation_id == conversation.id).order_by(Message.created_at)))
     return conversation, answer, thinking, tool_calls, messages
 
@@ -318,7 +332,7 @@ async def stream_chat_events(
                 return
 
             try:
-                conversation, system_prompt, prompt, thinking, tool_calls = await _prepare_chat(
+                conversation, system_prompt, prompt, thinking, tool_calls, user_message = await _prepare_chat(
                     db, user, agent, message, project, conversation_id, route_reason
                 )
             except Exception as exc:
@@ -334,9 +348,16 @@ async def stream_chat_events(
 
             parts: list[str] = []
             try:
-                async for token in get_llm().stream(system_prompt, prompt, agent.model):
-                    parts.append(token)
-                    yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
+                with bind_llm_usage(
+                    db=db,
+                    user_id=user.id,
+                    project_id=project.id if project else None,
+                    agent_id=agent.id,
+                    agent_run_id=run_id,
+                ):
+                    async for token in get_llm().stream(system_prompt, prompt, agent.model):
+                        parts.append(token)
+                        yield f"event: token\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
             except Exception as exc:
                 db.rollback()
                 fail_agent_run(db, run_id, billing_transaction_id, str(exc))
@@ -346,13 +367,24 @@ async def stream_chat_events(
                 return
 
             answer = "".join(parts)
-            _finalize_chat(db, user, agent, project, conversation, answer, thinking, tool_calls)
+            assistant_message = _finalize_chat(
+                db,
+                user,
+                agent,
+                project,
+                conversation,
+                answer,
+                thinking,
+                tool_calls,
+                user_message.id,
+            )
             complete_agent_run(db, run_id, conversation.id)
             db.refresh(user)
             done = {
                 "conversation_id": conversation.id,
                 "agent_id": agent.id,
                 "agent_name": agent.name,
+                "message_id": assistant_message.id,
                 "token_balance": user.ai_token_balance,
             }
             yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
@@ -362,3 +394,55 @@ async def stream_chat_events(
         raise
     finally:
         await lease.release()
+
+
+async def regenerate_assistant_message(db: Session, user: User, original: Message) -> Message:
+    if original.role != "assistant":
+        raise ConversationAccessError("Only assistant messages can be regenerated")
+    conversation = get_owned_conversation(db, user.id, original.conversation_id)
+    agent = db.get(Agent, conversation.agent_id)
+    project = db.get(Project, conversation.project_id) if conversation.project_id else None
+    if not agent:
+        raise ConversationAccessError("AI employee is unavailable")
+    parent = db.get(Message, original.parent_message_id) if original.parent_message_id else None
+    if not parent:
+        parent = db.scalar(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation.id,
+                Message.role == "user",
+                Message.id < original.id,
+            )
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+    if not parent:
+        raise ConversationAccessError("Original user message is unavailable")
+    recent_messages = list(
+        db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation.id, Message.id < original.id)
+            .order_by(Message.created_at.desc())
+            .limit(20)
+        )
+    )
+    context = _short_term_context(recent_messages)
+    tool_calls = json.loads(original.tool_calls or "[]")
+    prompt = (
+        f"历史上下文：\n{context}\n\n原工具结果：\n{json.dumps(tool_calls, ensure_ascii=False)}"
+        f"\n\n请重新回答用户输入：\n{parent.content}"
+    )
+    thinking = f"基于消息 {original.id} 重新生成，不重复执行写工具。"
+    answer = await get_llm().chat(build_system_prompt(db, user, agent, project), prompt, agent.model)
+    return _finalize_chat(
+        db,
+        user,
+        agent,
+        project,
+        conversation,
+        answer,
+        thinking,
+        tool_calls,
+        parent.id,
+        original.id,
+    )

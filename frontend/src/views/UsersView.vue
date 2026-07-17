@@ -10,10 +10,18 @@
 
     <div class="search-bar">
       <el-input v-model="query" :prefix-icon="Search" clearable placeholder="搜索姓名或邮箱" @keyup.enter="load" />
+      <el-select v-model="roleFilter" clearable placeholder="全部角色" aria-label="按角色筛选">
+        <el-option label="管理员" value="admin" />
+        <el-option label="成员" value="member" />
+      </el-select>
+      <el-select v-model="statusFilter" clearable placeholder="全部状态" aria-label="按账号状态筛选">
+        <el-option label="启用" value="active" />
+        <el-option label="停用" value="inactive" />
+      </el-select>
       <el-button type="primary" @click="load">搜索</el-button>
     </div>
 
-    <el-table :data="users" class="data-table">
+    <el-table v-loading="loading" :data="pagedUsers" class="data-table">
       <el-table-column prop="name" label="姓名" min-width="130" />
       <el-table-column prop="email" label="邮箱" min-width="220" />
       <el-table-column label="角色" width="110">
@@ -31,6 +39,8 @@
         <template #default="{ row }"><el-button :icon="Edit" circle aria-label="编辑权限" title="编辑权限" @click="openEditRow(row)" /></template>
       </el-table-column>
     </el-table>
+    <el-empty v-if="!loading && !filteredUsers.length" description="没有符合条件的用户" />
+    <el-pagination v-if="filteredUsers.length > pageSize" v-model:current-page="page" class="page-pagination" background layout="prev, pager, next" :page-size="pageSize" :total="filteredUsers.length" />
 
     <el-dialog v-model="dialog" title="编辑用户" width="min(520px, calc(100vw - 32px))">
       <el-form label-position="top">
@@ -55,19 +65,22 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { Edit, Key, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
 import type { User } from '../api/types'
 import { useAuthStore } from '../stores/auth'
+import { paginate } from '../utils/collection'
+import { confirmDestructiveAction } from '../utils/confirm'
 
 const auth = useAuthStore()
 const users = ref<User[]>([])
 const query = ref('')
 const dialog = ref(false)
 const saving = ref(false)
+const loading = ref(false)
 const activeUser = ref<User | null>(null)
 const form = reactive({ role: 'member' as User['role'], is_active: true, permissions: [] as string[] })
 const roleOptions = [{ label: '成员', value: 'member' }, { label: '管理员', value: 'admin' }]
@@ -76,6 +89,17 @@ const permissionOptions = [
   { value: 'projects:write', label: '写入项目数据' },
   { value: 'knowledge:write', label: '维护知识库' }
 ]
+const roleFilter = ref('')
+const statusFilter = ref('')
+const page = ref(1)
+const pageSize = 15
+const filteredUsers = computed(() => users.value.filter((user) =>
+  (!roleFilter.value || user.role === roleFilter.value)
+  && (!statusFilter.value || user.is_active === (statusFilter.value === 'active'))
+))
+const pagedUsers = computed(() => paginate(filteredUsers.value, page.value, pageSize))
+
+watch([query, roleFilter, statusFilter], () => { page.value = 1 })
 
 function permissionsOf(user: User) {
   return user.permissions.split(',').map((item) => item.trim()).filter(Boolean)
@@ -90,8 +114,13 @@ function permissionLabel(value: string) {
 }
 
 async function load() {
-  const { data } = await api.get<User[]>('/users', { params: query.value.trim() ? { q: query.value.trim() } : {} })
-  users.value = data
+  loading.value = true
+  try {
+    const { data } = await api.get<User[]>('/users', { params: query.value.trim() ? { q: query.value.trim(), limit: 500 } : { limit: 500 } })
+    users.value = data
+  } finally {
+    loading.value = false
+  }
 }
 
 function openEdit(user: User) {
@@ -120,6 +149,7 @@ async function save() {
 
 async function revokeSessions() {
   if (!activeUser.value) return
+  if (!await confirmDestructiveAction(`确认撤销 ${activeUser.value.name} 的全部登录会话吗？`, '撤销登录会话')) return
   await api.post(`/users/${activeUser.value.id}/revoke-sessions`)
   ElMessage.success('该用户的登录会话已撤销')
 }

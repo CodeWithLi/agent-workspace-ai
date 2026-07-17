@@ -30,16 +30,28 @@
         <el-table-column prop="balance_after" label="余额" width="120" />
       </el-table>
     </section>
+
+    <section class="section-band">
+      <div class="section-head-inline"><h3>模型实际用量</h3><span>{{ usageTokenTotal.toLocaleString() }} tokens · {{ formatCost(usageCostMicros) }}</span></div>
+      <el-table :data="usage" class="data-table">
+        <el-table-column label="时间" min-width="170"><template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template></el-table-column>
+        <el-table-column prop="operation" label="操作" width="100" />
+        <el-table-column prop="model" label="模型" min-width="150" />
+        <el-table-column prop="total_tokens" label="Tokens" width="110" />
+        <el-table-column label="耗时" width="100"><template #default="{ row }">{{ row.latency_ms }} ms</template></el-table-column>
+        <el-table-column label="估算成本" width="120"><template #default="{ row }">{{ formatCost(row.estimated_cost_micros) }}</template></el-table-column>
+      </el-table>
+    </section>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { Coin } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
-import type { RechargeOrder, Wallet } from '../api/types'
+import type { LLMUsage, RechargeOrder, Wallet } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
@@ -47,11 +59,22 @@ const wallet = ref<Wallet | null>(null)
 const packages = [10, 50, 100, 500]
 const selectedAmount = ref(50)
 const recharging = ref(false)
+const usage = ref<LLMUsage[]>([])
+const usageTokenTotal = computed(() => usage.value.reduce((total, item) => total + item.total_tokens, 0))
+const usageCostMicros = computed(() => usage.value.reduce((total, item) => total + item.estimated_cost_micros, 0))
+
+function formatCost(micros: number) {
+  return (micros / 1_000_000).toFixed(6)
+}
 
 async function load() {
-  const { data } = await api.get<Wallet>('/billing/wallet')
-  wallet.value = data
-  auth.setTokenBalance(data.balance)
+  const [walletResponse, usageResponse] = await Promise.all([
+    api.get<Wallet>('/billing/wallet'),
+    api.get<LLMUsage[]>('/billing/usage', { params: { limit: 50 } })
+  ])
+  wallet.value = walletResponse.data
+  usage.value = usageResponse.data
+  auth.setTokenBalance(walletResponse.data.balance)
 }
 
 async function recharge() {

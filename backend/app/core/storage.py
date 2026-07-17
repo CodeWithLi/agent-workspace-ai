@@ -59,5 +59,24 @@ class ObjectStorage:
         if path.exists() and path.is_file():
             path.unlink()
 
+    def read(self, storage_path: str) -> bytes:
+        if storage_path.startswith("minio://"):
+            path = storage_path.removeprefix("minio://")
+            bucket, object_name = path.split("/", 1)
+            response = None
+            try:
+                response = self._client().get_object(bucket, object_name)
+                return response.read()
+            except Exception as exc:
+                raise ObjectStorageError("MinIO download failed") from exc
+            finally:
+                if response is not None:
+                    response.close()
+                    response.release_conn()
+        path = Path(storage_path)
+        if not path.exists() or not path.is_file():
+            raise ObjectStorageError("Stored document is missing")
+        return path.read_bytes()
+
 
 object_storage = ObjectStorage()

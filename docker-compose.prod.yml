@@ -1,0 +1,84 @@
+services:
+  postgres:
+    ports: !reset []
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  redis:
+    ports: !reset []
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+
+  minio:
+    ports: !reset []
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  etcd:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  milvus:
+    ports: !reset []
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6G
+
+  backend:
+    ports: !reset []
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    environment:
+      ENVIRONMENT: production
+      AUTO_CREATE_SCHEMA: "false"
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      FIRST_SUPERUSER_EMAIL: ${FIRST_SUPERUSER_EMAIL:?FIRST_SUPERUSER_EMAIL is required}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
+      LLM_FALLBACK_ENABLED: "false"
+      STORAGE_FALLBACK_ENABLED: "false"
+      VECTOR_FALLBACK_ENABLED: "false"
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL with an encoded password is required}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+
+  frontend:
+    ports: !reset
+      - "80:80"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M

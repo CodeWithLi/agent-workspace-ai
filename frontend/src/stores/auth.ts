@@ -9,11 +9,11 @@ export const useAuthStore = defineStore('auth', {
   }),
   actions: {
     async login(email: string, password: string) {
-      const { data } = await api.post<TokenResponse>('/auth/login', { email, password })
+      const { data } = await api.post<TokenResponse>('/auth/login', { email, password }, { suppressErrorToast: true })
       this.setSession(data)
     },
     async register(email: string, name: string, password: string) {
-      const { data } = await api.post<TokenResponse>('/auth/register', { email, name, password })
+      const { data } = await api.post<TokenResponse>('/auth/register', { email, name, password }, { suppressErrorToast: true })
       this.setSession(data)
     },
     async fetchMe() {

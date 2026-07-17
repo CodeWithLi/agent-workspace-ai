@@ -101,12 +101,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowRight, Clock, Cpu, Files, Folder, Plus, Tickets } from '@element-plus/icons-vue'
-import { PieChart } from 'echarts/charts'
-import { TooltipComponent } from 'echarts/components'
-import * as echarts from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
 import { api } from '../api/client'
 import type { Agent, DashboardStats, Project } from '../api/types'
+import type { TaskChart } from '../lib/taskChart'
 import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
@@ -117,7 +114,7 @@ const stats = ref<DashboardStats>()
 const chartEl = ref<HTMLDivElement>()
 const createDialog = ref(false)
 const form = reactive({ name: '', description: '', members: '' })
-let chart: echarts.ECharts | undefined
+let chart: TaskChart | undefined
 
 const greeting = computed(() => {
   const hour = new Date().getHours()
@@ -134,8 +131,6 @@ const taskLegend = computed(() => [
 ])
 const taskChartLabel = computed(() => taskLegend.value.map((item) => `${item.label} ${item.value}`).join('，'))
 
-echarts.use([PieChart, TooltipComponent, CanvasRenderer])
-
 async function load() {
   const agentRequest = auth.hasPermission('agents:read')
     ? api.get<Agent[]>('/agents')
@@ -150,23 +145,8 @@ async function load() {
   stats.value = statRes.data
   await nextTick()
   if (chartEl.value) {
-    chart ||= echarts.init(chartEl.value)
-    chart.setOption({
-      color: ['#94a3b8', '#2563eb', '#16a34a', '#dc2626'],
-      tooltip: { trigger: 'item' },
-      series: [
-        {
-          type: 'pie',
-          radius: ['56%', '78%'],
-          center: ['50%', '48%'],
-          avoidLabelOverlap: true,
-          itemStyle: { borderColor: '#ffffff', borderWidth: 3 },
-          label: { show: false },
-          emphasis: { scale: false },
-          data: taskLegend.value.map((item) => ({ name: item.label, value: item.value }))
-        }
-      ]
-    })
+    const { renderTaskChart } = await import('../lib/taskChart')
+    chart = renderTaskChart(chartEl.value, taskLegend.value.map((item) => ({ name: item.label, value: item.value })))
   }
 }
 

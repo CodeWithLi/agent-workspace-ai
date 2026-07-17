@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models import AgentRole, ProjectMemberRole, TaskStatus, UserRole, WorkflowStatus
+from app.models import AgentRole, ProjectMemberRole, SagaStepStatus, TaskStatus, UserRole, WorkflowStatus
 
 
 class UserCreate(BaseModel):
@@ -64,8 +64,23 @@ class ProjectOut(BaseModel):
     description: str
     members: str
     owner_id: int
+    status: str
     created_at: datetime
+    updated_at: datetime
     current_user_role: ProjectMemberRole = ProjectMemberRole.owner
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    status: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"ACTIVE", "ARCHIVED"}:
+            raise ValueError("Project status must be ACTIVE or ARCHIVED")
+        return value
 
 
 class ProjectMemberCreate(BaseModel):
@@ -114,6 +129,13 @@ class RequirementOut(BaseModel):
     status: str
     analysis: str
     created_at: datetime
+    updated_at: datetime
+
+
+class RequirementUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    content: str | None = Field(default=None, min_length=1)
+    status: str | None = None
 
 
 class GlobalSearchResult(BaseModel):
@@ -132,11 +154,19 @@ class TaskCreate(BaseModel):
     description: str = ""
     priority: str = "MEDIUM"
     assignee_agent_id: int | None = None
+    assignee_user_id: int | None = None
     due_date: str = ""
+    due_at: datetime | None = None
 
 
 class TaskUpdate(BaseModel):
-    status: TaskStatus
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    priority: str | None = None
+    status: TaskStatus | None = None
+    assignee_agent_id: int | None = None
+    assignee_user_id: int | None = None
+    due_at: datetime | None = None
 
 
 class TaskOut(BaseModel):
@@ -149,9 +179,34 @@ class TaskOut(BaseModel):
     priority: str
     status: TaskStatus
     assignee_agent_id: int | None
+    assignee_user_id: int | None
     due_date: str
+    due_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class TaskCommentCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=5000)
+
+
+class TaskCommentOut(BaseModel):
+    id: int
+    task_id: int
+    user_id: int
+    user_name: str
+    content: str
+    created_at: datetime
+
+
+class ProjectActivityOut(BaseModel):
+    id: int
+    action: str
+    resource_type: str
+    resource_id: str
+    details: str
+    user_id: int | None
+    created_at: datetime
 
 
 class AgentOut(BaseModel):
@@ -168,6 +223,7 @@ class AgentOut(BaseModel):
     knowledge_access: bool
     human_approval_required: bool
     concurrency_limit: int
+    current_version: int
 
 
 class AgentUpdate(BaseModel):
@@ -178,6 +234,30 @@ class AgentUpdate(BaseModel):
     knowledge_access: bool
     human_approval_required: bool
     concurrency_limit: int = Field(ge=1, le=100)
+
+
+class AgentVersionCreate(AgentUpdate):
+    release_note: str = Field(default="", max_length=500)
+
+
+class AgentVersionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    agent_id: int
+    version: int
+    status: str
+    description: str
+    system_prompt: str
+    model: str
+    memory_enable: bool
+    knowledge_access: bool
+    human_approval_required: bool
+    concurrency_limit: int
+    release_note: str
+    created_by_user_id: int | None
+    created_at: datetime
+    published_at: datetime | None
 
 
 class AgentToolOut(BaseModel):
@@ -224,6 +304,13 @@ class ChatRequest(AgentRouteRequest):
     request_id: str = Field(min_length=8, max_length=64)
 
 
+class DiscussionRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20000)
+    project_id: int | None = None
+    conversation_id: int | None = None
+    request_id: str = Field(min_length=8, max_length=64)
+
+
 class ToolCallOut(BaseModel):
     name: str
     input: dict[str, Any]
@@ -235,11 +322,48 @@ class MessageOut(BaseModel):
 
     id: int
     conversation_id: int
+    agent_id: int | None
     role: str
+    stage: str
     content: str
     thinking: str
     tool_calls: str
+    parent_message_id: int | None
+    regenerated_from_id: int | None
     created_at: datetime
+
+
+class MessageFeedbackRequest(BaseModel):
+    rating: int
+    comment: str = Field(default="", max_length=2000)
+
+    @field_validator("rating")
+    @classmethod
+    def validate_rating(cls, value: int) -> int:
+        if value not in {-1, 1}:
+            raise ValueError("Rating must be -1 or 1")
+        return value
+
+
+class MessageFeedbackOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    message_id: int
+    user_id: int
+    rating: int
+    comment: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MessageRegenerateRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class MessageRegenerateOut(BaseModel):
+    message: MessageOut
+    token_balance: int
 
 
 class ConversationOut(BaseModel):
@@ -250,6 +374,7 @@ class ConversationOut(BaseModel):
     project_id: int | None
     agent_id: int
     user_id: int
+    mode: str
     created_at: datetime
 
 
@@ -282,12 +407,81 @@ class WorkflowContinueRequest(BaseModel):
     human_feedback: str = ""
 
 
+class WorkflowRetryRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
 class WorkflowResponse(BaseModel):
     workflow_id: int
     project_id: int
     status: WorkflowStatus
     current_node: str
     state: dict[str, Any]
+    attempt_count: int
+    max_attempts: int
+    error: str
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class WorkflowEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    workflow_id: int
+    node: str
+    event_type: str
+    message: str
+    payload_json: str
+    created_at: datetime
+
+
+class WorkflowSagaStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    workflow_id: int
+    sequence: int
+    node: str
+    tool_name: str
+    compensation_action: str
+    idempotency_key: str
+    status: SagaStepStatus
+    input_json: str
+    output_json: str
+    transition_log_json: str
+    execute_attempts: int
+    compensation_attempts: int
+    error: str
+    started_at: datetime | None
+    completed_at: datetime | None
+    compensated_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkflowPublishRequest(BaseModel):
+    document_type: str = Field(min_length=1, max_length=50)
+    target: str
+    request_id: str = Field(min_length=8, max_length=64)
+
+    @field_validator("target")
+    @classmethod
+    def validate_publish_target(cls, value: str) -> str:
+        if value not in {"report", "knowledge"}:
+            raise ValueError("Publish target must be report or knowledge")
+        return value
+
+
+class WorkflowPublicationOut(BaseModel):
+    id: int
+    workflow_id: int
+    document_type: str
+    target: str
+    report_id: int | None
+    document_id: int | None
 
 
 class KnowledgeDocumentOut(BaseModel):
@@ -299,22 +493,101 @@ class KnowledgeDocumentOut(BaseModel):
     content_type: str
     status: str
     summary: str
+    source_label: str
+    metadata_json: str
+    version: int
+    attempts: int
+    max_attempts: int
+    error: str
+    indexed_at: datetime | None
+    active_index_version: int
+    pending_index_version: int | None
+    parser_name: str
+    parser_version: str
+    chunker_name: str
+    chunker_version: str
+    element_count: int
+    chunk_count: int
+    index_config_json: str
     created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeDocumentUpdate(BaseModel):
+    tags: list[str] = Field(default_factory=list)
+    source_label: str = Field(default="upload", min_length=1, max_length=100)
+
+
+class KnowledgeDocumentActionRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class KnowledgeIndexVersionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    version: int
+    status: str
+    parser_name: str
+    parser_version: str
+    chunker_name: str
+    chunker_version: str
+    embedding_model: str
+    embedding_dimensions: int
+    element_count: int
+    chunk_count: int
+    config_json: str
+    error: str
+    activated_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeChunkOut(BaseModel):
+    document_id: int
+    filename: str
+    chunk_index: int
+    content: str
+    citation: str
+    stable_id: str = ""
+    index_version: int = 0
+    parent_stable_id: str = ""
+    parent_content: str = ""
+    heading_path: list[str] = Field(default_factory=list)
+    page_start: int | None = None
+    page_end: int | None = None
+    token_count: int = 0
 
 
 class KnowledgeSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     project_id: int | None = None
-    top_k: int = Field(default=5, ge=1, le=20)
-    min_score: float = Field(default=0.2, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1, le=20)
+    min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    document_ids: list[int] = Field(default_factory=list, max_length=100)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    source_labels: list[str] = Field(default_factory=list, max_length=20)
 
 
 class KnowledgeSearchResult(BaseModel):
     document_id: int
     filename: str
+    chunk_index: int
     content: str
     score: float
     citation: str
+    stable_id: str = ""
+    index_version: int = 0
+    heading_path: list[str] = Field(default_factory=list)
+    page_start: int | None = None
+    page_end: int | None = None
+    sparse_score: float = 0.0
+    dense_score: float = 0.0
+    hybrid_score: float = 0.0
+    query_coverage: float = 0.0
+    rerank_score: float | None = None
+    rerank_fallback: bool | None = None
+    source_label: str = ""
+    tags: list[str] = Field(default_factory=list)
 
 
 class KnowledgeSearchResponse(BaseModel):
@@ -338,6 +611,14 @@ class MeetingOut(BaseModel):
     summary: str
     action_items: str
     created_at: datetime
+    updated_at: datetime
+
+
+class MeetingUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    transcript: str | None = Field(default=None, min_length=1)
+    summary: str | None = None
+    action_items: list[dict[str, Any]] | None = None
 
 
 class ReportCreate(BaseModel):
@@ -354,6 +635,13 @@ class ReportOut(BaseModel):
     title: str
     content: str
     created_at: datetime
+    updated_at: datetime
+
+
+class ReportUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    content: str | None = Field(default=None, min_length=1)
+    report_type: str | None = Field(default=None, min_length=1, max_length=50)
 
 
 class NotificationCreate(BaseModel):
@@ -391,15 +679,46 @@ class NotificationOut(BaseModel):
     created_at: datetime
 
 
-class SettingOut(BaseModel):
-    provider: str
-    base_url: str
-    model: str
-    embedding_model: str
-    milvus_collection: str
+class SettingItemOut(BaseModel):
+    key: str
+    label: str
+    category: str
+    value: Any | None
+    value_type: str
+    minimum: float | None
+    maximum: float | None
+    secret: bool
+    configured: bool
+    source: str
+    restart_required: bool
+    updated_at: datetime | None
+
+
+class SettingCollectionOut(BaseModel):
     environment: str
-    allow_registration: bool
-    registration_email_domains: list[str]
+    items: list[SettingItemOut]
+
+
+class SettingUpdate(BaseModel):
+    values: dict[str, Any]
+
+
+class SettingConnectionTestRequest(BaseModel):
+    target: str
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        allowed = {"llm", "embedding", "reranker", "docling", "redis", "milvus", "minio", "smtp"}
+        if value not in allowed:
+            raise ValueError(f"Connection target must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+
+class SettingConnectionTestOut(BaseModel):
+    target: str
+    ok: bool
+    message: str
 
 
 class AuditLogOut(BaseModel):
@@ -416,6 +735,37 @@ class AuditLogOut(BaseModel):
     created_at: datetime
 
 
+class EvaluationCaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    agent_role: AgentRole
+    input_text: str = Field(min_length=1, max_length=20000)
+    expected_keywords: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+class EvaluationCaseOut(BaseModel):
+    id: int
+    name: str
+    agent_role: str
+    input_text: str
+    expected_keywords: list[str]
+    enabled: bool
+    created_at: datetime
+
+
+class EvaluationRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: str
+    total_cases: int
+    passed_cases: int
+    average_score: float
+    created_by_user_id: int | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
 class TokenTransactionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -427,6 +777,27 @@ class TokenTransactionOut(BaseModel):
     reference_type: str
     reference_id: str
     description: str
+    created_at: datetime
+
+
+class LLMUsageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int | None
+    project_id: int | None
+    agent_id: int | None
+    workflow_id: int | None
+    agent_run_id: int | None
+    operation: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost_micros: int
+    latency_ms: int
+    usage_source: str
     created_at: datetime
 
 

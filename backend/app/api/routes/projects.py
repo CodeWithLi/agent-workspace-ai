@@ -5,15 +5,19 @@ from sqlalchemy.orm import Session
 from app.api.deps import ensure_permission, get_current_user
 from app.core.database import get_db
 from app.core.audit import record_audit
-from app.models import Project, ProjectMember, ProjectMemberRole, Task, User
+from app.models import AuditLog, Project, ProjectMember, ProjectMemberRole, Task, TaskComment, User, WorkflowRun, WorkflowStatus
 from app.schemas import (
     ProjectCreate,
     ProjectMemberCreate,
     ProjectMemberOut,
     ProjectOut,
+    ProjectUpdate,
+    ProjectActivityOut,
     TaskCreate,
     TaskOut,
     TaskUpdate,
+    TaskCommentCreate,
+    TaskCommentOut,
 )
 
 router = APIRouter()
@@ -112,6 +116,59 @@ def get_project(
     return get_project_for_user(project_id, current_user, db)
 
 
+@router.patch("/{project_id}", response_model=ProjectOut)
+def update_project(
+    project_id: int,
+    payload: ProjectUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Project:
+    project = get_project_for_user(project_id, current_user, db, write=True)
+    values = payload.model_dump(exclude_unset=True)
+    if "status" in values and project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the project owner can archive a project")
+    for field, value in values.items():
+        setattr(project, field, value)
+    record_audit(
+        db,
+        "project.update",
+        current_user.id,
+        project.id,
+        "project",
+        project.id,
+        {"fields": sorted(values)},
+        request,
+    )
+    db.commit()
+    db.refresh(project)
+    project.current_user_role = project_role(project, current_user, db)
+    return project
+
+
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(
+    project_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    project = get_project_for_user(project_id, current_user, db, write=True)
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the project owner can delete a project")
+    active = db.scalar(
+        select(WorkflowRun.id).where(
+            WorkflowRun.project_id == project.id,
+            WorkflowRun.status.in_([WorkflowStatus.queued, WorkflowStatus.running, WorkflowStatus.cancelling, WorkflowStatus.paused]),
+        )
+    )
+    if active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cancel the active workflow before deleting the project")
+    record_audit(db, "project.delete", current_user.id, project.id, "project", project.id, request=request)
+    db.delete(project)
+    db.commit()
+
+
 @router.get("/{project_id}/members", response_model=list[ProjectMemberOut])
 def list_members(
     project_id: int,
@@ -202,12 +259,19 @@ def list_tasks(
 def create_task(
     project_id: int,
     payload: TaskCreate,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Task:
     get_project_for_user(project_id, current_user, db, write=True)
+    if payload.assignee_user_id is not None:
+        assignee = db.get(User, payload.assignee_user_id)
+        if not assignee or project_role(db.get(Project, project_id), assignee, db) is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Task assignee must be a project member")
     task = Task(project_id=project_id, **payload.model_dump())
     db.add(task)
+    db.flush()
+    record_audit(db, "task.create", current_user.id, project_id, "task", task.id, request=request)
     db.commit()
     db.refresh(task)
     return task
@@ -218,6 +282,7 @@ def update_task(
     project_id: int,
     task_id: int,
     payload: TaskUpdate,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Task:
@@ -225,7 +290,100 @@ def update_task(
     task = db.get(Task, task_id)
     if not task or task.project_id != project_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-    task.status = payload.status
+    values = payload.model_dump(exclude_unset=True)
+    assignee_user_id = values.get("assignee_user_id")
+    if assignee_user_id is not None:
+        assignee = db.get(User, assignee_user_id)
+        project = db.get(Project, project_id)
+        if not assignee or project_role(project, assignee, db) is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Task assignee must be a project member")
+    for field, value in values.items():
+        setattr(task, field, value)
+    record_audit(db, "task.update", current_user.id, project_id, "task", task.id, {"fields": sorted(values)}, request)
     db.commit()
     db.refresh(task)
     return task
+
+
+@router.delete("/{project_id}/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task(
+    project_id: int,
+    task_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    get_project_for_user(project_id, current_user, db, write=True)
+    task = db.get(Task, task_id)
+    if not task or task.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    record_audit(db, "task.delete", current_user.id, project_id, "task", task.id, request=request)
+    db.delete(task)
+    db.commit()
+
+
+def comment_response(comment: TaskComment, db: Session) -> TaskCommentOut:
+    user = db.get(User, comment.user_id)
+    return TaskCommentOut(
+        id=comment.id,
+        task_id=comment.task_id,
+        user_id=comment.user_id,
+        user_name=user.name if user else "Unknown",
+        content=comment.content,
+        created_at=comment.created_at,
+    )
+
+
+@router.get("/{project_id}/tasks/{task_id}/comments", response_model=list[TaskCommentOut])
+def list_task_comments(
+    project_id: int,
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TaskCommentOut]:
+    get_project_for_user(project_id, current_user, db)
+    task = db.get(Task, task_id)
+    if not task or task.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    comments = list(db.scalars(select(TaskComment).where(TaskComment.task_id == task.id).order_by(TaskComment.created_at)))
+    return [comment_response(item, db) for item in comments]
+
+
+@router.post("/{project_id}/tasks/{task_id}/comments", response_model=TaskCommentOut)
+def add_task_comment(
+    project_id: int,
+    task_id: int,
+    payload: TaskCommentCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskCommentOut:
+    get_project_for_user(project_id, current_user, db)
+    task = db.get(Task, task_id)
+    if not task or task.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    comment = TaskComment(task_id=task.id, user_id=current_user.id, content=payload.content)
+    db.add(comment)
+    db.flush()
+    record_audit(db, "task.comment", current_user.id, project_id, "task", task.id, {"comment_id": comment.id}, request)
+    db.commit()
+    db.refresh(comment)
+    return comment_response(comment, db)
+
+
+@router.get("/{project_id}/activity", response_model=list[ProjectActivityOut])
+def list_project_activity(
+    project_id: int,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AuditLog]:
+    get_project_for_user(project_id, current_user, db)
+    return list(
+        db.scalars(
+            select(AuditLog)
+            .where(AuditLog.project_id == project_id)
+            .order_by(AuditLog.created_at.desc())
+            .limit(min(max(limit, 1), 200))
+        )
+    )

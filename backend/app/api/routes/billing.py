@@ -10,12 +10,13 @@ from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import check_rate_limit
-from app.models import RechargeOrder, TokenTransaction, User
+from app.models import LLMUsage, RechargeOrder, TokenTransaction, User, UserRole
 from app.schemas import (
     AdminTokenAdjustment,
     RechargeOrderOut,
     RechargeRequest,
     TokenTransactionOut,
+    LLMUsageOut,
     WalletOut,
 )
 from app.services.billing import BillingReferenceError, InsufficientTokensError, apply_token_change
@@ -23,6 +24,24 @@ from app.services.billing import BillingReferenceError, InsufficientTokensError,
 
 router = APIRouter()
 settings = get_settings()
+
+
+@router.get("/usage", response_model=list[LLMUsageOut])
+def list_llm_usage(
+    user_id: int | None = None,
+    project_id: int | None = None,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[LLMUsage]:
+    stmt = select(LLMUsage)
+    if current_user.role != UserRole.admin:
+        stmt = stmt.where(LLMUsage.user_id == current_user.id)
+    elif user_id is not None:
+        stmt = stmt.where(LLMUsage.user_id == user_id)
+    if project_id is not None:
+        stmt = stmt.where(LLMUsage.project_id == project_id)
+    return list(db.scalars(stmt.order_by(LLMUsage.created_at.desc()).limit(min(max(limit, 1), 500))))
 
 
 @router.get("/wallet", response_model=WalletOut)

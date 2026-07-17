@@ -22,7 +22,9 @@ export interface Project {
   description: string
   members: string
   owner_id: number
+  status: 'ACTIVE' | 'ARCHIVED'
   created_at: string
+  updated_at: string
   current_user_role: 'owner' | 'editor' | 'viewer'
 }
 
@@ -48,6 +50,25 @@ export interface Agent {
   knowledge_access: boolean
   human_approval_required: boolean
   concurrency_limit: number
+  current_version: number
+}
+
+export interface AgentVersion {
+  id: number
+  agent_id: number
+  version: number
+  status: 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
+  description: string
+  system_prompt: string
+  model: string
+  memory_enable: boolean
+  knowledge_access: boolean
+  human_approval_required: boolean
+  concurrency_limit: number
+  release_note: string
+  created_by_user_id?: number | null
+  created_at: string
+  published_at?: string | null
 }
 
 export interface AgentTool {
@@ -80,17 +101,24 @@ export interface Conversation {
   project_id?: number | null
   agent_id: number
   user_id: number
+  mode: 'SINGLE' | 'TEAM'
   created_at: string
 }
 
 export interface ChatMessage {
   id?: number
   conversation_id?: number
+  agent_id?: number | null
   role: string
+  stage?: string
   content: string
   thinking?: string
   tool_calls?: string
+  parent_message_id?: number | null
+  regenerated_from_id?: number | null
+  feedback?: 1 | -1 | null
   created_at?: string
+  client_id?: string
 }
 
 export interface Task {
@@ -101,7 +129,9 @@ export interface Task {
   priority: string
   status: string
   assignee_agent_id?: number | null
+  assignee_user_id?: number | null
   due_date: string
+  due_at?: string | null
   created_at: string
   updated_at: string
 }
@@ -113,7 +143,15 @@ export interface KnowledgeDocument {
   content_type: string
   status: string
   summary: string
+  source_label: string
+  metadata_json: string
+  version: number
+  attempts: number
+  max_attempts: number
+  error: string
+  indexed_at?: string | null
   created_at: string
+  updated_at: string
 }
 
 export interface DashboardStats {
@@ -132,6 +170,7 @@ export interface Meeting {
   summary: string
   action_items: string
   created_at: string
+  updated_at: string
 }
 
 export interface Report {
@@ -141,6 +180,7 @@ export interface Report {
   title: string
   content: string
   created_at: string
+  updated_at: string
 }
 
 export interface NotificationItem {
@@ -160,15 +200,24 @@ export interface NotificationItem {
   created_at: string
 }
 
-export interface SystemSetting {
-  provider: string
-  base_url: string
-  model: string
-  embedding_model: string
-  milvus_collection: string
+export interface SystemSettingItem {
+  key: string
+  label: string
+  category: string
+  value: unknown
+  value_type: 'str' | 'int' | 'float' | 'bool' | 'list'
+  minimum?: number | null
+  maximum?: number | null
+  secret: boolean
+  configured: boolean
+  source: string
+  restart_required: boolean
+  updated_at?: string | null
+}
+
+export interface SystemSettings {
   environment: string
-  allow_registration: boolean
-  registration_email_domains: string[]
+  items: SystemSettingItem[]
 }
 
 export interface Requirement {
@@ -178,6 +227,26 @@ export interface Requirement {
   content: string
   status: string
   analysis: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskComment {
+  id: number
+  task_id: number
+  user_id: number
+  user_name: string
+  content: string
+  created_at: string
+}
+
+export interface ProjectActivity {
+  id: number
+  action: string
+  resource_type: string
+  resource_id: string
+  details: string
+  user_id?: number | null
   created_at: string
 }
 
@@ -221,6 +290,45 @@ export interface Wallet {
   transactions: TokenTransaction[]
 }
 
+export interface LLMUsage {
+  id: number
+  user_id?: number | null
+  project_id?: number | null
+  agent_id?: number | null
+  workflow_id?: number | null
+  agent_run_id?: number | null
+  operation: string
+  provider: string
+  model: string
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  estimated_cost_micros: number
+  latency_ms: number
+  usage_source: string
+  created_at: string
+}
+
+export interface EvaluationCase {
+  id: number
+  name: string
+  agent_role: string
+  input_text: string
+  expected_keywords: string[]
+  enabled: boolean
+  created_at: string
+}
+
+export interface EvaluationRun {
+  id: number
+  status: string
+  total_cases: number
+  passed_cases: number
+  average_score: number
+  created_at: string
+  finished_at?: string | null
+}
+
 export interface RechargeOrder {
   id: number
   order_no: string
@@ -238,4 +346,43 @@ export interface WorkflowRun {
   status: string
   current_node: string
   state: Record<string, unknown>
+  attempt_count: number
+  max_attempts: number
+  error: string
+  created_at: string
+  updated_at: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface WorkflowEvent {
+  id: number
+  workflow_id: number
+  node: string
+  event_type: string
+  message: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface WorkflowSagaStep {
+  id: number
+  workflow_id: number
+  sequence: number
+  node: string
+  tool_name: string
+  compensation_action: string
+  idempotency_key: string
+  status: string
+  input_json: string
+  output_json: string
+  transition_log_json: string
+  execute_attempts: number
+  compensation_attempts: number
+  error: string
+  started_at?: string | null
+  completed_at?: string | null
+  compensated_at?: string | null
+  created_at: string
+  updated_at: string
 }

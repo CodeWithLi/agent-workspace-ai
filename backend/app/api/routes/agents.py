@@ -9,10 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.agent.router import AgentRoutingError, RouteDecision
 from app.agent.concurrency import AgentBusyError, acquire_agent_slot
+from app.agent.discussion import DiscussionConfigurationError, select_discussion_agents, stream_discussion_events
 from app.agent.service import (
     ConversationAccessError,
     chat_with_agent,
     get_owned_conversation,
+    regenerate_assistant_message,
     select_agent_for_message,
     stream_chat_events,
 )
@@ -21,7 +23,8 @@ from app.api.routes.projects import get_project_for_user
 from app.core.database import get_db
 from app.core.config import get_settings
 from app.core.audit import record_audit
-from app.models import Agent, AgentAction, AgentRun, AgentTool, Conversation, Message, Project, User, UserRole
+from app.core.llm_usage import bind_llm_usage
+from app.models import Agent, AgentAction, AgentPromptVersion, AgentRun, AgentTool, Conversation, Message, MessageFeedback, Project, User, UserRole
 from app.schemas import (
     AgentOut,
     AgentActionOut,
@@ -30,15 +33,23 @@ from app.schemas import (
     AgentToolOut,
     AgentToolUpdate,
     AgentUpdate,
+    AgentVersionCreate,
+    AgentVersionOut,
     ChatRequest,
     ChatResponse,
     ConversationOut,
+    DiscussionRequest,
     MessageOut,
+    MessageFeedbackOut,
+    MessageFeedbackRequest,
+    MessageRegenerateOut,
+    MessageRegenerateRequest,
 )
 from app.tools.project_tools import task_create
 from app.tools.registry import allowed_tools_for_role
 from app.services.agent_runs import complete_agent_run, fail_agent_run
 from app.services.billing import InsufficientTokensError, apply_token_change
+from app.services.agent_versions import activate_version, create_version, rollback_to_version
 
 router = APIRouter()
 settings = get_settings()
@@ -50,8 +61,12 @@ def create_agent_run(
     current_user: User,
     agent: Agent,
     project: Project | None,
-    payload: ChatRequest,
+    payload: ChatRequest | DiscussionRequest,
+    *,
+    token_cost: int | None = None,
+    description: str | None = None,
 ) -> AgentRun:
+    cost = settings.chat_token_cost if token_cost is None else token_cost
     existing = db.scalar(select(AgentRun).where(AgentRun.request_id == payload.request_id))
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent request has already been submitted")
@@ -69,12 +84,12 @@ def create_agent_run(
         billing = apply_token_change(
             db,
             current_user.id,
-            -settings.chat_token_cost,
+            -cost,
             "CONSUME",
             idempotency_key=f"agent:{current_user.id}:{payload.request_id}",
             reference_type="agent_run",
             reference_id=payload.request_id,
-            description=f"{agent.name} 对话",
+            description=description or f"{agent.name} 对话",
         )
         run.billing_transaction_id = billing.id
         record_audit(
@@ -84,7 +99,7 @@ def create_agent_run(
             project.id if project else None,
             "agent_run",
             run.id,
-            {"agent_id": agent.id, "request_id": payload.request_id, "token_cost": settings.chat_token_cost},
+            {"agent_id": agent.id, "request_id": payload.request_id, "token_cost": cost},
             request,
         )
         db.commit()
@@ -125,9 +140,17 @@ def update_agent(
     agent = db.get(Agent, agent_id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI employee not found")
-    changed = [field for field, value in payload.model_dump().items() if getattr(agent, field) != value]
-    for field, value in payload.model_dump().items():
-        setattr(agent, field, value)
+    values = payload.model_dump()
+    changed = [field for field, value in values.items() if getattr(agent, field) != value]
+    if changed:
+        create_version(
+            db,
+            agent,
+            values,
+            current_admin.id,
+            status="PUBLISHED",
+            release_note="Published from agent settings",
+        )
     record_audit(
         db,
         "agent.update",
@@ -135,6 +158,109 @@ def update_agent(
         resource_type="agent",
         resource_id=agent.id,
         details={"changed_fields": changed},
+        request=request,
+    )
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+@router.get("/{agent_id}/versions", response_model=list[AgentVersionOut])
+def list_agent_versions(
+    agent_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[AgentPromptVersion]:
+    if not db.get(Agent, agent_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI employee not found")
+    return list(
+        db.scalars(
+            select(AgentPromptVersion)
+            .where(AgentPromptVersion.agent_id == agent_id)
+            .order_by(AgentPromptVersion.version.desc())
+        )
+    )
+
+
+@router.post("/{agent_id}/versions", response_model=AgentVersionOut, status_code=status.HTTP_201_CREATED)
+def create_agent_version(
+    agent_id: int,
+    payload: AgentVersionCreate,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentPromptVersion:
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI employee not found")
+    values = payload.model_dump(exclude={"release_note"})
+    version = create_version(db, agent, values, current_admin.id, release_note=payload.release_note)
+    record_audit(
+        db,
+        "agent.version_create",
+        current_admin.id,
+        resource_type="agent_version",
+        resource_id=version.id,
+        details={"agent_id": agent.id, "version": version.version},
+        request=request,
+    )
+    db.commit()
+    db.refresh(version)
+    return version
+
+
+@router.post("/{agent_id}/versions/{version_id}/publish", response_model=AgentVersionOut)
+def publish_agent_version(
+    agent_id: int,
+    version_id: int,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentPromptVersion:
+    agent = db.get(Agent, agent_id)
+    version = db.get(AgentPromptVersion, version_id)
+    if not agent or not version or version.agent_id != agent.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent version not found")
+    activate_version(db, agent, version)
+    record_audit(
+        db,
+        "agent.version_publish",
+        current_admin.id,
+        resource_type="agent_version",
+        resource_id=version.id,
+        details={"agent_id": agent.id, "version": version.version},
+        request=request,
+    )
+    db.commit()
+    db.refresh(version)
+    return version
+
+
+@router.post("/{agent_id}/versions/{target_version}/rollback", response_model=AgentOut)
+def rollback_agent_version(
+    agent_id: int,
+    target_version: int,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Agent:
+    agent = db.get(Agent, agent_id)
+    target = db.scalar(
+        select(AgentPromptVersion).where(
+            AgentPromptVersion.agent_id == agent_id,
+            AgentPromptVersion.version == target_version,
+        )
+    )
+    if not agent or not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent version not found")
+    created = rollback_to_version(db, agent, target, current_admin.id)
+    record_audit(
+        db,
+        "agent.version_rollback",
+        current_admin.id,
+        resource_type="agent_version",
+        resource_id=created.id,
+        details={"agent_id": agent.id, "target_version": target_version, "new_version": created.version},
         request=request,
     )
     db.commit()
@@ -330,9 +456,16 @@ async def chat(
         await lease.release()
         raise
     try:
-        conversation, answer, thinking, tool_calls, messages = await chat_with_agent(
-            db, current_user, agent, payload.message, project, payload.conversation_id, decision.reason
-        )
+        with bind_llm_usage(
+            db=db,
+            user_id=current_user.id,
+            project_id=project.id if project else None,
+            agent_id=agent.id,
+            agent_run_id=run.id,
+        ):
+            conversation, answer, thinking, tool_calls, messages = await chat_with_agent(
+                db, current_user, agent, payload.message, project, payload.conversation_id, decision.reason
+            )
         complete_agent_run(db, run.id, conversation.id)
     except ConversationAccessError as exc:
         db.rollback()
@@ -391,6 +524,53 @@ async def chat_stream(
     )
 
 
+@router.post("/discussion/stream")
+async def discussion_stream(
+    payload: DiscussionRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    ensure_permission(current_user, "agents:read")
+    project = get_project_for_user(payload.project_id, current_user, db, write=True) if payload.project_id else None
+    if payload.conversation_id:
+        try:
+            conversation = get_owned_conversation(db, current_user.id, payload.conversation_id)
+        except ConversationAccessError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if conversation.mode != "TEAM":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该会话不是团队讨论")
+        if conversation.project_id != (project.id if project else None):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="讨论所属项目与当前项目不一致")
+    try:
+        agents = select_discussion_agents(db)
+    except DiscussionConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    coordinator = agents[-1]
+    run = create_agent_run(
+        db,
+        request,
+        current_user,
+        coordinator,
+        project,
+        payload,
+        token_cost=settings.discussion_token_cost,
+        description="多 AI 团队讨论",
+    )
+    return StreamingResponse(
+        stream_discussion_events(
+            current_user.id,
+            payload.message,
+            project.id if project else None,
+            payload.conversation_id,
+            run.id,
+            run.billing_transaction_id,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/conversations", response_model=list[ConversationOut])
 def list_conversations(
     project_id: int | None = None,
@@ -417,3 +597,99 @@ def list_conversation_messages(
     except ConversationAccessError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return list(db.scalars(select(Message).where(Message.conversation_id == conversation.id).order_by(Message.created_at)))
+
+
+@router.post("/messages/{message_id}/feedback", response_model=MessageFeedbackOut)
+def submit_message_feedback(
+    message_id: int,
+    payload: MessageFeedbackRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageFeedback:
+    ensure_permission(current_user, "agents:read")
+    message = db.get(Message, message_id)
+    if not message or message.role != "assistant":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assistant message not found")
+    try:
+        get_owned_conversation(db, current_user.id, message.conversation_id)
+    except ConversationAccessError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    feedback = db.scalar(
+        select(MessageFeedback).where(
+            MessageFeedback.message_id == message.id,
+            MessageFeedback.user_id == current_user.id,
+        )
+    )
+    if feedback is None:
+        feedback = MessageFeedback(message_id=message.id, user_id=current_user.id, rating=payload.rating)
+        db.add(feedback)
+    feedback.rating = payload.rating
+    feedback.comment = payload.comment
+    record_audit(
+        db,
+        "agent.message_feedback",
+        current_user.id,
+        resource_type="message",
+        resource_id=message.id,
+        details={"rating": payload.rating},
+        request=request,
+    )
+    db.commit()
+    db.refresh(feedback)
+    return feedback
+
+
+@router.post("/messages/{message_id}/regenerate", response_model=MessageRegenerateOut)
+async def regenerate_message(
+    message_id: int,
+    payload: MessageRegenerateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageRegenerateOut:
+    ensure_permission(current_user, "agents:read")
+    original = db.get(Message, message_id)
+    if not original or original.role != "assistant":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assistant message not found")
+    try:
+        conversation = get_owned_conversation(db, current_user.id, original.conversation_id)
+    except ConversationAccessError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    agent = db.get(Agent, conversation.agent_id)
+    project = get_project_for_user(conversation.project_id, current_user, db, write=True) if conversation.project_id else None
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI employee not found")
+    parent = db.get(Message, original.parent_message_id) if original.parent_message_id else None
+    message_text = parent.content if parent else "Regenerate assistant response"
+    run_payload = ChatRequest(
+        request_id=payload.request_id,
+        agent_id=agent.id,
+        message=message_text,
+        project_id=project.id if project else None,
+        conversation_id=conversation.id,
+    )
+    try:
+        lease = await acquire_agent_slot(agent.id, agent.concurrency_limit)
+    except AgentBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    try:
+        run = create_agent_run(db, request, current_user, agent, project, run_payload)
+        with bind_llm_usage(
+            db=db,
+            user_id=current_user.id,
+            project_id=project.id if project else None,
+            agent_id=agent.id,
+            agent_run_id=run.id,
+        ):
+            regenerated = await regenerate_assistant_message(db, current_user, original)
+        complete_agent_run(db, run.id, conversation.id)
+    except Exception as exc:
+        db.rollback()
+        if "run" in locals():
+            fail_agent_run(db, run.id, run.billing_transaction_id, str(exc))
+        raise
+    finally:
+        await lease.release()
+    db.refresh(current_user)
+    return MessageRegenerateOut(message=regenerated, token_balance=current_user.ai_token_balance)

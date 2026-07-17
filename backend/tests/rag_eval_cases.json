@@ -1,0 +1,52 @@
+[
+  {
+    "name": "milvus-fallback",
+    "query": "Milvus 不可用时知识库怎么完成向量检索？",
+    "document": "RAG.md",
+    "evidence": "Milvus 不可用时读取 PostgreSQL 的持久化向量"
+  },
+  {
+    "name": "production-startup-guard",
+    "query": "生产环境安全配置不合格时系统是否还会启动？",
+    "document": "DEPLOYMENT.md",
+    "evidence": "生产配置不满足上述安全约束时，应用会拒绝启动"
+  },
+  {
+    "name": "workflow-multi-replica",
+    "query": "工作流多副本如何避免重复认领任务？",
+    "document": "LANGGRAPH.md",
+    "evidence": "dispatcher 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 支持多副本"
+  },
+  {
+    "name": "knowledge-access-enforcement",
+    "query": "怎样真正禁止某个 Agent 使用知识库，而不是只写在提示词里？",
+    "document": "AGENT_DESIGN.md",
+    "evidence": "`knowledge_access=false` 会在运行时移除 `knowledge_search`"
+  },
+  {
+    "name": "restore-drill",
+    "query": "生产发布前多久执行一次备份恢复演练？",
+    "document": "OPERATIONS.md",
+    "evidence": "Perform a restore drill before first production release and at least quarterly"
+  },
+  {
+    "name": "schema-authority",
+    "query": "生产数据库结构以哪个目录为准？",
+    "document": "DATABASE.md",
+    "evidence": "Alembic 是生产数据库结构的权威来源"
+  },
+  {
+    "name": "unknown-wifi-password",
+    "query": "公司访客 WiFi 的密码是什么？",
+    "document": null,
+    "evidence": null,
+    "answerable": false
+  },
+  {
+    "name": "unknown-gpu-policy",
+    "query": "Kubernetes GPU 节点自动扩缩容阈值是多少？",
+    "document": null,
+    "evidence": null,
+    "answerable": false
+  }
+]

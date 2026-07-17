@@ -3,11 +3,13 @@ import json
 import logging
 import math
 import re
+from time import perf_counter
 from collections.abc import AsyncGenerator
 
 import httpx
 
 from app.core.config import get_settings
+from app.core.llm_usage import estimate_tokens, record_llm_usage
 
 
 logger = logging.getLogger(__name__)
@@ -49,13 +51,26 @@ class LLMGateway:
         raise LLMGatewayError("LLM provider request failed") from exc
 
     async def chat(self, system_prompt: str, user_prompt: str, model: str | None = None) -> str:
+        started = perf_counter()
+        resolved_model = self.resolve_model(model)
+        input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
         if not self.api_key:
             if not self.settings.llm_fallback_enabled:
                 raise LLMGatewayError("LLM_API_KEY is not configured")
-            return self._mock_response(system_prompt, user_prompt)
+            answer = self._mock_response(system_prompt, user_prompt)
+            record_llm_usage(
+                "chat",
+                "local",
+                resolved_model,
+                input_tokens,
+                estimate_tokens(answer),
+                int((perf_counter() - started) * 1000),
+                usage_source="estimated",
+            )
+            return answer
 
         payload = {
-            "model": self.resolve_model(model),
+            "model": resolved_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -72,10 +87,31 @@ class LLMGateway:
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data["choices"][0]["message"]["content"]
+                answer = data["choices"][0]["message"]["content"]
+                usage = data.get("usage") or {}
+                record_llm_usage(
+                    "chat",
+                    self.settings.llm_provider,
+                    resolved_model,
+                    int(usage.get("prompt_tokens", input_tokens)),
+                    int(usage.get("completion_tokens", estimate_tokens(answer))),
+                    int((perf_counter() - started) * 1000),
+                    usage_source="provider" if usage else "estimated",
+                )
+                return answer
         except Exception as exc:
             self._fallback_or_raise(exc)
-            return self._mock_response(system_prompt, user_prompt)
+            answer = self._mock_response(system_prompt, user_prompt)
+            record_llm_usage(
+                "chat",
+                "local",
+                resolved_model,
+                input_tokens,
+                estimate_tokens(answer),
+                int((perf_counter() - started) * 1000),
+                usage_source="estimated",
+            )
+            return answer
 
     async def stream(self, system_prompt: str, user_prompt: str, model: str | None = None) -> AsyncGenerator[str, None]:
         if not self.api_key:
@@ -84,17 +120,23 @@ class LLMGateway:
                 yield text[index : index + 12]
             return
 
+        started = perf_counter()
+        resolved_model = self.resolve_model(model)
+        input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
         payload = {
-            "model": self.resolve_model(model),
+            "model": resolved_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.3,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
+            usage: dict = {}
+            output_parts: list[str] = []
             async with httpx.AsyncClient(timeout=90) as client:
                 async with client.stream(
                     "POST",
@@ -110,14 +152,36 @@ class LLMGateway:
                         if not raw or raw == "[DONE]":
                             continue
                         data = json.loads(raw)
+                        if data.get("usage"):
+                            usage = data["usage"]
                         content = data.get("choices", [{}])[0].get("delta", {}).get("content")
                         if content:
+                            output_parts.append(content)
                             yield content
+            output = "".join(output_parts)
+            record_llm_usage(
+                "chat",
+                self.settings.llm_provider,
+                resolved_model,
+                int(usage.get("prompt_tokens", input_tokens)),
+                int(usage.get("completion_tokens", estimate_tokens(output))),
+                int((perf_counter() - started) * 1000),
+                usage_source="provider" if usage else "estimated",
+            )
         except Exception as exc:
             self._fallback_or_raise(exc)
             text = self._mock_response(system_prompt, user_prompt)
             for index in range(0, len(text), 12):
                 yield text[index : index + 12]
+            record_llm_usage(
+                "chat",
+                "local",
+                resolved_model,
+                input_tokens,
+                estimate_tokens(text),
+                int((perf_counter() - started) * 1000),
+                usage_source="estimated",
+            )
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -125,6 +189,8 @@ class LLMGateway:
         api_key = self.settings.embedding_api_key or self.api_key
         base_url = self.settings.embedding_base_url or self.base_url
         embedding_model = self.settings.embedding_model
+        started = perf_counter()
+        input_tokens = sum(estimate_tokens(text) for text in texts)
         if not self.settings.embedding_api_key and not self.settings.llm_api_key and embedding_model == "embedding-3":
             embedding_model = "text-embedding-3-small"
         if api_key:
@@ -136,13 +202,34 @@ class LLMGateway:
                         headers={"Authorization": f"Bearer {api_key}"},
                     )
                     response.raise_for_status()
-                    rows = sorted(response.json()["data"], key=lambda item: item["index"])
+                    data = response.json()
+                    rows = sorted(data["data"], key=lambda item: item["index"])
+                    usage = data.get("usage") or {}
+                    record_llm_usage(
+                        "embedding",
+                        self.settings.llm_provider,
+                        embedding_model,
+                        int(usage.get("prompt_tokens", usage.get("total_tokens", input_tokens))),
+                        0,
+                        int((perf_counter() - started) * 1000),
+                        usage_source="provider" if usage else "estimated",
+                    )
                     return [self._resize_and_normalize(item["embedding"]) for item in rows]
             except Exception as exc:
                 if not self.settings.llm_fallback_enabled:
                     raise LLMGatewayError("Embedding provider request failed") from exc
                 logger.warning("Embedding request failed; using local feature hashing: %s", exc)
-        return [self._local_embedding(text) for text in texts]
+        vectors = [self._local_embedding(text) for text in texts]
+        record_llm_usage(
+            "embedding",
+            "local",
+            embedding_model,
+            input_tokens,
+            0,
+            int((perf_counter() - started) * 1000),
+            usage_source="estimated",
+        )
+        return vectors
 
     async def embed(self, text: str) -> list[float]:
         return (await self.embed_many([text]))[0]
