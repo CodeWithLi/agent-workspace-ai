@@ -112,6 +112,9 @@ class Project(Base):
     notifications: Mapped[list["Notification"]] = relationship(back_populates="project")
     workflows: Mapped[list["WorkflowRun"]] = relationship(back_populates="project")
     requirements: Mapped[list["Requirement"]] = relationship(back_populates="project")
+    prototypes: Mapped[list["ProductPrototype"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     member_links: Mapped[list["ProjectMember"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
@@ -146,6 +149,54 @@ class Requirement(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     project: Mapped[Project | None] = relationship(back_populates="requirements")
+    prototypes: Mapped[list["ProductPrototype"]] = relationship(back_populates="requirement")
+
+
+class ProductPrototype(Base):
+    __tablename__ = "product_prototypes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    requirement_id: Mapped[int | None] = mapped_column(
+        ForeignKey("requirements.id", ondelete="SET NULL"), index=True
+    )
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT", index=True)
+    active_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    project: Mapped[Project] = relationship(back_populates="prototypes")
+    requirement: Mapped[Requirement | None] = relationship(back_populates="prototypes")
+    versions: Mapped[list["ProductPrototypeVersion"]] = relationship(
+        back_populates="prototype", cascade="all, delete-orphan", order_by="ProductPrototypeVersion.version"
+    )
+
+
+class ProductPrototypeVersion(Base):
+    __tablename__ = "product_prototype_versions"
+    __table_args__ = (
+        UniqueConstraint("prototype_id", "version", name="uq_product_prototype_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    prototype_id: Mapped[int] = mapped_column(
+        ForeignKey("product_prototypes.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    source_prompt: Mapped[str] = mapped_column(Text)
+    specification_json: Mapped[str] = mapped_column(Text)
+    agent_trace_json: Mapped[str] = mapped_column(Text, default="[]")
+    quality_json: Mapped[str] = mapped_column(Text, default="{}")
+    generation_mode: Mapped[str] = mapped_column(String(30), default="MULTI_AGENT")
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    prototype: Mapped[ProductPrototype] = relationship(back_populates="versions")
 
 
 class Agent(Base):

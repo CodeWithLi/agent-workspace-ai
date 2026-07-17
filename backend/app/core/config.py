@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     docling_serve_api_key: str | None = None
     docling_timeout_seconds: float = Field(default=300.0, ge=10.0, le=1800.0)
     docling_do_ocr: bool = True
+    rag_max_uncompressed_mb: int = Field(default=200, ge=10, le=2000)
+    rag_max_document_chars: int = Field(default=2_000_000, ge=10_000, le=20_000_000)
+    rag_max_pdf_pages: int = Field(default=500, ge=1, le=5000)
+    rag_max_elements: int = Field(default=50_000, ge=100, le=500_000)
+    rag_max_chunks: int = Field(default=10_000, ge=10, le=100_000)
     knowledge_worker_enabled: bool = True
     knowledge_poll_seconds: int = Field(default=1, ge=1, le=60)
     knowledge_lease_seconds: int = Field(default=300, ge=60, le=3600)

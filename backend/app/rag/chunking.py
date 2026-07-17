@@ -25,6 +25,16 @@ SEPARATORS = [
     " ",
     "",
 ]
+PROMPT_INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all instructions",
+    "system prompt",
+    "developer message",
+    "忽略之前的指令",
+    "忽略以上指令",
+    "你现在是",
+    "</document>",
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -117,6 +127,9 @@ class StructuralChunker:
                                 "chunker": self.name,
                                 "chunker_version": self.version,
                                 "has_overlap": any(segment.overlap for segment in group),
+                                "prompt_injection_suspected": any(
+                                    pattern in content.lower() for pattern in PROMPT_INJECTION_PATTERNS
+                                ),
                             },
                         )
                     )

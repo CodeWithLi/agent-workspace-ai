@@ -32,7 +32,8 @@
           <el-table-column label="文档" min-width="190">
             <template #default="{ row }">
               <strong>{{ row.filename }}</strong>
-              <div class="document-meta">{{ row.source_label }} · v{{ row.version }} · {{ documentTags(row).join(' / ') || '无标签' }}</div>
+              <div class="document-meta">{{ row.source_label }} · 文档 v{{ row.version }} · 索引 v{{ row.active_index_version }}</div>
+              <div class="document-meta">{{ row.parser_name || '等待解析' }} · {{ row.chunk_count }} chunks · {{ documentTags(row).join(' / ') || '无标签' }}</div>
             </template>
           </el-table-column>
           <el-table-column label="状态" width="105">
@@ -43,10 +44,11 @@
               <el-tag v-else :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column v-if="auth.hasPermission('knowledge:write')" label="操作" width="138" align="right">
+          <el-table-column v-if="auth.hasPermission('knowledge:write')" label="操作" width="188" align="right">
             <template #default="{ row }">
               <el-button v-if="row.status === 'FAILED'" link type="primary" @click="documentAction(row.id, 'retry')">重试</el-button>
               <el-button v-if="['INDEXED', 'EMPTY', 'FAILED'].includes(row.status)" link @click="documentAction(row.id, 'reindex')">重建</el-button>
+              <el-button v-if="row.active_index_version > 0" link :icon="Clock" @click="openIndexVersions(row)">版本</el-button>
               <el-button link type="danger" @click="remove(row.id)">删除</el-button>
             </template>
           </el-table-column>
@@ -58,11 +60,12 @@
         <h2 class="section-title">搜索结果</h2>
         <div v-if="answer" class="answer">{{ answer }}</div>
         <el-empty v-else-if="!searching && !results.length" description="输入关键词检索当前知识库" />
-        <div v-for="result in results" :key="`${result.document_id}-${result.chunk_index}`" class="result-row">
+        <div v-for="result in results" :key="result.stable_id || `${result.document_id}-${result.chunk_index}`" class="result-row">
           <div class="result-row-head">
             <strong>{{ result.filename }}</strong>
             <el-button link type="primary" @click="openCitation(result)">{{ result.citation }}</el-button>
           </div>
+          <div class="document-meta">{{ result.heading_path?.join(' / ') || '正文' }}<span v-if="result.page_start"> · 第 {{ result.page_start }} 页</span> · 相关度 {{ Math.round(result.score * 100) }}%</div>
           <p>{{ result.content }}</p>
         </div>
       </el-col>
@@ -90,19 +93,44 @@
     </el-dialog>
 
     <el-dialog v-model="citationDialog" :title="citation?.citation || '引用内容'" width="680">
-      <pre class="citation-content">{{ citation?.content }}</pre>
+      <div v-if="citation?.heading_path?.length" class="document-meta citation-location">{{ citation.heading_path.join(' / ') }}<span v-if="citation.page_start"> · 第 {{ citation.page_start }} 页</span></div>
+      <pre class="citation-content">{{ citation?.parent_content || citation?.content }}</pre>
+    </el-dialog>
+
+    <el-dialog v-model="versionDialog" :title="`${selectedDocument?.filename || ''} · 索引版本`" width="min(760px, 94vw)">
+      <el-table v-loading="versionsLoading" :data="indexVersions" class="data-table version-table">
+        <el-table-column label="版本" width="84"><template #default="{ row }">v{{ row.version }}</template></el-table-column>
+        <el-table-column label="状态" width="104">
+          <template #default="{ row }"><el-tag :type="row.status === 'ACTIVE' ? 'success' : 'info'" size="small">{{ indexStatusLabel(row.status) }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="处理管线" min-width="220">
+          <template #default="{ row }">
+            <strong>{{ row.parser_name }} {{ row.parser_version }}</strong>
+            <div class="document-meta">{{ row.chunker_name }} {{ row.chunker_version }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="规模" width="130"><template #default="{ row }">{{ row.element_count }} / {{ row.chunk_count }}</template></el-table-column>
+        <el-table-column label="激活时间" min-width="180"><template #default="{ row }">{{ row.activated_at ? new Date(row.activated_at).toLocaleString() : '-' }}</template></el-table-column>
+        <el-table-column v-if="auth.hasPermission('knowledge:write')" label="操作" width="92" align="right">
+          <template #default="{ row }">
+            <el-button link type="primary" :icon="RefreshLeft" :disabled="row.status === 'ACTIVE'" :loading="activatingVersion === row.version" @click="activateVersion(row.version)">激活</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-dialog>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Search, Upload } from '@element-plus/icons-vue'
+import { Clock, RefreshLeft, Search, Upload } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
+import 'element-plus/es/components/message-box/style/css.mjs'
 import type { UploadUserFile } from 'element-plus'
 import { api } from '../api/client'
-import type { KnowledgeDocument, Project } from '../api/types'
+import type { KnowledgeDocument, KnowledgeIndexVersion, Project } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { containsQuery, paginate } from '../utils/collection'
 import { confirmDestructiveAction } from '../utils/confirm'
@@ -114,11 +142,17 @@ interface SearchResult {
   content: string
   score: number
   citation: string
+  stable_id: string
+  heading_path: string[]
+  page_start?: number | null
 }
 
 interface Citation {
   citation: string
   content: string
+  parent_content: string
+  heading_path: string[]
+  page_start?: number | null
 }
 
 const auth = useAuthStore()
@@ -137,6 +171,11 @@ const uploadTags = ref('')
 const uploading = ref(false)
 const citationDialog = ref(false)
 const citation = ref<Citation | null>(null)
+const versionDialog = ref(false)
+const versionsLoading = ref(false)
+const indexVersions = ref<KnowledgeIndexVersion[]>([])
+const selectedDocument = ref<KnowledgeDocument | null>(null)
+const activatingVersion = ref<number | null>(null)
 const documentQuery = ref('')
 const documentStatus = ref('')
 const documentStatuses = ['QUEUED', 'INDEXING', 'INDEXED', 'EMPTY', 'FAILED']
@@ -174,6 +213,10 @@ function statusLabel(value: string) {
 
 function statusTagType(value: string) {
   return { QUEUED: 'info', INDEXING: 'primary', INDEXED: 'success', EMPTY: 'warning', FAILED: 'danger' }[value] as 'primary' | 'success' | 'warning' | 'info' | 'danger' | undefined
+}
+
+function indexStatusLabel(value: string) {
+  return { ACTIVE: '活动', SUPERSEDED: '历史', STAGING: '构建中', FAILED: '失败' }[value] || value
 }
 
 async function load(silent = false) {
@@ -232,6 +275,44 @@ async function documentAction(id: number, action: 'retry' | 'reindex') {
   await api.post(`/knowledge/documents/${id}/${action}`, { request_id: crypto.randomUUID() })
   ElMessage.success(action === 'retry' ? '文档已重新入队' : '文档已进入重建队列')
   await load(true)
+}
+
+async function openIndexVersions(row: unknown) {
+  const document = row as KnowledgeDocument
+  selectedDocument.value = document
+  versionDialog.value = true
+  versionsLoading.value = true
+  try {
+    const { data } = await api.get<KnowledgeIndexVersion[]>(`/knowledge/documents/${document.id}/index-versions`)
+    indexVersions.value = data
+  } finally {
+    versionsLoading.value = false
+  }
+}
+
+async function activateVersion(version: number) {
+  const document = selectedDocument.value
+  if (!document || version === document.active_index_version) return
+  try {
+    await ElMessageBox.confirm(`将活动索引切换到 v${version}，当前版本仍会保留。`, '激活历史索引', {
+      type: 'warning',
+      confirmButtonText: '确认激活',
+      cancelButtonText: '取消'
+    })
+  } catch {
+    return
+  }
+  activatingVersion.value = version
+  try {
+    await api.post(`/knowledge/documents/${document.id}/index-versions/${version}/activate`, { request_id: crypto.randomUUID() })
+    ElMessage.success(`索引 v${version} 已激活`)
+    await load(true)
+    const refreshed = documents.value.find((item) => item.id === document.id)
+    if (refreshed) selectedDocument.value = refreshed
+    await openIndexVersions(selectedDocument.value || document)
+  } finally {
+    activatingVersion.value = null
+  }
 }
 
 async function remove(id: number) {

@@ -150,6 +150,33 @@ export interface KnowledgeDocument {
   max_attempts: number
   error: string
   indexed_at?: string | null
+  active_index_version: number
+  pending_index_version?: number | null
+  parser_name: string
+  parser_version: string
+  chunker_name: string
+  chunker_version: string
+  element_count: number
+  chunk_count: number
+  index_config_json: string
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeIndexVersion {
+  version: number
+  status: string
+  parser_name: string
+  parser_version: string
+  chunker_name: string
+  chunker_version: string
+  embedding_model: string
+  embedding_dimensions: number
+  element_count: number
+  chunk_count: number
+  config_json: string
+  error: string
+  activated_at?: string | null
   created_at: string
   updated_at: string
 }
@@ -385,4 +412,80 @@ export interface WorkflowSagaStep {
   compensated_at?: string | null
   created_at: string
   updated_at: string
+}
+
+export type PrototypeComponentType =
+  | 'heading'
+  | 'text'
+  | 'input'
+  | 'textarea'
+  | 'select'
+  | 'button'
+  | 'link'
+  | 'stepper'
+  | 'stats'
+  | 'callout'
+  | 'table'
+  | 'tabs'
+  | 'list'
+  | 'divider'
+
+export interface PrototypeAction {
+  type: 'navigate' | 'toast' | 'submit' | 'copy' | 'advance_step' | 'back'
+  target?: string | null
+  message?: string | null
+}
+
+export interface PrototypeOption {
+  label: string
+  value: string
+}
+
+export interface PrototypeComponentSpec {
+  id: string
+  type: PrototypeComponentType
+  label: string
+  text: string
+  placeholder: string
+  value: string
+  variant: 'default' | 'primary' | 'secondary' | 'success' | 'warning' | 'danger'
+  required: boolean
+  disabled: boolean
+  options: PrototypeOption[]
+  items: Record<string, unknown>[]
+  columns: string[]
+  steps: string[]
+  active_step: number
+  action?: PrototypeAction | null
+}
+
+export interface PrototypeSection {
+  id: string
+  title: string
+  description: string
+  width: 'narrow' | 'medium' | 'wide' | 'full'
+  components: PrototypeComponentSpec[]
+}
+
+export interface PrototypeScreen {
+  id: string
+  name: string
+  description: string
+  layout: 'auth' | 'app' | 'dashboard' | 'form' | 'list'
+  sections: PrototypeSection[]
+}
+
+export interface PrototypeSpecification {
+  product_name: string
+  summary: string
+  start_screen_id: string
+  theme: {
+    primary: string
+    accent: string
+    background: string
+    surface: string
+    foreground: string
+    radius: 'compact' | 'soft' | 'rounded'
+  }
+  screens: PrototypeScreen[]
 }

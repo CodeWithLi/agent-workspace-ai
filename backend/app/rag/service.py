@@ -1,5 +1,6 @@
 import json
 import hashlib
+import html
 import math
 import re
 from collections import Counter
@@ -21,7 +22,12 @@ from app.core.storage import object_storage
 from app.models import Embedding, KnowledgeDocument, KnowledgeElement, KnowledgeIndexVersion, User
 from app.rag.chunking import ChunkingConfig, StructuralChunker, TokenCounter
 from app.rag.advanced_parser import parse_document_with_backend
-from app.rag.parsers import DocumentParseError, parse_document_elements
+from app.rag.parsers import (
+    DocumentParseError,
+    parse_document_elements,
+    validate_document_container,
+    validate_parsed_document,
+)
 from app.rag.reranker import reranker
 from app.rag.vector_store import vector_store
 
@@ -49,6 +55,14 @@ async def read_upload(file: UploadFile) -> bytes:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
         raise DocumentValidationError("仅支持 PDF、DOCX、Markdown 和 TXT 文件")
+    try:
+        validate_document_container(
+            file.filename or "document",
+            data,
+            settings.rag_max_uncompressed_mb * 1024 * 1024,
+        )
+    except DocumentParseError as exc:
+        raise DocumentValidationError(str(exc)) from exc
     return data
 
 
@@ -158,6 +172,15 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
         raise DocumentValidationError(str(exc)) from exc
     if document.content_hash and parsed.content_hash != document.content_hash:
         raise DocumentValidationError("存储文档内容哈希与上传记录不一致")
+    try:
+        validate_parsed_document(
+            parsed,
+            max_characters=settings.rag_max_document_chars,
+            max_pages=settings.rag_max_pdf_pages,
+            max_elements=settings.rag_max_elements,
+        )
+    except DocumentParseError as exc:
+        raise DocumentValidationError(str(exc)) from exc
     config = ChunkingConfig(
         child_tokens=settings.rag_child_chunk_tokens,
         parent_tokens=settings.rag_parent_chunk_tokens,
@@ -166,6 +189,8 @@ async def index_stored_document(db: Session, document: KnowledgeDocument) -> Kno
     )
     chunker = StructuralChunker(config)
     chunks = chunker.chunk(parsed)
+    if len(chunks) > settings.rag_max_chunks:
+        raise DocumentValidationError("文档切片数量超过限制")
     if not chunks and document.active_index_version > 0:
         raise DocumentValidationError("重建解析结果为空，继续保留当前活动索引")
     index_version = max(document.active_index_version + 1, document.pending_index_version or 0)
@@ -517,12 +542,13 @@ def build_context(rows: list[dict], max_tokens: int) -> str:
     used_tokens = 0
     for row in rows:
         content = row.get("parent_content") or row["content"]
-        prefix = f'<document citation="{row["citation"]}">\n'
+        prefix = f'<document citation="{html.escape(row["citation"], quote=True)}">\n'
         suffix = "\n</document>"
         wrapper_tokens = context_tokens.count(prefix + suffix)
         remaining = max_tokens - used_tokens - wrapper_tokens
         if remaining <= 0:
             break
+        content = html.escape(content, quote=False)
         encoded = context_tokens.encoding.encode(content, disallowed_special=())
         if len(encoded) > remaining:
             encoded = encoded[:remaining]

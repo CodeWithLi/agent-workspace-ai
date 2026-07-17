@@ -6,12 +6,49 @@ from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile, ZipFile
 
 from app.rag.types import DocumentElement, ParsedDocument
 
 
 class DocumentParseError(ValueError):
     pass
+
+
+def validate_document_container(filename: str, data: bytes, max_uncompressed_bytes: int) -> None:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf" and not data.lstrip().startswith(b"%PDF-"):
+        raise DocumentParseError("PDF 文件签名无效")
+    if suffix == ".docx":
+        try:
+            with ZipFile(BytesIO(data)) as archive:
+                names = set(archive.namelist())
+                if not {"[Content_Types].xml", "word/document.xml"}.issubset(names):
+                    raise DocumentParseError("DOCX 容器缺少必要文件")
+                infos = archive.infolist()
+                if any(info.flag_bits & 0x1 for info in infos):
+                    raise DocumentParseError("不支持加密 DOCX 文件")
+                if sum(info.file_size for info in infos) > max_uncompressed_bytes:
+                    raise DocumentParseError("DOCX 解压后大小超过限制")
+        except BadZipFile as exc:
+            raise DocumentParseError("DOCX 压缩容器无效") from exc
+
+
+def validate_parsed_document(
+    parsed: ParsedDocument,
+    *,
+    max_characters: int,
+    max_pages: int,
+    max_elements: int,
+) -> None:
+    if len(parsed.text) > max_characters:
+        raise DocumentParseError("文档解析文本超过字符数限制")
+    if len(parsed.elements) > max_elements:
+        raise DocumentParseError("文档结构元素数量超过限制")
+    pages = [element.page_end for element in parsed.elements if element.page_end is not None]
+    page_count = max(pages, default=int(parsed.metadata.get("page_count", 0) or 0))
+    if page_count > max_pages:
+        raise DocumentParseError("PDF 页数超过限制")
 
 
 @dataclass(slots=True)

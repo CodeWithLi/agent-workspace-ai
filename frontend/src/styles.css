@@ -1363,6 +1363,14 @@ h4 {
   line-height: 1.65;
 }
 
+.citation-location {
+  margin: 0 0 12px;
+}
+
+.version-table {
+  width: 100%;
+}
+
 .el-upload,
 .el-upload-dragger {
   width: 100%;
