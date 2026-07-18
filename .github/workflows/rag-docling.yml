@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 60
     env:
       DOCLING_SERVE_URL: http://127.0.0.1:5001
+      DOCLING_SERVE_IMAGE: quay.io/docling-project/docling-serve-cpu@sha256:7e07522e0240c1db3ff5b837ffa969c2ecd5a71664c0e0369f5a69fc169e30ba
       DOCLING_DO_OCR: "true"
       DOCLING_TIMEOUT_SECONDS: "600"
       RAG_REAL_DOCLING: "1"
@@ -29,7 +30,7 @@ jobs:
           docker run -d --name docling-serve
           -p 5001:5001
           -e DOCLING_SERVE_ENABLE_UI=0
-          quay.io/docling-project/docling-serve-cpu:1.26.0
+          "$DOCLING_SERVE_IMAGE"
       - name: Wait for Docling
         shell: bash
         run: |
@@ -46,6 +47,6 @@ jobs:
       - run: python -m pytest -q tests/test_rag_real_docling.py
         working-directory: backend
       - if: always()
-        run: docker logs docling-serve
+        run: docker logs docling-serve || true
       - if: always()
-        run: docker rm -f docling-serve
+        run: docker rm -f docling-serve || true
