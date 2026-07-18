@@ -49,6 +49,8 @@ jobs:
       WORKFLOW_WORKER_ENABLED: "false"
       KNOWLEDGE_WORKER_ENABLED: "false"
       NOTIFICATION_WORKER_ENABLED: "false"
+      PROTOTYPE_GENERATION_WORKER_ENABLED: "false"
+      PROTOTYPE_GENERATION_PG_INTEGRATION: "1"
     defaults:
       run:
         working-directory: backend
@@ -60,11 +62,11 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements*.txt
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m pytest -q
-      - run: alembic heads
       - run: alembic upgrade head
+      - run: alembic heads
       - run: alembic current
       - run: alembic check
+      - run: python -m pytest -q
 
   rag-integration:
     runs-on: ubuntu-latest

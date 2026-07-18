@@ -14,6 +14,8 @@ from app.models import (
     ProductPrototype,
     ProductPrototypeMaterialization,
     ProductPrototypeVersion,
+    PrototypeGenerationJob,
+    PrototypeGenerationStatus,
     PrototypeReviewComment,
     PrototypeTestCase,
     Requirement,
@@ -690,6 +692,23 @@ def delete_prototype(
 ) -> None:
     ensure_permission(current_user, "projects:write")
     prototype = get_prototype_for_user(prototype_id, current_user, db, write=True)
+    active_job = db.scalar(
+        select(PrototypeGenerationJob.id).where(
+            PrototypeGenerationJob.prototype_id == prototype.id,
+            PrototypeGenerationJob.status.in_(
+                {
+                    PrototypeGenerationStatus.queued,
+                    PrototypeGenerationStatus.running,
+                    PrototypeGenerationStatus.cancelling,
+                }
+            ),
+        )
+    )
+    if active_job:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cancel the active prototype generation job before deleting the prototype",
+        )
     record_audit(
         db,
         "prototype.delete",

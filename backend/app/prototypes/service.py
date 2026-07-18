@@ -1,6 +1,8 @@
 import json
 import re
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -17,6 +19,89 @@ from app.prototypes.schemas import PrototypeSpecification, PrototypeVersionOut
 MAX_PROTOTYPE_REPAIR_ROUNDS = 2
 MAX_REVIEW_CONTRACT_REPAIRS = 1
 PROTOTYPE_REVIEW_MIN_SCORE = 80
+
+PrototypeProgressCallback = Callable[[str, int, dict[str, Any]], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class PrototypeGenerationArtifact:
+    specification: PrototypeSpecification
+    agent_trace: list[dict[str, Any]]
+    quality: dict[str, Any]
+    generation_mode: str
+
+    def checkpoint(self) -> dict[str, Any]:
+        return {
+            "artifact": {
+                "specification": self.specification.model_dump(mode="json"),
+                "agent_trace": self.agent_trace,
+                "quality": self.quality,
+                "generation_mode": self.generation_mode,
+            }
+        }
+
+    @classmethod
+    def from_checkpoint(cls, value: Mapping[str, Any]) -> "PrototypeGenerationArtifact":
+        return cls(
+            specification=PrototypeSpecification.model_validate(value["specification"]),
+            agent_trace=list(value.get("agent_trace") or []),
+            quality=dict(value.get("quality") or {}),
+            generation_mode=str(value.get("generation_mode") or "MULTI_AGENT"),
+        )
+
+
+async def _report_prototype_progress(
+    callback: PrototypeProgressCallback | None,
+    stage: str,
+    progress_percent: int,
+    state: dict[str, Any],
+) -> None:
+    if callback:
+        await callback(stage, max(0, min(100, progress_percent)), deepcopy(state))
+
+
+def snapshot_prototype_agent_configs(db: Session) -> dict[str, dict[str, Any]]:
+    return {
+        agent.role.value: {
+            "agent_id": agent.id,
+            "name": agent.name,
+            "system_prompt": agent.system_prompt,
+            "model": agent.model,
+            "concurrency_limit": agent.concurrency_limit,
+            "prompt_version": agent.current_version,
+        }
+        for agent in db.scalars(select(Agent))
+    }
+
+
+def snapshot_prototype_requirement(requirement: Requirement | None) -> dict[str, Any] | None:
+    if requirement is None:
+        return None
+    return {
+        "id": requirement.id,
+        "title": requirement.title,
+        "content": requirement.content,
+        "analysis": requirement.analysis,
+        "updated_at": requirement.updated_at.isoformat() if requirement.updated_at else None,
+    }
+
+
+def freeze_prototype_generation_context(
+    db: Session,
+    *,
+    user_id: int,
+    project_id: int,
+    prototype_title: str,
+    requirement_id: int | None,
+) -> dict[str, Any]:
+    requirement = db.get(Requirement, requirement_id) if requirement_id else None
+    return {
+        "user_id": user_id,
+        "project_id": project_id,
+        "prototype_title": prototype_title,
+        "requirement": snapshot_prototype_requirement(requirement),
+        "agents": snapshot_prototype_agent_configs(db),
+    }
 
 
 class PrototypeReviewDecision(BaseModel):
@@ -421,6 +506,57 @@ def extract_review_decision(text: str) -> PrototypeReviewDecision | None:
     return None
 
 
+async def _invoke_frozen_agent(
+    *,
+    user_id: int,
+    project_id: int,
+    role: AgentRole,
+    agent_snapshot: Mapping[str, Any] | None,
+    fallback_prompt: str,
+    content: str,
+    json_mode: bool = False,
+    contract_only: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    response_format = {"type": "json_object"} if json_mode else None
+    frozen = dict(agent_snapshot or {})
+    agent_id = frozen.get("agent_id")
+    if not agent_id:
+        with bind_llm_usage(user_id=user_id, project_id=project_id):
+            output = await get_llm().chat(fallback_prompt, content, None, response_format)
+        return output, {
+            "role": role.value,
+            "agent_id": None,
+            "name": role.value,
+            "model": "default",
+            "output": output,
+        }
+    system_prompt = fallback_prompt if contract_only else (
+        f"{frozen.get('system_prompt', '')}\n\n"
+        "The current task output contract overrides the general role instructions.\n"
+        f"{fallback_prompt}"
+    )
+    agent_id = int(agent_id)
+    lease = await acquire_agent_slot(agent_id, max(1, int(frozen.get("concurrency_limit") or 1)))
+    try:
+        with bind_llm_usage(user_id=user_id, project_id=project_id, agent_id=agent_id):
+            output = await get_llm().chat(
+                system_prompt,
+                content,
+                str(frozen.get("model") or "") or None,
+                response_format,
+            )
+    finally:
+        await lease.release()
+    return output, {
+        "role": role.value,
+        "agent_id": agent_id,
+        "name": str(frozen.get("name") or role.value),
+        "model": str(frozen.get("model") or "default"),
+        "prompt_version": int(frozen.get("prompt_version") or 0),
+        "output": output,
+    }
+
+
 async def _invoke_agent(
     db: Session,
     user: User,
@@ -647,9 +783,7 @@ def merge_quality_decision(
 
 
 async def review_prototype_specification(
-    db: Session,
-    user: User,
-    prototype: ProductPrototype,
+    context: Mapping[str, Any],
     spec: PrototypeSpecification,
     automated: dict[str, Any],
     trace: list[dict[str, Any]],
@@ -666,13 +800,14 @@ async def review_prototype_specification(
         f"存在任何阻塞验收的问题或分数低于 {PROTOTYPE_REVIEW_MIN_SCORE} 时 passed 必须为 false。"
         "不要输出 Markdown。"
     )
-    review_output, review_trace = await _invoke_agent(
-        db,
-        user,
-        prototype.project_id,
-        AgentRole.test_engineer,
-        review_prompt,
-        json.dumps(
+    agents = context.get("agents") or {}
+    review_output, review_trace = await _invoke_frozen_agent(
+        user_id=int(context["user_id"]),
+        project_id=int(context["project_id"]),
+        role=AgentRole.test_engineer,
+        agent_snapshot=agents.get(AgentRole.test_engineer.value),
+        fallback_prompt=review_prompt,
+        content=json.dumps(
             {"specification": spec.model_dump(mode="json"), "automated_quality": automated},
             ensure_ascii=False,
         ),
@@ -688,18 +823,18 @@ async def review_prototype_specification(
 
     while reviewer is None and contract_repairs < MAX_REVIEW_CONTRACT_REPAIRS:
         contract_repairs += 1
-        normalized_output, normalized_trace = await _invoke_agent(
-            db,
-            user,
-            prototype.project_id,
-            AgentRole.test_engineer,
-            (
+        normalized_output, normalized_trace = await _invoke_frozen_agent(
+            user_id=int(context["user_id"]),
+            project_id=int(context["project_id"]),
+            role=AgentRole.test_engineer,
+            agent_snapshot=agents.get(AgentRole.test_engineer.value),
+            fallback_prompt=(
                 "你是 JSON 质量门禁归一化器。忽略其他角色说明，不重新编写测试方案。"
                 "根据自动检查和上一份评审，只输出一个 JSON 对象且只能包含："
                 "{\"passed\":boolean,\"score\":0-100,\"issues\":[string],\"summary\":string}。"
                 "不得输出 Markdown、test_strategy、测试用例或其他字段。"
             ),
-            json.dumps(
+            content=json.dumps(
                 {
                     "automated_quality": automated,
                     "previous_review": review_output[:12000],
@@ -730,34 +865,42 @@ async def review_prototype_specification(
     )
 
 
-async def generate_prototype_version(
-    db: Session,
-    user: User,
-    prototype: ProductPrototype,
+async def generate_prototype_artifact(
+    context: Mapping[str, Any],
     source_prompt: str,
-    version: int,
-) -> ProductPrototypeVersion:
-    requirement = db.get(Requirement, prototype.requirement_id) if prototype.requirement_id else None
-    context = {
-        "prototype_title": prototype.title,
+    *,
+    progress_callback: PrototypeProgressCallback | None = None,
+    resume_state: Mapping[str, Any] | None = None,
+) -> PrototypeGenerationArtifact:
+    state = deepcopy(dict(resume_state or {}))
+    if state.get("artifact"):
+        return PrototypeGenerationArtifact.from_checkpoint(state["artifact"])
+    generation_context = {
+        "prototype_title": str(context["prototype_title"]),
         "source_prompt": source_prompt,
-        "requirement": {
-            "title": requirement.title,
-            "content": requirement.content,
-            "analysis": requirement.analysis,
-        } if requirement else None,
+        "requirement": context.get("requirement"),
     }
-    trace: list[dict[str, Any]] = []
-    product_brief, product_trace = await _invoke_agent(
-        db,
-        user,
-        prototype.project_id,
-        AgentRole.product_manager,
-        "你正在生成交互原型。先定义目标用户、核心路径、界面清单、每个界面的成功条件。不要声称已实现代码。",
-        json.dumps(context, ensure_ascii=False),
-    )
-    product_trace.update({"stage": "product_definition", "round": 0})
-    trace.append(product_trace)
+    agents = context.get("agents") or {}
+    trace: list[dict[str, Any]] = list(state.get("trace") or [])
+    product_brief = str(state.get("product_brief") or "")
+    product_trace: dict[str, Any] | None = None
+    if not product_brief:
+        product_brief, product_trace = await _invoke_frozen_agent(
+            user_id=int(context["user_id"]),
+            project_id=int(context["project_id"]),
+            role=AgentRole.product_manager,
+            agent_snapshot=agents.get(AgentRole.product_manager.value),
+            fallback_prompt=(
+                "你正在生成交互原型。先定义目标用户、核心路径、界面清单、每个界面的成功条件。"
+                "不要声称已实现代码。"
+            ),
+            content=json.dumps(generation_context, ensure_ascii=False),
+        )
+    if product_trace is not None:
+        product_trace.update({"stage": "product_definition", "round": 0})
+        trace.append(product_trace)
+        state.update({"product_brief": product_brief, "trace": trace})
+        await _report_prototype_progress(progress_callback, "product_definition", 20, state)
     schema_guide = {
         "json_schema": PrototypeSpecification.model_json_schema(),
         "component_types": ["heading", "text", "input", "textarea", "select", "button", "link", "stepper", "stats", "callout", "table", "tabs", "list", "divider"],
@@ -765,35 +908,49 @@ async def generate_prototype_version(
         "layouts": ["auth", "app", "dashboard", "form", "list"],
         "rules": ["return one JSON object only", "all IDs lowercase and unique", "all form controls have labels", "navigate targets must exist", "2-12 screens"],
     }
-    architect_output, architect_trace = await _invoke_agent(
-        db,
-        user,
-        prototype.project_id,
-        AgentRole.architect,
-        (
-            "你是交互原型 DSL 编译器。把产品方案转换为安全的结构化原型，只输出一个满足用户消息中"
-            " json_schema 的 JSON 对象。顶层必须且只能使用 product_name、summary、start_screen_id、"
-            "theme、screens；不要回显 context、product_brief、schema_guide，不输出 HTML、JavaScript、"
-            "Markdown 或解释。"
-        ),
-        json.dumps(
-            {"context": context, "product_brief": product_brief, "schema_guide": schema_guide},
-            ensure_ascii=False,
-        ),
-        json_mode=True,
-        contract_only=True,
-    )
-    architect_trace.update({"stage": "architecture", "round": 0})
-    trace.append(architect_trace)
+    architect_output = str(state.get("architect_output") or "")
+    architect_trace: dict[str, Any] | None = None
+    if not architect_output:
+        architect_output, architect_trace = await _invoke_frozen_agent(
+            user_id=int(context["user_id"]),
+            project_id=int(context["project_id"]),
+            role=AgentRole.architect,
+            agent_snapshot=agents.get(AgentRole.architect.value),
+            fallback_prompt=(
+                "你是交互原型 DSL 编译器。把产品方案转换为安全的结构化原型，只输出一个满足用户消息中"
+                " json_schema 的 JSON 对象。顶层必须且只能使用 product_name、summary、start_screen_id、"
+                "theme、screens；不要回显 context、product_brief、schema_guide，不输出 HTML、JavaScript、"
+                "Markdown 或解释。"
+            ),
+            content=json.dumps(
+                {
+                    "context": generation_context,
+                    "product_brief": product_brief,
+                    "schema_guide": schema_guide,
+                },
+                ensure_ascii=False,
+            ),
+            json_mode=True,
+            contract_only=True,
+        )
+    if architect_trace is not None:
+        architect_trace.update({"stage": "architecture", "round": 0})
+        trace.append(architect_trace)
+        state.update({"architect_output": architect_output, "trace": trace})
+        await _report_prototype_progress(progress_callback, "architecture", 45, state)
     spec: PrototypeSpecification | None = None
     quality: dict[str, Any] | None = None
-    best_spec: PrototypeSpecification | None = None
-    best_quality: dict[str, Any] | None = None
-    repair_rounds = 0
-    deterministic_repairs = 0
+    best_spec = (
+        PrototypeSpecification.model_validate(state["best_specification"])
+        if state.get("best_specification")
+        else None
+    )
+    best_quality = dict(state["best_quality"]) if state.get("best_quality") else None
+    repair_rounds = int(state.get("repair_rounds") or 0)
+    deterministic_repairs = int(state.get("deterministic_repairs") or 0)
     generation_mode = "MULTI_AGENT"
 
-    for attempt in range(MAX_PROTOTYPE_REPAIR_ROUNDS + 1):
+    for attempt in range(repair_rounds, MAX_PROTOTYPE_REPAIR_ROUNDS + 1):
         spec, validation_issues = validate_prototype_specification(architect_output)
         repair_issues: list[str]
         if spec is None:
@@ -825,10 +982,23 @@ async def generate_prototype_version(
                                 "round": attempt,
                             }
                         )
+                        state.update(
+                            {
+                                "architect_output": architect_output,
+                                "trace": trace,
+                                "repair_rounds": repair_rounds,
+                                "deterministic_repairs": deterministic_repairs,
+                            }
+                        )
+                        await _report_prototype_progress(
+                            progress_callback,
+                            "deterministic_repair",
+                            min(84, 55 + attempt * 10),
+                            state,
+                        )
+            review_trace_start = len(trace)
             quality = await review_prototype_specification(
-                db,
-                user,
-                prototype,
+                context,
                 spec,
                 automated,
                 trace,
@@ -838,6 +1008,31 @@ async def generate_prototype_version(
             if best_quality is None or quality["score"] > best_quality["score"]:
                 best_spec = spec.model_copy(deep=True)
                 best_quality = deepcopy(quality)
+            state.update(
+                {
+                    "architect_output": architect_output,
+                    "trace": trace,
+                    "repair_rounds": repair_rounds,
+                    "deterministic_repairs": deterministic_repairs,
+                    "specification": spec.model_dump(mode="json"),
+                    "quality": quality,
+                    "best_specification": best_spec.model_dump(mode="json") if best_spec else None,
+                    "best_quality": best_quality,
+                }
+            )
+            if any(item.get("stage") == "quality_review_repair" for item in trace[review_trace_start:]):
+                await _report_prototype_progress(
+                    progress_callback,
+                    "quality_review_repair",
+                    min(88, 64 + attempt * 10),
+                    state,
+                )
+            await _report_prototype_progress(
+                progress_callback,
+                "quality_review",
+                min(90, 68 + attempt * 10),
+                state,
+            )
             if quality["passed"]:
                 break
             repair_issues = quality["issues"]
@@ -846,21 +1041,21 @@ async def generate_prototype_version(
             break
         repair_rounds += 1
         previous_spec = spec.model_dump(mode="json") if spec else architect_output[:20000]
-        architect_output, repair_trace = await _invoke_agent(
-            db,
-            user,
-            prototype.project_id,
-            AgentRole.architect,
-            (
+        architect_output, repair_trace = await _invoke_frozen_agent(
+            user_id=int(context["user_id"]),
+            project_id=int(context["project_id"]),
+            role=AgentRole.architect,
+            agent_snapshot=agents.get(AgentRole.architect.value),
+            fallback_prompt=(
                 "你是交互架构返修 Agent。根据确定性门禁和测试 Agent 反馈修复原型。"
                 "保留已正确的产品需求，返回完整且可独立校验的原型 DSL JSON；"
                 "顶层必须且只能使用 product_name、summary、start_screen_id、theme、screens；"
                 "严格满足用户消息中的 json_schema，不要输出 answer、context、HTML、JavaScript、"
                 "Markdown 或解释。"
             ),
-            json.dumps(
+            content=json.dumps(
                 {
-                    "context": context,
+                    "context": generation_context,
                     "product_brief": product_brief,
                     "schema_guide": schema_guide,
                     "repair_round": repair_rounds,
@@ -874,6 +1069,22 @@ async def generate_prototype_version(
         )
         repair_trace.update({"stage": "architecture_repair", "round": repair_rounds})
         trace.append(repair_trace)
+        state.update(
+            {
+                "architect_output": architect_output,
+                "trace": trace,
+                "repair_rounds": repair_rounds,
+                "deterministic_repairs": deterministic_repairs,
+                "best_specification": best_spec.model_dump(mode="json") if best_spec else None,
+                "best_quality": best_quality,
+            }
+        )
+        await _report_prototype_progress(
+            progress_callback,
+            "architecture_repair",
+            min(92, 72 + repair_rounds * 10),
+            state,
+        )
 
     if best_spec is not None and (
         spec is None
@@ -890,13 +1101,11 @@ async def generate_prototype_version(
             quality["repair_rounds"] = repair_rounds
 
     if spec is None:
-        spec = build_fallback_spec(prototype.title, source_prompt)
+        spec = build_fallback_spec(str(context["prototype_title"]), source_prompt)
         generation_mode = "MULTI_AGENT_TEMPLATE_FALLBACK"
         automated = evaluate_specification(spec)
         quality = await review_prototype_specification(
-            db,
-            user,
-            prototype,
+            context,
             spec,
             automated,
             trace,
@@ -904,6 +1113,16 @@ async def generate_prototype_version(
             fallback=True,
         )
         quality["deterministic_repairs"] = deterministic_repairs
+        state.update(
+            {
+                "trace": trace,
+                "repair_rounds": repair_rounds,
+                "deterministic_repairs": deterministic_repairs,
+                "specification": spec.model_dump(mode="json"),
+                "quality": quality,
+            }
+        )
+        await _report_prototype_progress(progress_callback, "quality_review", 90, state)
     elif quality and quality["passed"] and (repair_rounds or deterministic_repairs):
         generation_mode = "MULTI_AGENT_REPAIRED"
     elif not quality or not quality["passed"]:
@@ -911,14 +1130,39 @@ async def generate_prototype_version(
 
     if quality is None:
         raise RuntimeError("Prototype generation completed without a quality decision")
+    artifact = PrototypeGenerationArtifact(
+        specification=spec,
+        agent_trace=trace,
+        quality=quality,
+        generation_mode=generation_mode,
+    )
+    state.update(artifact.checkpoint())
+    return artifact
+
+
+async def generate_prototype_version(
+    db: Session,
+    user: User,
+    prototype: ProductPrototype,
+    source_prompt: str,
+    version: int,
+) -> ProductPrototypeVersion:
+    context = freeze_prototype_generation_context(
+        db,
+        user_id=user.id,
+        project_id=prototype.project_id,
+        prototype_title=prototype.title,
+        requirement_id=prototype.requirement_id,
+    )
+    artifact = await generate_prototype_artifact(context, source_prompt)
     item = ProductPrototypeVersion(
         prototype_id=prototype.id,
         version=version,
         source_prompt=source_prompt,
-        specification_json=spec.model_dump_json(),
-        agent_trace_json=json.dumps(trace, ensure_ascii=False),
-        quality_json=json.dumps(quality, ensure_ascii=False),
-        generation_mode=generation_mode,
+        specification_json=artifact.specification.model_dump_json(),
+        agent_trace_json=json.dumps(artifact.agent_trace, ensure_ascii=False),
+        quality_json=json.dumps(artifact.quality, ensure_ascii=False),
+        generation_mode=artifact.generation_mode,
         created_by_user_id=user.id,
     )
     db.add(item)

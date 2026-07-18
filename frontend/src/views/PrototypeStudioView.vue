@@ -19,6 +19,77 @@
       </div>
     </div>
 
+    <section
+      v-if="generationJob"
+      class="generation-job-band"
+      :class="`job-${generationJob.status.toLowerCase()}`"
+      :aria-live="generationJob.status === 'FAILED' ? 'assertive' : 'polite'"
+      :role="generationJob.status === 'FAILED' ? 'alert' : 'status'"
+    >
+      <div class="generation-job-head">
+        <div class="generation-job-title">
+          <span class="job-state-icon" aria-hidden="true">
+            <el-icon v-if="generationActive" class="is-loading"><Loading /></el-icon>
+            <el-icon v-else-if="generationJob.status === 'SUCCEEDED'"><CircleCheck /></el-icon>
+            <el-icon v-else><WarningFilled /></el-icon>
+          </span>
+          <div>
+            <strong>{{ generationHeadline }}</strong>
+            <span>{{ generationJob.title }} · {{ generationStatusLabel(generationJob.status) }}</span>
+          </div>
+        </div>
+        <div class="generation-job-actions">
+          <el-tag :type="generationStatusTag(generationJob.status)" effect="light">{{ generationJob.progress_percent }}%</el-tag>
+          <el-button
+            v-if="generationActive && canControlGenerationJob"
+            :icon="Close"
+            :loading="cancellingGeneration"
+            @click="cancelGeneration"
+          >取消任务</el-button>
+          <el-button
+            v-if="generationJob.status === 'FAILED' && generationJob.retryable && canControlGenerationJob"
+            type="primary"
+            :icon="Refresh"
+            :loading="retryingGeneration"
+            @click="retryGeneration"
+          >重试</el-button>
+          <el-button v-if="generationTerminal" :icon="Close" @click="dismissGenerationJob">隐藏</el-button>
+        </div>
+      </div>
+
+      <el-progress
+        :percentage="generationJob.progress_percent"
+        :status="generationProgressStatus"
+        :stroke-width="8"
+        :show-text="false"
+      />
+
+      <div class="generation-job-current">
+        <div>
+          <strong>{{ generationStageLabel(generationJob.stage, currentGenerationStage?.round) }}</strong>
+          <span>{{ generationJob.error_message ? generationStatusDescription : (currentGenerationStage?.message || generationStatusDescription) }}</span>
+        </div>
+        <span>第 {{ generationJob.attempt_count || 1 }} / {{ generationJob.max_attempts }} 次尝试</span>
+      </div>
+
+      <div v-if="generationConnectionNotice" class="generation-connection-notice">
+        <el-icon><Connection /></el-icon>
+        <span>{{ generationConnectionNotice }}</span>
+      </div>
+      <p v-if="generationJob.error_message" class="generation-job-error">{{ generationJob.error_message }}</p>
+
+      <details v-if="generationJob.stage_history.length" class="generation-stage-history">
+        <summary>查看 Agent 执行记录（{{ generationJob.stage_history.length }}）</summary>
+        <ol>
+          <li v-for="(stage, index) in generationJob.stage_history" :key="`${stage.stage}-${stage.round || 0}-${index}`" :class="`stage-${stage.status.toLowerCase()}`">
+            <span class="stage-marker" aria-hidden="true"><el-icon><CircleCheck v-if="stage.status === 'COMPLETED'" /><Loading v-else-if="stage.status === 'RUNNING'" /><CircleClose v-else-if="stage.status === 'FAILED'" /><Clock v-else /></el-icon></span>
+            <div><strong>{{ generationStageLabel(stage.stage, stage.round) }}</strong><span>{{ stage.message || generationStageRoleLabel(stage.agent_role) }}</span></div>
+            <small>{{ stage.finished_at ? formatDate(stage.finished_at) : stage.started_at ? formatDate(stage.started_at) : '' }}</small>
+          </li>
+        </ol>
+      </details>
+    </section>
+
     <div v-loading="loadingCatalog" class="studio-content">
       <div v-if="!loadingCatalog && !activePrototype" class="studio-empty">
         <el-empty :description="projects.length ? '还没有产品原型' : '请先创建一个项目'">
@@ -210,7 +281,7 @@
       </template>
     </div>
 
-    <el-dialog v-model="createDialog" title="生成产品原型" width="min(620px, 94vw)" :close-on-click-modal="!creating" :close-on-press-escape="!creating" :show-close="!creating">
+    <el-dialog v-model="createDialog" title="生成产品原型" width="min(620px, 94vw)">
       <el-form label-position="top">
         <div class="form-grid-two">
           <el-form-item label="所属项目" required>
@@ -231,17 +302,13 @@
           <el-input v-model="createForm.prompt" type="textarea" :rows="7" maxlength="12000" show-word-limit placeholder="描述目标用户、业务目标、关键页面、核心流程和验收要求" />
         </el-form-item>
       </el-form>
-      <div v-if="creating" class="generation-status" role="status">
-        <el-icon class="is-loading"><Loading /></el-icon>
-        <div><strong>Agent 团队正在生成原型</strong><span>产品经理整理路径，架构师构建交互，测试工程师执行质量门禁。</span></div>
-      </div>
       <template #footer>
-        <el-button :disabled="creating" @click="createDialog = false">取消</el-button>
-        <el-button type="primary" :icon="MagicStick" :loading="creating" :disabled="!canSubmitCreate" @click="generatePrototype">{{ creating ? '生成中' : '开始生成' }}</el-button>
+        <el-button @click="createDialog = false">取消</el-button>
+        <el-button type="primary" :icon="MagicStick" :loading="creating" :disabled="!canSubmitCreate" @click="generatePrototype">{{ creating ? '正在提交' : '开始生成' }}</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="regenerateDialog" title="重新生成原型" width="min(560px, 94vw)" :close-on-click-modal="!regenerating" :show-close="!regenerating">
+    <el-dialog v-model="regenerateDialog" title="重新生成原型" width="min(560px, 94vw)">
       <el-form label-position="top">
         <el-form-item label="本轮修改意见">
           <el-input v-model="regenerateFeedback" type="textarea" :rows="6" maxlength="4000" show-word-limit placeholder="例如：增加邀请奖励状态，并将移动端首要操作固定在底部" />
@@ -249,8 +316,8 @@
       </el-form>
       <div class="regenerate-note"><el-icon><InfoFilled /></el-icon><span>当前版本会保留，新结果将创建为独立版本。</span></div>
       <template #footer>
-        <el-button :disabled="regenerating" @click="regenerateDialog = false">取消</el-button>
-        <el-button type="primary" :icon="Refresh" :loading="regenerating" @click="regeneratePrototype">生成新版本</el-button>
+        <el-button @click="regenerateDialog = false">取消</el-button>
+        <el-button type="primary" :icon="Refresh" :loading="regenerating" @click="regeneratePrototype">{{ regenerating ? '正在提交' : '生成新版本' }}</el-button>
       </template>
     </el-dialog>
 
@@ -285,7 +352,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowRight,
@@ -293,6 +360,8 @@ import {
   CircleCheck,
   CircleClose,
   Clock,
+  Close,
+  Connection,
   Delete,
   Document,
   Download,
@@ -309,17 +378,19 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
-import { api } from '../api/client'
+import { api, apiBaseURL } from '../api/client'
 import type {
   ProductPrototype,
   ProductPrototypeDetail,
   Project,
+  PrototypeGenerationJob,
   PrototypeMaterialization,
   PrototypeReviewComment,
   PrototypeScreen,
   Requirement
 } from '../api/types'
 import PrototypeCanvas from '../components/PrototypeCanvas.vue'
+import { usePrototypeGenerationStream } from '../composables/usePrototypeGenerationStream'
 import { useAuthStore } from '../stores/auth'
 import { confirmDestructiveAction } from '../utils/confirm'
 
@@ -357,6 +428,11 @@ const materialization = ref<PrototypeMaterialization | null>(null)
 const materializationDialog = ref(false)
 const canvasSession = ref(0)
 const lastInteraction = ref('')
+const cancellingGeneration = ref(false)
+const retryingGeneration = ref(false)
+const generationConnectionDetail = ref('')
+const jobAutoOpen = ref(true)
+const handledSuccessfulJobId = ref<number | null>(null)
 const prototypeStatuses: PrototypeStatus[] = ['DRAFT', 'REVIEW', 'APPROVED', 'ARCHIVED']
 const deviceOptions = [
   { label: '桌面', value: 'desktop' },
@@ -393,6 +469,71 @@ const qualityColor = computed(() => {
   return '#b91c1c'
 })
 
+const {
+  job: generationJob,
+  connectionState: generationConnectionState,
+  start: startGenerationStream,
+  clear: clearGenerationStream,
+  dispose: disposeGenerationStream
+} = usePrototypeGenerationStream({
+  onJob: handleGenerationJob,
+  onConnectionState: (state, detail) => {
+    generationConnectionDetail.value = state === 'reconnecting' && detail?.retryInMs
+      ? `${Math.max(1, Math.ceil(detail.retryInMs / 1000))} 秒后重连`
+      : ''
+  }
+})
+
+const generationActive = computed(() => Boolean(
+  generationJob.value && ['QUEUED', 'RUNNING', 'CANCELLING'].includes(generationJob.value.status)
+))
+const generationTerminal = computed(() => Boolean(
+  generationJob.value && ['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(generationJob.value.status)
+))
+const canControlGenerationJob = computed(() => Boolean(
+  generationJob.value
+  && canCreate.value
+  && writableProjects.value.some((project) => project.id === generationJob.value?.project_id)
+))
+const currentGenerationStage = computed(() => {
+  const stages = generationJob.value?.stage_history || []
+  return [...stages].reverse().find((stage) => stage.status === 'RUNNING') || stages[stages.length - 1]
+})
+const generationProgressStatus = computed<'success' | 'exception' | 'warning' | undefined>(() => {
+  if (generationJob.value?.status === 'SUCCEEDED') return 'success'
+  if (generationJob.value?.status === 'FAILED') return 'exception'
+  if (generationJob.value?.status === 'CANCELLED') return 'warning'
+  return undefined
+})
+const generationConnectionNotice = computed(() => {
+  if (!generationActive.value) return ''
+  if (generationConnectionState.value === 'reconnecting') {
+    return `进度连接已中断，任务仍在后台运行。${generationConnectionDetail.value}`
+  }
+  if (generationConnectionState.value === 'connecting' || generationConnectionState.value === 'loading_snapshot') {
+    return '正在连接后台任务，生成不会因刷新页面而中断。'
+  }
+  return ''
+})
+const generationStatusDescription = computed(() => {
+  if (generationJob.value?.status === 'QUEUED') return '任务已进入队列，正在等待可用的 Agent 执行资源。'
+  if (generationJob.value?.status === 'CANCELLING') return '取消请求已收到，当前 Agent 步骤结束后将安全停止。'
+  if (generationJob.value?.status === 'SUCCEEDED') return '原型已通过多 Agent 生成与质量门禁。'
+  if (generationJob.value?.status === 'FAILED') return '后台任务执行失败，可查看原因并重试。'
+  if (generationJob.value?.status === 'CANCELLED') return '任务已取消，未发布不完整的原型版本。'
+  return '产品经理、交互架构师和测试工程师正在协同执行。'
+})
+const generationHeadline = computed(() => {
+  if (!generationJob.value) return ''
+  if (generationJob.value.status === 'SUCCEEDED') {
+    return generationJob.value.operation === 'CREATE' ? '产品原型已生成' : '新版本已生成'
+  }
+  if (generationJob.value.status === 'FAILED') return '原型生成失败'
+  if (generationJob.value.status === 'CANCELLED') return '原型生成已取消'
+  if (generationJob.value.status === 'CANCELLING') return '正在安全取消原型生成'
+  return generationJob.value.operation === 'CREATE' ? 'AI 团队正在生成产品原型' : 'AI 团队正在生成新版本'
+})
+
 function summaryFromDetail(detail: ProductPrototypeDetail): ProductPrototype {
   return {
     id: detail.id,
@@ -424,13 +565,76 @@ async function loadReviewComments(prototypeId: number, version: number) {
   reviewComments.value = data
 }
 
+function generationJobUrls(jobId: number) {
+  const snapshotUrl = `${apiBaseURL}/prototypes/generation-jobs/${jobId}`
+  return { snapshotUrl, eventsUrl: `${snapshotUrl}/events` }
+}
+
+function newRequestId() {
+  return globalThis.crypto?.randomUUID?.() || `prototype-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+async function showGenerationJob(job: PrototypeGenerationJob, autoOpen = true) {
+  jobAutoOpen.value = autoOpen
+  if (job.status !== 'SUCCEEDED') handledSuccessfulJobId.value = null
+  await startGenerationStream({ ...generationJobUrls(job.job_id), initialSnapshot: job })
+  if (String(route.query.generation_job || '') !== String(job.job_id)) {
+    await router.replace({ query: { ...route.query, generation_job: String(job.job_id) } })
+  }
+}
+
+async function refreshPrototypeCatalog() {
+  const { data } = await api.get<ProductPrototype[]>('/prototypes')
+  prototypes.value = data
+}
+
+async function finishGenerationJob(job: PrototypeGenerationJob) {
+  if (!job.result_prototype_id) return
+  await refreshPrototypeCatalog()
+  const stillFocused = jobAutoOpen.value && generationJob.value?.job_id === job.job_id
+  if (stillFocused) {
+    await openPrototype(job.result_prototype_id)
+    if (job.operation === 'REGENERATE') inspectorTab.value = 'versions'
+  }
+  ElMessage.success(job.operation === 'CREATE'
+    ? '可交互原型已在后台生成完成'
+    : `原型 v${job.result_version || ''} 已生成`)
+}
+
+function handleGenerationJob(job: PrototypeGenerationJob) {
+  if (job.status !== 'SUCCEEDED' || handledSuccessfulJobId.value === job.job_id) return
+  handledSuccessfulJobId.value = job.job_id
+  void finishGenerationJob(job)
+}
+
+async function resumeGenerationJob(queryJobId: number | null, activeJobs: PrototypeGenerationJob[]) {
+  let job = activeJobs[0]
+  if (queryJobId) {
+    try {
+      const { data } = await api.get<PrototypeGenerationJob>(`/prototypes/generation-jobs/${queryJobId}`, {
+        suppressErrorToast: true
+      })
+      job = data
+    } catch {
+      const query = { ...route.query }
+      delete query.generation_job
+      await router.replace({ query })
+    }
+  }
+  if (job) await showGenerationJob(job, true)
+}
+
 async function loadCatalog() {
   loadingCatalog.value = true
   try {
-    const [prototypeResponse, projectResponse, requirementResponse] = await Promise.all([
+    const [prototypeResponse, projectResponse, requirementResponse, generationResponse] = await Promise.all([
       api.get<ProductPrototype[]>('/prototypes'),
       api.get<Project[]>('/projects'),
-      api.get<Requirement[]>('/requirements')
+      api.get<Requirement[]>('/requirements'),
+      api.get<PrototypeGenerationJob[]>('/prototypes/generation-jobs', {
+        params: { active: true },
+        suppressErrorToast: true
+      }).catch(() => ({ data: [] as PrototypeGenerationJob[] }))
     ])
     prototypes.value = prototypeResponse.data
     projects.value = projectResponse.data
@@ -438,6 +642,7 @@ async function loadCatalog() {
     const queryId = Number(route.query.prototype)
     const initialId = prototypes.value.some((item) => item.id === queryId) ? queryId : prototypes.value[0]?.id
     if (initialId) await openPrototype(initialId)
+    await resumeGenerationJob(Number(route.query.generation_job) || null, generationResponse.data)
   } finally {
     loadingCatalog.value = false
   }
@@ -468,7 +673,10 @@ async function openPrototype(id: number, syncRoute = true) {
 
 function selectPrototype(value: unknown) {
   const id = Number(value)
-  if (id && id !== activePrototype.value?.id) void openPrototype(id)
+  if (id && id !== activePrototype.value?.id) {
+    jobAutoOpen.value = false
+    void openPrototype(id)
+  }
 }
 
 function navigateScreen(screenId: string) {
@@ -521,24 +729,16 @@ async function generatePrototype() {
   if (!canSubmitCreate.value || !createForm.project_id) return
   creating.value = true
   try {
-    const { data } = await api.post<ProductPrototypeDetail>('/prototypes/generate', {
+    const { data } = await api.post<PrototypeGenerationJob>('/prototypes/generation-jobs', {
+      request_id: newRequestId(),
       project_id: createForm.project_id,
       requirement_id: createForm.requirement_id,
       title: createForm.title.trim(),
       prompt: createForm.prompt.trim()
     })
-    activePrototype.value = data
-    mergePrototypeSummary(data)
-    selectedPrototypeId.value = data.id
-    activeScreenId.value = data.current.specification.start_screen_id
-    commentScreenId.value = activeScreenId.value
-    reviewComments.value = []
-    materialization.value = null
-    screenHistory.value = []
-    canvasSession.value += 1
     createDialog.value = false
-    await router.replace({ query: { ...route.query, prototype: String(data.id) } })
-    ElMessage.success('可交互原型已生成')
+    await showGenerationJob(data, true)
+    ElMessage.success('生成任务已进入后台队列')
   } finally {
     creating.value = false
   }
@@ -553,23 +753,51 @@ async function regeneratePrototype() {
   if (!activePrototype.value) return
   regenerating.value = true
   try {
-    const { data } = await api.post<ProductPrototypeDetail>(`/prototypes/${activePrototype.value.id}/regenerate`, {
+    const { data } = await api.post<PrototypeGenerationJob>(`/prototypes/${activePrototype.value.id}/generation-jobs`, {
+      request_id: newRequestId(),
       feedback: regenerateFeedback.value.trim()
     })
-    activePrototype.value = data
-    mergePrototypeSummary(data)
-    activeScreenId.value = data.current.specification.start_screen_id
-    commentScreenId.value = activeScreenId.value
-    screenHistory.value = []
-    canvasSession.value += 1
-    materialization.value = null
-    await loadReviewComments(data.id, data.active_version)
     regenerateDialog.value = false
-    inspectorTab.value = 'versions'
-    ElMessage.success(`原型 v${data.active_version} 已生成`)
+    await showGenerationJob(data, true)
+    ElMessage.success('新版本生成任务已进入后台队列')
   } finally {
     regenerating.value = false
   }
+}
+
+async function cancelGeneration() {
+  if (!generationJob.value || !generationActive.value) return
+  cancellingGeneration.value = true
+  try {
+    const { data } = await api.post<PrototypeGenerationJob>(
+      `/prototypes/generation-jobs/${generationJob.value.job_id}/cancel`
+    )
+    await showGenerationJob(data, jobAutoOpen.value)
+  } finally {
+    cancellingGeneration.value = false
+  }
+}
+
+async function retryGeneration() {
+  if (!generationJob.value || !generationJob.value.retryable) return
+  retryingGeneration.value = true
+  try {
+    const { data } = await api.post<PrototypeGenerationJob>(
+      `/prototypes/generation-jobs/${generationJob.value.job_id}/retry`
+    )
+    handledSuccessfulJobId.value = null
+    await showGenerationJob(data, true)
+    ElMessage.success('任务已重新进入队列')
+  } finally {
+    retryingGeneration.value = false
+  }
+}
+
+async function dismissGenerationJob() {
+  clearGenerationStream()
+  const query = { ...route.query }
+  delete query.generation_job
+  await router.replace({ query })
 }
 
 async function updateStatus(value: unknown) {
@@ -730,7 +958,42 @@ function traceStageLabel(stage?: string, round = 0, fallback = false) {
   if (stage === 'quality_review') return round ? `第 ${round} 轮复审` : '首次评审'
   if (stage === 'product_definition') return '产品定义'
   if (stage === 'architecture') return '首次生成'
+  if (stage === 'queued') return '等待执行'
+  if (stage === 'persisting') return '发布原型版本'
+  if (stage === 'completed') return '生成完成'
+  if (stage === 'failed') return '执行失败'
+  if (stage === 'cancelled') return '任务已取消'
   return '协作执行'
+}
+
+function generationStageLabel(stage?: string, round = 0) {
+  return traceStageLabel(stage, round)
+}
+
+function generationStageRoleLabel(role?: string | null) {
+  return role ? `${roleLabel(role)} Agent` : '多 Agent 编排器'
+}
+
+function generationStatusLabel(status: PrototypeGenerationJob['status']) {
+  return {
+    QUEUED: '等待执行',
+    RUNNING: '执行中',
+    SUCCEEDED: '已完成',
+    FAILED: '执行失败',
+    CANCELLING: '正在取消',
+    CANCELLED: '已取消'
+  }[status]
+}
+
+function generationStatusTag(status: PrototypeGenerationJob['status']) {
+  return {
+    QUEUED: 'info',
+    RUNNING: 'primary',
+    SUCCEEDED: 'success',
+    FAILED: 'danger',
+    CANCELLING: 'warning',
+    CANCELLED: 'warning'
+  }[status] as 'success' | 'warning' | 'info' | 'primary' | 'danger'
 }
 
 function generationModeLabel(mode: string) {
@@ -749,7 +1012,17 @@ watch(() => route.query.prototype, (value) => {
   }
 })
 
+watch(() => route.query.generation_job, (value) => {
+  const jobId = Number(value)
+  if (jobId && jobId !== generationJob.value?.job_id) {
+    jobAutoOpen.value = true
+    handledSuccessfulJobId.value = null
+    void startGenerationStream(generationJobUrls(jobId))
+  }
+})
+
 onMounted(loadCatalog)
+onBeforeUnmount(disposeGenerationStream)
 </script>
 
 <style scoped>
@@ -759,6 +1032,209 @@ onMounted(loadCatalog)
 
 .studio-page-head {
   margin-bottom: 16px;
+}
+
+.generation-job-band {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 16px 18px;
+  border: 1px solid #bfdbfe;
+  border-left: 4px solid var(--color-primary);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.generation-job-band.job-succeeded {
+  border-color: #bbf7d0;
+  border-left-color: var(--color-success);
+}
+
+.generation-job-band.job-failed {
+  border-color: #fecaca;
+  border-left-color: var(--color-danger);
+}
+
+.generation-job-band.job-cancelled,
+.generation-job-band.job-cancelling {
+  border-color: #fed7aa;
+  border-left-color: var(--color-warning);
+}
+
+.generation-job-head,
+.generation-job-title,
+.generation-job-actions,
+.generation-job-current,
+.generation-connection-notice {
+  display: flex;
+  align-items: center;
+}
+
+.generation-job-head,
+.generation-job-current {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.generation-job-title {
+  min-width: 0;
+  gap: 10px;
+}
+
+.generation-job-title > div,
+.generation-job-current > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.generation-job-title strong {
+  font-size: 14px;
+}
+
+.generation-job-title span,
+.generation-job-current span,
+.generation-connection-notice,
+.generation-job-error {
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.job-state-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border-radius: var(--radius-md);
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  font-size: 18px;
+}
+
+.job-succeeded .job-state-icon {
+  background: #f0fdf4;
+  color: var(--color-success);
+}
+
+.job-failed .job-state-icon {
+  background: #fef2f2;
+  color: var(--color-danger);
+}
+
+.generation-job-actions {
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.generation-job-current strong {
+  font-size: 12px;
+}
+
+.generation-job-current > span {
+  flex: 0 0 auto;
+  color: var(--color-muted-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.generation-connection-notice {
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.generation-job-error {
+  margin: 0;
+  padding: 9px 11px;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius-md);
+  background: #fef2f2;
+  color: var(--color-danger);
+}
+
+.generation-stage-history {
+  border-top: 1px solid var(--color-border);
+  padding-top: 10px;
+}
+
+.generation-stage-history summary {
+  display: flex;
+  width: fit-content;
+  min-height: 44px;
+  align-items: center;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.generation-stage-history ol {
+  display: grid;
+  gap: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.generation-stage-history li {
+  display: grid;
+  min-height: 42px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.generation-stage-history li:last-child {
+  border-bottom: 0;
+}
+
+.stage-marker {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--color-surface-subtle);
+  color: var(--color-muted-text);
+}
+
+.stage-completed .stage-marker {
+  background: #f0fdf4;
+  color: var(--color-success);
+}
+
+.stage-running .stage-marker {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.stage-failed .stage-marker {
+  background: #fef2f2;
+  color: var(--color-danger);
+}
+
+.generation-stage-history li > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.generation-stage-history strong {
+  font-size: 11px;
+}
+
+.generation-stage-history span,
+.generation-stage-history small {
+  color: var(--color-muted-text);
+  font-size: 10px;
+}
+
+.generation-stage-history small {
+  font-variant-numeric: tabular-nums;
 }
 
 .studio-head-actions,
@@ -1443,7 +1919,6 @@ onMounted(loadCatalog)
   gap: 12px;
 }
 
-.generation-status,
 .regenerate-note {
   display: flex;
   align-items: flex-start;
@@ -1454,16 +1929,6 @@ onMounted(loadCatalog)
   color: #1d4ed8;
 }
 
-.generation-status > div {
-  display: grid;
-  gap: 3px;
-}
-
-.generation-status strong {
-  font-size: 12px;
-}
-
-.generation-status span,
 .regenerate-note span {
   color: var(--color-secondary-text);
   font-size: 11px;
@@ -1513,6 +1978,40 @@ onMounted(loadCatalog)
 
   .prototype-switcher {
     width: 100%;
+  }
+
+  .generation-job-band {
+    padding: 14px 12px;
+  }
+
+  .generation-job-head,
+  .generation-job-current {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .generation-job-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .generation-job-actions .el-button {
+    min-height: 44px;
+    flex: 1;
+  }
+
+  .generation-job-actions .el-tag {
+    min-height: 32px;
+  }
+
+  .generation-stage-history li {
+    min-height: 54px;
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .generation-stage-history small {
+    grid-column: 2;
   }
 
   .studio-head-actions > .el-button,

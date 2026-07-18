@@ -557,6 +557,65 @@ export interface ProductPrototypeDetail extends ProductPrototype {
   versions: PrototypeVersion[]
 }
 
+export type PrototypeGenerationOperation = 'CREATE' | 'REGENERATE'
+
+export type PrototypeGenerationJobStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLING'
+  | 'CANCELLED'
+
+export type PrototypeGenerationStageName =
+  | 'queued'
+  | 'product_definition'
+  | 'architecture'
+  | 'architecture_repair'
+  | 'deterministic_repair'
+  | 'quality_review'
+  | 'quality_review_repair'
+  | 'persisting'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export interface PrototypeGenerationStage {
+  stage: PrototypeGenerationStageName
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+  round?: number
+  agent_role?: string | null
+  message?: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface PrototypeGenerationJob {
+  job_id: number
+  operation: PrototypeGenerationOperation
+  project_id: number
+  title: string
+  prototype_id?: number | null
+  base_version?: number | null
+  target_version?: number | null
+  status: PrototypeGenerationJobStatus
+  stage: PrototypeGenerationStageName
+  stage_history: PrototypeGenerationStage[]
+  progress_percent: number
+  attempt_count: number
+  max_attempts: number
+  latest_event_id: number
+  retryable: boolean
+  error_code: string | null
+  error_message: string | null
+  result_prototype_id: number | null
+  result_version: number | null
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  updated_at: string
+}
+
 export interface PrototypeReviewComment {
   id: number
   prototype_id: number

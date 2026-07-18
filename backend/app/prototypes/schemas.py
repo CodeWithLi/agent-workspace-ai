@@ -129,6 +129,50 @@ class PrototypeRegenerateRequest(BaseModel):
     feedback: str = Field(default="", max_length=4000)
 
 
+class PrototypeGenerationCreateRequest(PrototypeGenerateRequest):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class PrototypeGenerationRegenerateRequest(PrototypeRegenerateRequest):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class PrototypeGenerationStageOut(BaseModel):
+    stage: str
+    status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
+    round: int = Field(default=0, ge=0)
+    agent_role: str | None = None
+    message: str = ""
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class PrototypeGenerationJobOut(BaseModel):
+    job_id: int
+    operation: Literal["CREATE", "REGENERATE"]
+    project_id: int
+    title: str
+    prototype_id: int | None
+    base_version: int | None
+    target_version: int
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLING", "CANCELLED"]
+    stage: str
+    stage_history: list[PrototypeGenerationStageOut]
+    progress_percent: int = Field(ge=0, le=100)
+    attempt_count: int = Field(ge=0)
+    max_attempts: int = Field(ge=1)
+    latest_event_id: int
+    retryable: bool
+    error_code: str | None
+    error_message: str | None
+    result_prototype_id: int | None
+    result_version: int | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    updated_at: datetime
+
+
 class PrototypeUpdateRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     summary: str | None = Field(default=None, max_length=2000)

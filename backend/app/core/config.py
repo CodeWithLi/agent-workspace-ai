@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     workflow_lease_seconds: int = Field(default=900, ge=60, le=7200)
     workflow_max_attempts: int = Field(default=2, ge=1, le=10)
     workflow_compensation_max_attempts: int = Field(default=3, ge=1, le=10)
+    prototype_generation_worker_enabled: bool = True
+    prototype_generation_poll_seconds: int = Field(default=1, ge=1, le=60)
+    prototype_generation_lease_seconds: int = Field(default=300, ge=60, le=3600)
+    prototype_generation_max_attempts: int = Field(default=3, ge=1, le=10)
+    prototype_generation_retry_base_seconds: int = Field(default=5, ge=1, le=300)
+    prototype_generation_retry_max_seconds: int = Field(default=300, ge=5, le=3600)
+    prototype_generation_shutdown_grace_seconds: int = Field(default=15, ge=1, le=300)
 
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
@@ -135,6 +142,8 @@ class Settings(BaseSettings):
             raise ValueError("RAG chunk strategy must be structural or semantic")
         if self.rag_parser_backend not in {"native", "auto", "docling"}:
             raise ValueError("RAG parser backend must be native, auto or docling")
+        if self.prototype_generation_retry_max_seconds < self.prototype_generation_retry_base_seconds:
+            raise ValueError("Prototype generation retry maximum must not be smaller than its base delay")
         if self.environment == "production":
             if self.secret_key in {"change-me-in-production", "please-change-this-secret"} or len(self.secret_key) < 32:
                 raise ValueError("Production SECRET_KEY must be unique and at least 32 characters")

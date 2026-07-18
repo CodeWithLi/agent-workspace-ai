@@ -20,6 +20,22 @@ HTTP_IN_PROGRESS = Gauge(
 WORKFLOW_QUEUE = Gauge("agent_workspace_workflow_queue", "Workflows by status", ("status",))
 KNOWLEDGE_QUEUE = Gauge("agent_workspace_knowledge_queue", "Knowledge documents by status", ("status",))
 NOTIFICATION_QUEUE = Gauge("agent_workspace_notification_queue", "Notifications by status", ("status",))
+PROTOTYPE_GENERATION_QUEUE = Gauge(
+    "agent_workspace_prototype_generation_queue",
+    "Prototype generation jobs by status",
+    ("status",),
+)
+PROTOTYPE_GENERATION_EVENTS = Counter(
+    "agent_workspace_prototype_generation_events_total",
+    "Prototype generation events by type",
+    ("event_type",),
+)
+PROTOTYPE_GENERATION_DURATION = Histogram(
+    "agent_workspace_prototype_generation_duration_seconds",
+    "Prototype generation duration by operation and terminal status",
+    ("operation", "status"),
+    buckets=(1, 5, 15, 30, 60, 90, 120, 180, 300, 600, 1200),
+)
 SAGA_STEPS = Counter(
     "agent_workspace_saga_step_transitions_total",
     "Durable Saga step state transitions",

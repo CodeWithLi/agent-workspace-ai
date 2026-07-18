@@ -5,7 +5,19 @@ from sqlalchemy.orm import Session
 from app.api.deps import ensure_permission, get_current_user
 from app.core.database import get_db
 from app.core.audit import record_audit
-from app.models import AuditLog, Project, ProjectMember, ProjectMemberRole, Task, TaskComment, User, WorkflowRun, WorkflowStatus
+from app.models import (
+    AuditLog,
+    Project,
+    ProjectMember,
+    ProjectMemberRole,
+    PrototypeGenerationJob,
+    PrototypeGenerationStatus,
+    Task,
+    TaskComment,
+    User,
+    WorkflowRun,
+    WorkflowStatus,
+)
 from app.schemas import (
     ProjectCreate,
     ProjectMemberCreate,
@@ -164,6 +176,23 @@ def delete_project(
     )
     if active:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cancel the active workflow before deleting the project")
+    active_prototype_job = db.scalar(
+        select(PrototypeGenerationJob.id).where(
+            PrototypeGenerationJob.project_id == project.id,
+            PrototypeGenerationJob.status.in_(
+                {
+                    PrototypeGenerationStatus.queued,
+                    PrototypeGenerationStatus.running,
+                    PrototypeGenerationStatus.cancelling,
+                }
+            ),
+        )
+    )
+    if active_prototype_job:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cancel the active prototype generation job before deleting the project",
+        )
     record_audit(db, "project.delete", current_user.id, project.id, "project", project.id, request=request)
     db.delete(project)
     db.commit()

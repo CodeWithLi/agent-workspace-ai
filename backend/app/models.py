@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum as SqlEnum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -56,6 +56,20 @@ class SagaStepStatus(str, Enum):
     compensating = "COMPENSATING"
     compensated = "COMPENSATED"
     compensation_failed = "COMPENSATION_FAILED"
+
+
+class PrototypeGenerationOperation(str, Enum):
+    create = "CREATE"
+    regenerate = "REGENERATE"
+
+
+class PrototypeGenerationStatus(str, Enum):
+    queued = "QUEUED"
+    running = "RUNNING"
+    succeeded = "SUCCEEDED"
+    failed = "FAILED"
+    cancelling = "CANCELLING"
+    cancelled = "CANCELLED"
 
 
 class User(Base):
@@ -206,6 +220,101 @@ class ProductPrototypeVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     prototype: Mapped[ProductPrototype] = relationship(back_populates="versions")
+
+
+class PrototypeGenerationJob(Base):
+    __tablename__ = "prototype_generation_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "progress_percent >= 0 AND progress_percent <= 100",
+            name="ck_prototype_generation_progress_percent",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_prototype_generation_attempt_count"),
+        CheckConstraint("max_attempts > 0", name="ck_prototype_generation_max_attempts"),
+        CheckConstraint("target_version > 0", name="ck_prototype_generation_target_version"),
+        Index("ix_prototype_generation_jobs_queue", "status", "next_attempt_at", "created_at"),
+        Index(
+            "uq_prototype_generation_active_target_version",
+            "prototype_id",
+            "target_version",
+            unique=True,
+            postgresql_where=text(
+                "prototype_id IS NOT NULL AND status IN ('QUEUED','RUNNING','CANCELLING')"
+            ),
+            sqlite_where=text(
+                "prototype_id IS NOT NULL AND status IN ('QUEUED','RUNNING','CANCELLING')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    request_payload_hash: Mapped[str] = mapped_column(String(64))
+    operation: Mapped[PrototypeGenerationOperation] = mapped_column(
+        SqlEnum(
+            PrototypeGenerationOperation,
+            values_callable=lambda enum: [item.value for item in enum],
+            native_enum=False,
+        ),
+        index=True,
+    )
+    status: Mapped[PrototypeGenerationStatus] = mapped_column(
+        SqlEnum(
+            PrototypeGenerationStatus,
+            values_callable=lambda enum: [item.value for item in enum],
+            native_enum=False,
+        ),
+        default=PrototypeGenerationStatus.queued,
+        index=True,
+    )
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    requirement_id: Mapped[int | None] = mapped_column(ForeignKey("requirements.id", ondelete="SET NULL"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    prototype_id: Mapped[int | None] = mapped_column(ForeignKey("product_prototypes.id", ondelete="SET NULL"), index=True)
+    base_version: Mapped[int | None] = mapped_column(Integer)
+    target_version: Mapped[int] = mapped_column(Integer, default=1)
+    title: Mapped[str] = mapped_column(String(200))
+    source_prompt: Mapped[str] = mapped_column(Text)
+    requirement_snapshot_json: Mapped[str] = mapped_column(Text, default="null")
+    agent_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    state_json: Mapped[str] = mapped_column(Text, default="{}")
+    stage: Mapped[str] = mapped_column(String(100), default="queued")
+    stage_history_json: Mapped[str] = mapped_column(Text, default="[]")
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    latest_event_id: Mapped[int | None] = mapped_column(Integer)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result_prototype_id: Mapped[int | None] = mapped_column(ForeignKey("product_prototypes.id", ondelete="SET NULL"), index=True)
+    result_version: Mapped[int | None] = mapped_column(Integer)
+    result_version_id: Mapped[int | None] = mapped_column(ForeignKey("product_prototype_versions.id", ondelete="SET NULL"), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    events: Mapped[list["PrototypeGenerationEvent"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class PrototypeGenerationEvent(Base):
+    __tablename__ = "prototype_generation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("prototype_generation_jobs.id", ondelete="CASCADE"), index=True)
+    stage: Mapped[str] = mapped_column(String(100), default="")
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    message: Mapped[str] = mapped_column(String(500), default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    job: Mapped[PrototypeGenerationJob] = relationship(back_populates="events")
 
 
 class PrototypeReviewComment(Base):

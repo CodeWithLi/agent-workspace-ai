@@ -318,6 +318,96 @@ async function mockApi(page: Page) {
     updated_at: '2026-07-17T00:00:00Z'
   }))
   let mockPrototypes = [prototypeDetail()]
+  type MockGenerationJob = {
+    job_id: number
+    operation: 'CREATE' | 'REGENERATE'
+    project_id: number
+    prototype_id: number | null
+    base_version: number | null
+    target_version: number
+    title: string
+    status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLING' | 'CANCELLED'
+    stage: string
+    stage_history: Array<Record<string, unknown>>
+    progress_percent: number
+    attempt_count: number
+    max_attempts: number
+    latest_event_id: number
+    retryable: boolean
+    error_code: string | null
+    error_message: string | null
+    result_prototype_id: number | null
+    result_version: number | null
+    created_at: string
+    updated_at: string
+  }
+  let nextGenerationJobId = 700
+  const mockGenerationJobs = new Map<number, MockGenerationJob>()
+  const generationStreamAttempts = new Map<number, number>()
+
+  function generationJob(
+    operation: MockGenerationJob['operation'],
+    title: string,
+    prototypeId: number | null = null
+  ): MockGenerationJob {
+    const detail = prototypeId ? mockPrototypes.find((item) => item.id === prototypeId) : null
+    const job: MockGenerationJob = {
+      job_id: nextGenerationJobId++,
+      operation,
+      project_id: detail?.project_id || 1,
+      prototype_id: prototypeId,
+      base_version: detail?.active_version || null,
+      target_version: operation === 'CREATE' ? 1 : (detail?.active_version || 0) + 1,
+      title,
+      status: 'QUEUED',
+      stage: 'queued',
+      stage_history: [],
+      progress_percent: 0,
+      attempt_count: 0,
+      max_attempts: 3,
+      latest_event_id: 0,
+      retryable: false,
+      error_code: null,
+      error_message: null,
+      result_prototype_id: null,
+      result_version: null,
+      created_at: '2026-07-18T00:00:00Z',
+      updated_at: '2026-07-18T00:00:00Z'
+    }
+    mockGenerationJobs.set(job.job_id, job)
+    return job
+  }
+
+  function completeGenerationJob(job: MockGenerationJob, latestEventId: number): MockGenerationJob {
+    if (job.operation === 'CREATE') {
+      const generated = prototypeDetail(42, job.title)
+      mockPrototypes = [generated, ...mockPrototypes.filter((item) => item.id !== generated.id)]
+      job.result_prototype_id = generated.id
+      job.result_version = 1
+    } else {
+      const detail = mockPrototypes.find((item) => item.id === job.prototype_id)
+      if (detail) {
+        const version = prototypeVersion(job.target_version)
+        detail.active_version = version.version
+        detail.current = version
+        detail.versions = [version, ...detail.versions]
+        detail.updated_at = version.created_at
+        job.result_prototype_id = detail.id
+        job.result_version = version.version
+      }
+    }
+    job.status = 'SUCCEEDED'
+    job.stage = 'completed'
+    job.progress_percent = 100
+    job.latest_event_id = latestEventId
+    job.attempt_count = 1
+    job.stage_history = [
+      { stage: 'product_definition', status: 'COMPLETED', agent_role: 'product_manager', message: '产品路径已定义' },
+      { stage: 'architecture', status: 'COMPLETED', agent_role: 'architect', message: '交互结构已生成' },
+      { stage: 'quality_review', status: 'COMPLETED', agent_role: 'test_engineer', message: '质量门禁已通过' }
+    ]
+    return job
+  }
   const mockPrototypeComments: Array<{
     id: number
     prototype_id: number
@@ -381,6 +471,86 @@ async function mockApi(page: Page) {
     let body: unknown = {}
 
     if (method === 'GET' && path === '/prototypes') body = mockPrototypes.map((item) => prototypeSummary(item))
+    else if (method === 'GET' && path === '/prototypes/generation-jobs') {
+      body = [...mockGenerationJobs.values()].filter((job) => !url.searchParams.has('active') || ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.status))
+    } else if (method === 'POST' && path === '/prototypes/generation-jobs') {
+      const input = request.postDataJSON() as { title: string }
+      body = generationJob('CREATE', input.title)
+    } else if (method === 'POST' && /^\/prototypes\/\d+\/generation-jobs$/.test(path)) {
+      const id = Number(path.split('/')[2])
+      const detail = mockPrototypes.find((item) => item.id === id)
+      if (!detail) return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: 'Prototype not found' }) })
+      body = generationJob('REGENERATE', detail.title, id)
+    } else if (method === 'GET' && /^\/prototypes\/generation-jobs\/\d+$/.test(path)) {
+      const jobId = Number(path.split('/').pop())
+      body = mockGenerationJobs.get(jobId) || { detail: 'Generation job not found' }
+    } else if (method === 'GET' && /^\/prototypes\/generation-jobs\/\d+\/events$/.test(path)) {
+      const jobId = Number(path.split('/')[3])
+      const job = mockGenerationJobs.get(jobId)
+      if (!job) return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: 'Generation job not found' }) })
+      const streamAttempt = (generationStreamAttempts.get(jobId) || 0) + 1
+      generationStreamAttempts.set(jobId, streamAttempt)
+      if (job.title.includes('刷新恢复')) {
+        await new Promise((resolve) => setTimeout(resolve, 800))
+      }
+      const runningEventId = job.latest_event_id + 1
+      const terminalEventId = runningEventId + 1
+      const running: MockGenerationJob = {
+        ...job,
+        status: 'RUNNING',
+        stage: 'architecture',
+        progress_percent: 45,
+        attempt_count: 1,
+        latest_event_id: runningEventId,
+        stage_history: [{ stage: 'product_definition', status: 'COMPLETED', agent_role: 'product_manager', message: '产品路径已定义' }]
+      }
+      let terminal: MockGenerationJob
+      let terminalEvent = 'job_completed'
+      if (job.title.includes('失败恢复') && streamAttempt === 1) {
+        job.status = 'FAILED'
+        job.stage = 'failed'
+        job.progress_percent = 45
+        job.latest_event_id = terminalEventId
+        job.attempt_count = 1
+        job.retryable = true
+        job.error_code = 'PROVIDER_TIMEOUT'
+        job.error_message = '模型服务响应超时，已保留当前生成上下文。'
+        job.stage_history = [
+          { stage: 'product_definition', status: 'COMPLETED', agent_role: 'product_manager', message: '产品路径已定义' },
+          { stage: 'architecture', status: 'FAILED', agent_role: 'architect', message: job.error_message }
+        ]
+        terminal = job
+        terminalEvent = 'job_failed'
+      } else {
+        terminal = completeGenerationJob(job, terminalEventId)
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache' },
+        body: `id: ${runningEventId}\nevent: job_updated\ndata: ${JSON.stringify(running)}\n\nid: ${terminalEventId}\nevent: ${terminalEvent}\ndata: ${JSON.stringify(terminal)}\n\n`
+      })
+    } else if (method === 'POST' && /^\/prototypes\/generation-jobs\/\d+\/cancel$/.test(path)) {
+      const jobId = Number(path.split('/')[3])
+      const job = mockGenerationJobs.get(jobId)
+      if (!job) return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: 'Generation job not found' }) })
+      job.status = 'CANCELLED'
+      job.stage = 'cancelled'
+      job.latest_event_id += 1
+      body = job
+    } else if (method === 'POST' && /^\/prototypes\/generation-jobs\/\d+\/retry$/.test(path)) {
+      const jobId = Number(path.split('/')[3])
+      const job = mockGenerationJobs.get(jobId)
+      if (!job) return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: 'Generation job not found' }) })
+      job.status = 'QUEUED'
+      job.stage = 'queued'
+      job.progress_percent = 0
+      job.latest_event_id += 1
+      job.retryable = false
+      job.error_code = null
+      job.error_message = null
+      body = job
+    }
     else if (method === 'GET' && /^\/prototypes\/\d+\/comments$/.test(path)) {
       const id = Number(path.split('/')[2])
       const version = Number(url.searchParams.get('version'))
@@ -421,22 +591,6 @@ async function mockApi(page: Page) {
     } else if (method === 'GET' && /^\/prototypes\/\d+$/.test(path)) {
       const id = Number(path.split('/').pop())
       body = mockPrototypes.find((item) => item.id === id) || { detail: 'Prototype not found' }
-    } else if (method === 'POST' && path === '/prototypes/generate') {
-      const input = request.postDataJSON() as { title: string; requirement_id?: number | null }
-      const generated = prototypeDetail(42, input.title)
-      generated.requirement_id = input.requirement_id || null
-      mockPrototypes = [generated, ...mockPrototypes]
-      body = generated
-    } else if (method === 'POST' && /^\/prototypes\/\d+\/regenerate$/.test(path)) {
-      const id = Number(path.split('/')[2])
-      const detail = mockPrototypes.find((item) => item.id === id)
-      if (!detail) return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: 'Prototype not found' }) })
-      const version = prototypeVersion(detail.versions.length + 1)
-      detail.active_version = version.version
-      detail.current = version
-      detail.versions = [version, ...detail.versions]
-      detail.updated_at = version.created_at
-      body = detail
     } else if (method === 'POST' && /^\/prototypes\/\d+\/versions\/\d+\/activate$/.test(path)) {
       const parts = path.split('/')
       const id = Number(parts[2])
@@ -730,6 +884,32 @@ test('generates, regenerates and restores immutable prototype versions', async (
   await page.getByRole('button', { name: '恢复原型版本' }).click()
   await expect(page.locator('.version-label')).toHaveText('v1')
   await expect(page.getByText('已恢复原型 v1')).toBeVisible()
+})
+
+test('restores an active prototype job after refresh and retries a transient failure', async ({ page }) => {
+  await page.goto('/prototypes')
+
+  await page.getByRole('button', { name: '新建原型' }).click()
+  await page.getByPlaceholder('例如：手机号注册与邀请增长原型').fill('刷新恢复原型')
+  await page.getByPlaceholder('描述目标用户、业务目标、关键页面、核心流程和验收要求').fill('生成支持刷新恢复的注册、邀请和奖励查询可交互原型。')
+  await page.getByRole('button', { name: '开始生成' }).click()
+  await expect(page.getByText('刷新恢复原型 · 等待执行', { exact: true })).toBeVisible()
+  await page.reload()
+  await expect(page.getByText('刷新恢复原型', { exact: true })).toBeVisible()
+  await expect(page.getByText('产品原型已生成', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '新建原型' }).click()
+  await page.getByPlaceholder('例如：手机号注册与邀请增长原型').fill('失败恢复原型')
+  await page.getByPlaceholder('描述目标用户、业务目标、关键页面、核心流程和验收要求').fill('生成首次失败后能够保留上下文并继续执行的可交互原型。')
+  await page.getByRole('button', { name: '开始生成' }).click()
+  await expect(page.getByText('原型生成失败', { exact: true })).toBeVisible()
+  await expect(page.locator('.generation-job-error')).toHaveText('模型服务响应超时，已保留当前生成上下文。')
+  await page.getByRole('button', { name: '重试', exact: true }).click()
+  await expect(page.getByText('失败恢复原型', { exact: true })).toBeVisible()
+  await expect(page.getByText('产品原型已生成', { exact: true })).toBeVisible()
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
+  expect(overflow).toBeLessThanOrEqual(0)
 })
 
 test('reviews, approves and converts a prototype into delivery evidence', async ({ page }) => {

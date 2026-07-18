@@ -59,6 +59,13 @@ WORKFLOW_WORKER_ENABLED=true
 WORKFLOW_POLL_SECONDS=1
 WORKFLOW_LEASE_SECONDS=900
 WORKFLOW_MAX_ATTEMPTS=2
+PROTOTYPE_GENERATION_WORKER_ENABLED=true
+PROTOTYPE_GENERATION_POLL_SECONDS=1
+PROTOTYPE_GENERATION_LEASE_SECONDS=300
+PROTOTYPE_GENERATION_MAX_ATTEMPTS=3
+PROTOTYPE_GENERATION_RETRY_BASE_SECONDS=5
+PROTOTYPE_GENERATION_RETRY_MAX_SECONDS=300
+PROTOTYPE_GENERATION_SHUTDOWN_GRACE_SECONDS=15
 POSTGRES_PASSWORD=...
 DATABASE_URL=postgresql+psycopg://postgres:<url-encoded-password>@postgres:5432/agent_workspace_ai
 MINIO_ACCESS_KEY=...
@@ -70,6 +77,8 @@ MINIO_SECRET_KEY=...
 通知 worker 默认随 API 进程启动。多副本通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 争抢任务；邮件失败按指数退避重试。生产环境必须配置 SMTP，并监控 `notification.failed` 审计事件。
 
 工作流 dispatcher 同样支持多副本认领。租约应大于单个模型调用的最长超时；滚动发布时实例会等待当前节点完成，异常退出后的任务由其他实例从最后一个已提交节点恢复。
+
+AI 原型生成使用独立的持久化 dispatcher。API 只负责把任务写入 PostgreSQL 并返回 `202`；worker 通过带 fencing token 的租约认领任务，阶段进度和终态由 SSE 恢复。租约心跳必须持续运行，`PROTOTYPE_GENERATION_LEASE_SECONDS` 应大于心跳间隔并覆盖短暂数据库抖动；滚动发布超过关机宽限后，未完成任务会由其他实例在租约过期后接管。生产环境应监控原型任务队列、失败率、重试次数和租约恢复事件。
 
 管理员可在系统设置页覆盖模型、Embedding、RAG、计费、注册、通知与运行控制参数。数据库、Redis、MinIO、Milvus 地址及 `SECRET_KEY` 属于启动级配置，只能由部署环境提供。运行时密钥使用 `SECRET_KEY` 派生密钥加密保存，轮换 `SECRET_KEY` 前必须先清除或重新写入这些密钥。多副本每 15 秒刷新一次数据库覆盖值。
 

@@ -7,6 +7,7 @@ __all__ = [
     "meetings",
     "notifications",
     "projects",
+    "prototype_jobs",
     "reports",
     "settings",
     "users",
