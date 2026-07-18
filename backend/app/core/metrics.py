@@ -47,6 +47,17 @@ EVALUATION_DURATION = Histogram(
     ("status",),
     buckets=(1, 5, 15, 30, 60, 90, 120, 180, 300, 600, 1200),
 )
+AGENT_OPTIMIZATION_QUEUE = Gauge(
+    "agent_workspace_agent_optimization_queue",
+    "Agent prompt optimization jobs by status",
+    ("status",),
+)
+AGENT_OPTIMIZATION_DURATION = Histogram(
+    "agent_workspace_agent_optimization_duration_seconds",
+    "Agent prompt optimization duration by terminal status",
+    ("status",),
+    buckets=(1, 5, 15, 30, 60, 90, 120, 180, 300, 600, 1200),
+)
 SAGA_STEPS = Counter(
     "agent_workspace_saga_step_transitions_total",
     "Durable Saga step state transitions",

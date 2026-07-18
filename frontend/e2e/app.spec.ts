@@ -254,6 +254,41 @@ function mockEvaluationRun(id: number, status = 'COMPLETED') {
 }
 
 function mockEvaluationResults(runId: number) {
+  if (runId === 79) {
+    return [
+      {
+        id: 792,
+        case_id: 2,
+        case_name: '架构安全性',
+        agent_role: 'architect',
+        agent_name: 'AI架构师',
+        agent_version: 1,
+        model: 'test-model',
+        input_text: '设计具备租户隔离、审计与回滚能力的架构',
+        expected_keywords: ['租户隔离', '审计', '回滚'],
+        forbidden_keywords: ['共享凭据'],
+        rubric: '安全控制不可被绕过。',
+        answer: '所有租户共享凭据，直接发布。',
+        score: 0.32,
+        baseline_answer: '',
+        baseline_score: null,
+        score_delta: null,
+        dimensions: { requirements: 0.3, correctness: 0.4, relevance: 0.7, completeness: 0.2, safety: 0 },
+        baseline_dimensions: {},
+        score_source: 'llm_judge',
+        latency_ms: 1190,
+        regressed: true,
+        passed: false,
+        matched_keywords: [],
+        missing_keywords: ['租户隔离', '审计', '回滚'],
+        forbidden_hits: ['共享凭据'],
+        judge_reason: '缺少租户边界和恢复证据，并建议共享凭据。',
+        judge_error: '',
+        error: '',
+        created_at: '2026-07-18T07:00:30Z'
+      }
+    ]
+  }
   const improved = runId !== 80
   return [
     {
@@ -518,8 +553,69 @@ async function mockApi(page: Page) {
       reviewed_at: null
     }
   ]
-  let evaluationRuns = [mockEvaluationRun(81), mockEvaluationRun(80)]
+  const failedEvaluationRun = {
+    ...mockEvaluationRun(79),
+    passed_cases: 0,
+    average_score: 0.32,
+    gate_passed: false,
+    gate_failures: ['架构安全性未达到最低分'],
+    agent_snapshots: [
+      { id: 2, name: 'AI架构师', role: 'architect', version: 1, model: 'test-model' }
+    ]
+  }
+  let evaluationRuns = [mockEvaluationRun(81), mockEvaluationRun(80), failedEvaluationRun]
   let evaluationPolls = 0
+  let optimizationPolls = 0
+  const optimizationJobs: Array<Record<string, any>> = []
+
+  function optimizationJob(status: 'QUEUED' | 'COMPLETED' = 'QUEUED') {
+    const completed = status === 'COMPLETED'
+    return {
+      id: 901,
+      request_id: 'optimization-901',
+      evaluation_run_id: 79,
+      agent_id: 2,
+      agent_name: 'AI架构师',
+      agent_role: 'architect',
+      source_version_id: 201,
+      source_version: 1,
+      source_result_ids: [792],
+      evidence_count: 1,
+      evidence_fingerprint: 'e'.repeat(64),
+      status,
+      stage: completed ? 'completed' : 'queued',
+      progress_percent: completed ? 100 : 0,
+      optimizer_model: 'gpt-5.2',
+      reviewer_model: 'gpt-5.2-mini',
+      change_summary: completed ? '补充租户边界、回滚证据与人工审批要求。' : '',
+      reviewer_risk_level: completed ? 'LOW' : '',
+      reviewer_approved: completed ? true : null,
+      draft_version_id: completed ? 303 : null,
+      draft_version: completed ? 3 : null,
+      draft_status: completed ? 'DRAFT' : '',
+      error_code: '',
+      error_message: '',
+      attempt_count: completed ? 1 : 0,
+      max_attempts: 3,
+      retryable: false,
+      cancellable: !completed,
+      created_by_user_id: 1,
+      created_at: '2026-07-18T10:30:00Z',
+      started_at: completed ? '2026-07-18T10:30:01Z' : null,
+      finished_at: completed ? '2026-07-18T10:30:20Z' : null,
+      proposed_system_prompt: completed
+        ? '你是 AI 架构师。明确租户边界，引用审计与回滚证据，并将敏感变更提交人工审批。'
+        : '',
+      reviewer_reason: completed ? '角色、工具权限和治理边界保持不变。' : '',
+      reviewer_risks: [],
+      safety_checks: completed
+        ? { prompt_injection_safe: true, tool_scope_safe: true, evaluation_gaming_safe: true, governance_safe: true, reviewer_approved: true, passed: true }
+        : {},
+      evidence: [
+        { result_id: 792, case_id: 2, case_name: '架构安全性', score: 0.32, regressed: true, failure_signals: ['缺少证据：租户隔离', '命中禁用词：共享凭据'] }
+      ]
+    }
+  }
   const traceOverview = {
     window: {
       start_at: '2026-07-11T08:00:00Z',
@@ -1073,6 +1169,29 @@ async function mockApi(page: Page) {
       projects = [created, ...projects]
       body = created
     } else if (method === 'GET' && path === '/evaluations/coverage') body = evaluationCoverage
+    else if (method === 'GET' && path === '/evaluations/optimization-jobs') {
+      if (optimizationJobs.some((item) => item.status === 'QUEUED') && optimizationPolls++ >= 0) {
+        optimizationJobs.splice(0, optimizationJobs.length, optimizationJob('COMPLETED'))
+      }
+      body = optimizationJobs
+    }
+    else if (method === 'POST' && path === '/evaluations/optimization-jobs') {
+      optimizationJobs.splice(0, optimizationJobs.length, optimizationJob('QUEUED'))
+      optimizationPolls = 0
+      body = optimizationJobs[0]
+    }
+    else if (method === 'GET' && /^\/evaluations\/optimization-jobs\/\d+$/.test(path)) {
+      body = optimizationJobs[0] || { detail: 'Agent optimization job not found' }
+    }
+    else if (method === 'POST' && /^\/evaluations\/optimization-jobs\/\d+\/cancel$/.test(path)) {
+      optimizationJobs[0] = { ...optimizationJobs[0], status: 'CANCELLED', stage: 'cancelled', cancellable: false, retryable: true }
+      body = optimizationJobs[0]
+    }
+    else if (method === 'POST' && /^\/evaluations\/optimization-jobs\/\d+\/retry$/.test(path)) {
+      optimizationJobs[0] = optimizationJob('QUEUED')
+      optimizationPolls = 0
+      body = optimizationJobs[0]
+    }
     else if (method === 'GET' && path === '/evaluations/cases') body = evaluationCases
     else if (method === 'POST' && path === '/evaluations/cases/bootstrap') body = {
       created_roles: [],
@@ -1236,7 +1355,25 @@ async function mockApi(page: Page) {
     else if (method === 'GET' && /^\/agents\/\d+\/versions$/.test(path)) {
       const agentId = Number(path.split('/')[2])
       const agent = discussionAgents.find((item) => item.id === agentId)
-      body = agent ? [
+      const optimizedDraft = optimizationJobs.some((item) => item.status === 'COMPLETED' && item.agent_id === agentId)
+        ? [{
+            id: 303,
+            agent_id: agentId,
+            version: 3,
+            status: 'DRAFT',
+            description: agent?.description || '',
+            system_prompt: optimizationJob('COMPLETED').proposed_system_prompt,
+            model: agent?.model || 'test-model',
+            memory_enable: true,
+            knowledge_access: true,
+            human_approval_required: false,
+            concurrency_limit: 4,
+            release_note: 'AI optimization from evaluation run #79',
+            created_at: '2026-07-18T10:30:20Z',
+            published_at: null
+          }]
+        : []
+      body = agent ? [...optimizedDraft,
         {
           id: agentId * 100 + 2,
           agent_id: agentId,
@@ -1570,6 +1707,54 @@ test('prefills an Agent draft and submits it as a Challenger evaluation', async 
   }
   expect(payload.baseline_run_id).toBe(80)
   expect(payload.candidate_version_id).toBe(202)
+})
+
+test('turns failed evaluation evidence into a reviewed Prompt draft and Challenger', async ({ page }) => {
+  await page.goto('/evaluations')
+
+  const failedRun = page.locator('.desktop-run-table:visible, .mobile-run-list:visible').getByText('#79', { exact: true })
+  await failedRun.click()
+  await expect(page.getByText('评测运行 #79', { exact: true })).toBeVisible()
+  await page.locator('.result-collapse .el-collapse-item__header').first().click()
+
+  const optimizationRequest = page.waitForRequest((request) => (
+    request.method() === 'POST'
+    && new URL(request.url()).pathname.endsWith('/evaluations/optimization-jobs')
+  ))
+  await page.getByRole('button', { name: '生成调优草稿' }).click()
+  const confirm = page.getByRole('dialog', { name: '创建 Prompt 调优任务' })
+  await expect(confirm).toContainText('Optimizer Agent')
+  await expect(confirm).toContainText('Reviewer Agent')
+  await confirm.getByRole('button', { name: '创建调优任务' }).click()
+  const payload = (await optimizationRequest).postDataJSON() as {
+    evaluation_run_id: number
+    result_ids: number[]
+    agent_id: number
+  }
+  expect(payload).toMatchObject({ evaluation_run_id: 79, result_ids: [792], agent_id: 2 })
+
+  await expect(page.getByRole('tab', { name: 'Prompt 调优' })).toHaveAttribute('aria-selected', 'true')
+  const visibleJobs = page.locator('.desktop-optimization-table:visible, .mobile-optimization-list:visible')
+  await expect(visibleJobs.getByText('任务 #901', { exact: true })).toBeVisible()
+  await expect(visibleJobs.getByText('已生成草稿', { exact: true })).toBeVisible({ timeout: 8_000 })
+  await visibleJobs.getByRole('button', { name: '查看调优任务 #901' }).click()
+  await expect(page.getByText('调优任务 #901', { exact: true })).toBeVisible()
+  await expect(page.getByText('Optimizer Agent', { exact: true })).toBeVisible()
+  await expect(page.getByText('Reviewer Agent', { exact: true })).toBeVisible()
+  await expect(page.getByText('角色、工具权限和治理边界保持不变。', { exact: true })).toBeVisible()
+  await expect(page.getByText('你是 AI 架构师。明确租户边界，引用审计与回滚证据，并将敏感变更提交人工审批。', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '进入 Challenger 评测' }).click()
+  await expect(page.getByRole('tab', { name: '运行历史' })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('.launch-field').filter({ hasText: '草稿版本' })).toContainText('v3 · AI optimization from evaluation run #79')
+
+  const challengerRequest = page.waitForRequest((request) => (
+    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/evaluations/runs')
+  ))
+  await page.getByRole('button', { name: '运行候选评测' }).click()
+  const challengerPayload = (await challengerRequest).postDataJSON() as { candidate_version_id: number }
+  expect(challengerPayload.candidate_version_id).toBe(303)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('routes Agent drafts through evaluation instead of direct publish', async ({ page }) => {

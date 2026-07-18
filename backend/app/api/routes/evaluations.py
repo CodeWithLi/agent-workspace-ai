@@ -18,6 +18,8 @@ from app.evaluation import (
 from app.models import (
     Agent,
     AgentEvaluationRelease,
+    AgentOptimizationJob,
+    AgentPromptVersion,
     EvaluationCase,
     EvaluationResult,
     EvaluationRun,
@@ -28,6 +30,10 @@ from app.models import (
 )
 from app.schemas import (
     AgentEvaluationReleaseOut,
+    AgentOptimizationEvidenceOut,
+    AgentOptimizationJobCreate,
+    AgentOptimizationJobDetailOut,
+    AgentOptimizationJobOut,
     EvaluationCaseCreate,
     EvaluationCaseBootstrapOut,
     EvaluationCaseOut,
@@ -56,6 +62,12 @@ from app.services.evaluation_feedback import (
 )
 from app.services.evaluation_coverage import evaluation_suite_coverage
 from app.services.evaluation_case_bootstrap import bootstrap_missing_evaluation_cases
+from app.services.agent_optimizations import (
+    AgentOptimizationRequestConflict,
+    cancel_agent_optimization_job,
+    enqueue_agent_optimization_job,
+    retry_agent_optimization_job,
+)
 
 
 router = APIRouter()
@@ -235,6 +247,100 @@ def _get_run(run_id: int, db: Session) -> EvaluationRun:
     item = db.get(EvaluationRun, run_id)
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evaluation run not found")
+    return item
+
+
+def _optimization_evidence(item: AgentOptimizationJob) -> list[AgentOptimizationEvidenceOut]:
+    snapshot = _json_loads(item.evidence_snapshot_json, {})
+    evidence: list[AgentOptimizationEvidenceOut] = []
+    for result in snapshot.get("results") or []:
+        case = result.get("case") or {}
+        details = result.get("details") or {}
+        signals = [
+            *[f"缺少证据：{value}" for value in details.get("missing") or []],
+            *[f"命中禁用词：{value}" for value in details.get("forbidden_hits") or []],
+        ]
+        if result.get("error"):
+            signals.append("执行错误")
+        if not signals and result.get("regressed"):
+            signals.append("相对基线回退")
+        evidence.append(
+            AgentOptimizationEvidenceOut(
+                result_id=int(result["id"]),
+                case_id=int(case["id"]) if case.get("id") is not None else None,
+                case_name=str(case.get("name") or f"Case {case.get('id') or ''}").strip(),
+                score=float(result.get("score") or 0.0),
+                regressed=bool(result.get("regressed")),
+                failure_signals=signals[:20],
+            )
+        )
+    return evidence
+
+
+def optimization_job_out(
+    item: AgentOptimizationJob,
+    db: Session,
+    *,
+    detail: bool = False,
+) -> AgentOptimizationJobOut | AgentOptimizationJobDetailOut:
+    agent = db.get(Agent, item.agent_id)
+    draft = db.get(AgentPromptVersion, item.draft_version_id) if item.draft_version_id else None
+    evidence = _optimization_evidence(item)
+    optimizer = _json_loads(item.optimizer_output_json, {})
+    reviewer = _json_loads(item.reviewer_output_json, {})
+    common = {
+        "id": item.id,
+        "request_id": item.request_id,
+        "evaluation_run_id": item.evaluation_run_id,
+        "agent_id": item.agent_id,
+        "agent_name": agent.name if agent else f"Agent #{item.agent_id}",
+        "agent_role": str(getattr(agent.role, "value", agent.role)) if agent else "",
+        "source_version_id": item.source_version_id,
+        "source_version": item.source_version,
+        "source_result_ids": _json_loads(item.result_ids_json, []),
+        "evidence_count": len(evidence),
+        "evidence_fingerprint": item.evidence_fingerprint,
+        "status": item.status,
+        "stage": item.stage,
+        "progress_percent": item.progress_percent,
+        "optimizer_model": item.optimizer_model,
+        "reviewer_model": item.reviewer_model,
+        "change_summary": str(optimizer.get("change_summary") or ""),
+        "reviewer_risk_level": str(reviewer.get("risk_level") or ""),
+        "reviewer_approved": reviewer.get("approved") if "approved" in reviewer else None,
+        "draft_version_id": item.draft_version_id,
+        "draft_version": draft.version if draft else None,
+        "draft_status": draft.status if draft else "",
+        "error_code": item.error_code,
+        "error_message": item.error_message,
+        "attempt_count": item.attempt_count,
+        "max_attempts": item.max_attempts,
+        "retryable": item.status in {"FAILED", "CANCELLED"},
+        "cancellable": item.status in {"QUEUED", "RUNNING"},
+        "created_by_user_id": item.created_by_user_id,
+        "created_at": item.created_at,
+        "started_at": item.started_at,
+        "finished_at": item.finished_at,
+    }
+    if not detail:
+        return AgentOptimizationJobOut(**common)
+    return AgentOptimizationJobDetailOut(
+        **common,
+        proposed_system_prompt=str(optimizer.get("proposed_system_prompt") or ""),
+        reviewer_reason=str(reviewer.get("reason") or ""),
+        reviewer_risks=list(reviewer.get("risks") or []),
+        safety_checks=_json_loads(item.safety_checks_json, {}),
+        evidence=evidence,
+    )
+
+
+def _get_optimization_job(job_id: int, db: Session) -> AgentOptimizationJob:
+    item = db.get(AgentOptimizationJob, job_id)
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent optimization job not found",
+        )
     return item
 
 
@@ -599,6 +705,164 @@ def get_evaluation_run(
     db: Session = Depends(get_db),
 ) -> EvaluationRunDetailOut:
     return detail_out(_get_run(run_id, db), db)
+
+
+@router.post(
+    "/optimization-jobs",
+    response_model=AgentOptimizationJobDetailOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_agent_optimization_job(
+    payload: AgentOptimizationJobCreate,
+    request: Request,
+    response: Response,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentOptimizationJobDetailOut:
+    try:
+        item, created = enqueue_agent_optimization_job(
+            db,
+            request_id=payload.request_id,
+            user_id=current_admin.id,
+            evaluation_run_id=payload.evaluation_run_id,
+            result_ids=payload.result_ids,
+            agent_id=payload.agent_id,
+        )
+    except IntegrityError:
+        db.rollback()
+        try:
+            item, created = enqueue_agent_optimization_job(
+                db,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+                evaluation_run_id=payload.evaluation_run_id,
+                result_ids=payload.result_ids,
+                agent_id=payload.agent_id,
+            )
+        except AgentOptimizationRequestConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except AgentOptimizationRequestConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if created:
+        record_audit(
+            db,
+            "agent.optimization_queued",
+            current_admin.id,
+            resource_type="agent_optimization_job",
+            resource_id=item.id,
+            details={
+                "evaluation_run_id": item.evaluation_run_id,
+                "agent_id": item.agent_id,
+                "source_version": item.source_version,
+                "result_ids": _json_loads(item.result_ids_json, []),
+                "evidence_fingerprint": item.evidence_fingerprint,
+            },
+            request=request,
+        )
+        db.commit()
+        db.refresh(item)
+    response.status_code = status.HTTP_202_ACCEPTED
+    response.headers["Location"] = f"{request.url.path.rstrip('/')}/{item.id}"
+    result = optimization_job_out(item, db, detail=True)
+    assert isinstance(result, AgentOptimizationJobDetailOut)
+    return result
+
+
+@router.get("/optimization-jobs", response_model=list[AgentOptimizationJobOut])
+def list_agent_optimization_jobs(
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[AgentOptimizationJobOut]:
+    items = list(
+        db.scalars(
+            select(AgentOptimizationJob)
+            .order_by(AgentOptimizationJob.created_at.desc(), AgentOptimizationJob.id.desc())
+            .limit(100)
+        )
+    )
+    return [optimization_job_out(item, db) for item in items]
+
+
+@router.get(
+    "/optimization-jobs/{job_id}",
+    response_model=AgentOptimizationJobDetailOut,
+    name="get_agent_optimization_job",
+)
+def get_agent_optimization_job(
+    job_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentOptimizationJobDetailOut:
+    result = optimization_job_out(_get_optimization_job(job_id, db), db, detail=True)
+    assert isinstance(result, AgentOptimizationJobDetailOut)
+    return result
+
+
+@router.post(
+    "/optimization-jobs/{job_id}/cancel",
+    response_model=AgentOptimizationJobDetailOut,
+)
+def cancel_optimization_job(
+    job_id: int,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentOptimizationJobDetailOut:
+    item = _get_optimization_job(job_id, db)
+    try:
+        cancel_agent_optimization_job(db, item)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    record_audit(
+        db,
+        "agent.optimization_cancel_requested",
+        current_admin.id,
+        resource_type="agent_optimization_job",
+        resource_id=item.id,
+        details={"status": item.status, "stage": item.stage},
+        request=request,
+    )
+    db.commit()
+    db.refresh(item)
+    result = optimization_job_out(item, db, detail=True)
+    assert isinstance(result, AgentOptimizationJobDetailOut)
+    return result
+
+
+@router.post(
+    "/optimization-jobs/{job_id}/retry",
+    response_model=AgentOptimizationJobDetailOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_optimization_job(
+    job_id: int,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentOptimizationJobDetailOut:
+    item = _get_optimization_job(job_id, db)
+    try:
+        retry_agent_optimization_job(db, item)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    record_audit(
+        db,
+        "agent.optimization_retry_queued",
+        current_admin.id,
+        resource_type="agent_optimization_job",
+        resource_id=item.id,
+        details={"attempt_count": item.attempt_count, "stage": item.stage},
+        request=request,
+    )
+    db.commit()
+    db.refresh(item)
+    result = optimization_job_out(item, db, detail=True)
+    assert isinstance(result, AgentOptimizationJobDetailOut)
+    return result
 
 
 def _notify_release_admins(

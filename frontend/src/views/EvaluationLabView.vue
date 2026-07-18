@@ -8,7 +8,7 @@
       </div>
     </div>
 
-    <section class="evaluation-launcher" aria-label="创建评测运行">
+    <section ref="evaluationLauncher" class="evaluation-launcher" aria-label="创建评测运行">
       <div class="launch-field mode-field">
         <span class="launch-label">评测类型</span>
         <el-segmented
@@ -219,6 +219,103 @@
           </article>
         </div>
         <el-empty v-if="!loading && !filteredRuns.length" description="没有符合条件的评测运行" />
+      </el-tab-pane>
+
+      <el-tab-pane label="Prompt 调优" name="optimizations">
+        <div class="view-toolbar">
+          <div class="toolbar-copy">
+            <strong>失败证据调优</strong>
+            <span>{{ filteredOptimizationJobs.length }} 个任务，草稿始终需要 Challenger 评测</span>
+          </div>
+          <div class="toolbar-filters">
+            <el-input
+              v-model="optimizationQuery"
+              :prefix-icon="Search"
+              clearable
+              aria-label="搜索 Prompt 调优任务"
+              placeholder="搜索任务或 Agent"
+            />
+            <el-select v-model="optimizationStatusFilter" clearable aria-label="按调优状态筛选" placeholder="全部状态">
+              <el-option
+                v-for="option in optimizationStatusOptions"
+                :key="option"
+                :label="optimizationStatusLabel(option)"
+                :value="option"
+              />
+            </el-select>
+            <el-button
+              :icon="Refresh"
+              circle
+              aria-label="刷新 Prompt 调优任务"
+              title="刷新"
+              @click="loadOptimizationJobs"
+            />
+          </div>
+        </div>
+
+        <div class="desktop-optimization-table">
+          <el-table v-loading="loadingOptimizations" :data="filteredOptimizationJobs" class="data-table" row-key="id">
+            <el-table-column label="任务" min-width="150">
+              <template #default="{ row }">
+                <button
+                  class="optimization-link"
+                  :aria-label="`查看调优任务 #${row.id}`"
+                  @click="openOptimizationJob(row)"
+                >
+                  任务 #{{ row.id }}
+                </button>
+                <span class="run-revision">评测 #{{ row.evaluation_run_id }} · v{{ row.source_version }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="Agent" min-width="170">
+              <template #default="{ row }"><strong>{{ row.agent_name }}</strong><span class="run-revision">{{ roleLabel(row.agent_role) }}</span></template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="130">
+              <template #default="{ row }"><el-tag :type="optimizationStatusType(row.status)" size="small" effect="plain">{{ optimizationStatusLabel(row.status) }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="处理阶段" min-width="160">
+              <template #default="{ row }"><span class="optimization-stage">{{ optimizationStageLabel(row.stage) }}</span><small>{{ row.progress_percent }}%</small></template>
+            </el-table-column>
+            <el-table-column label="冻结证据" min-width="110">
+              <template #default="{ row }">{{ row.evidence_count }} 个案例</template>
+            </el-table-column>
+            <el-table-column label="Reviewer" min-width="130">
+              <template #default="{ row }"><span :class="row.reviewer_approved === true ? 'gate-pass' : row.status === 'REJECTED' ? 'gate-fail' : 'gate-pending'">{{ reviewerVerdictLabel(row) }}</span></template>
+            </el-table-column>
+            <el-table-column label="草稿" min-width="120">
+              <template #default="{ row }"><span>{{ row.draft_version ? `v${row.draft_version}` : '—' }}</span></template>
+            </el-table-column>
+            <el-table-column prop="created_at" label="创建时间" min-width="160">
+              <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="210" align="right" fixed="right">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openOptimizationJob(row)">详情</el-button>
+                <el-button v-if="row.cancellable" link @click="cancelOptimizationJob(row)">取消</el-button>
+                <el-button v-if="row.retryable" link @click="retryOptimizationJob(row)">重试</el-button>
+                <el-button v-if="row.draft_version_id" link type="primary" @click="enterChallenger(row)">Challenger</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-loading="loadingOptimizations" class="mobile-optimization-list">
+          <article v-for="job in filteredOptimizationJobs" :key="job.id" class="optimization-card" :data-job-id="job.id">
+            <button class="optimization-card-main" :aria-label="`查看调优任务 #${job.id}`" @click="openOptimizationJob(job)">
+              <span><strong>任务 #{{ job.id }}</strong><small>{{ job.agent_name }} · 来源评测 #{{ job.evaluation_run_id }}</small></span>
+              <el-tag :type="optimizationStatusType(job.status)" size="small" effect="plain">{{ optimizationStatusLabel(job.status) }}</el-tag>
+            </button>
+            <el-progress v-if="isOptimizationActive(job)" :percentage="job.progress_percent" :stroke-width="6" />
+            <dl><div><dt>阶段</dt><dd>{{ optimizationStageLabel(job.stage) }}</dd></div><div><dt>证据</dt><dd>{{ job.evidence_count }} 个</dd></div><div><dt>草稿</dt><dd>{{ job.draft_version ? `v${job.draft_version}` : '—' }}</dd></div></dl>
+            <div class="optimization-card-actions">
+              <el-button @click="openOptimizationJob(job)">查看详情</el-button>
+              <el-button v-if="job.draft_version_id" type="primary" @click="enterChallenger(job)">进入 Challenger</el-button>
+              <el-button v-else-if="job.cancellable" @click="cancelOptimizationJob(job)">取消</el-button>
+              <el-button v-else-if="job.retryable" type="primary" @click="retryOptimizationJob(job)">重试</el-button>
+            </div>
+          </article>
+        </div>
+        <el-empty v-if="!loadingOptimizations && !filteredOptimizationJobs.length" description="尚无 Prompt 调优任务；请从失败评测案例发起" />
       </el-tab-pane>
 
       <el-tab-pane label="用例库" name="cases">
@@ -496,6 +593,17 @@
                 </div>
                 <p v-if="result.judge_reason" class="judge-reason"><strong>Judge 依据</strong>{{ result.judge_reason }}</p>
                 <el-alert v-if="result.error || result.judge_error" type="warning" :closable="false" :title="result.error || result.judge_error" />
+                <div v-if="!result.passed || result.regressed || result.error" class="result-actions">
+                  <el-button
+                    type="primary"
+                    plain
+                    :icon="MagicStick"
+                    :loading="creatingOptimizationResultId === result.id"
+                    @click="startOptimizationFromResult(result)"
+                  >
+                    {{ optimizationForResult(result.id) ? '查看调优任务' : '生成调优草稿' }}
+                  </el-button>
+                </div>
               </div>
             </el-collapse-item>
           </el-collapse>
@@ -505,6 +613,66 @@
         <div class="detail-actions">
           <el-button v-if="canCancel(detailRun)" :icon="Close" @click="cancelRun(detailRun)">取消运行</el-button>
           <el-button v-if="detailRun.retryable" type="primary" :icon="RefreshRight" @click="retryRun(detailRun)">重试运行</el-button>
+        </div>
+      </div>
+    </el-drawer>
+
+    <el-drawer
+      v-model="optimizationDrawer"
+      :title="optimizationDetail ? `调优任务 #${optimizationDetail.id}` : 'Prompt 调优任务'"
+      size="min(780px, 100vw)"
+      class="optimization-detail-drawer"
+    >
+      <div v-if="optimizationDetail" v-loading="optimizationDetailLoading" class="optimization-detail">
+        <div class="detail-summary optimization-summary">
+          <div><span>状态</span><strong>{{ optimizationStatusLabel(optimizationDetail.status) }}</strong></div>
+          <div><span>目标 Agent</span><strong>{{ optimizationDetail.agent_name }}</strong></div>
+          <div><span>来源版本</span><strong>v{{ optimizationDetail.source_version }}</strong></div>
+          <div><span>草稿版本</span><strong>{{ optimizationDetail.draft_version ? `v${optimizationDetail.draft_version}` : '—' }}</strong></div>
+        </div>
+
+        <ol class="optimization-pipeline" aria-label="Prompt 调优 Agent 流程">
+          <li :class="pipelineState('optimizing', optimizationDetail)"><span>1</span><div><strong>Optimizer Agent</strong><small>从冻结失败证据生成通用改进提案</small></div></li>
+          <li :class="pipelineState('reviewing', optimizationDetail)"><span>2</span><div><strong>Reviewer Agent</strong><small>独立检查角色、注入、工具和治理风险</small></div></li>
+          <li :class="pipelineState('completed', optimizationDetail)"><span>3</span><div><strong>Draft Gate</strong><small>双门禁通过后仅创建草稿</small></div></li>
+        </ol>
+
+        <el-progress v-if="isOptimizationActive(optimizationDetail)" :percentage="optimizationDetail.progress_percent" :stroke-width="8" />
+        <el-alert v-if="optimizationDetail.status === 'REJECTED'" type="error" :closable="false" show-icon title="安全审查拒绝创建草稿" :description="optimizationDetail.reviewer_reason" />
+        <el-alert v-if="optimizationDetail.status === 'FAILED'" type="error" :closable="false" show-icon title="调优任务执行失败" :description="optimizationDetail.error_message" />
+
+        <section class="detail-section">
+          <div class="section-heading"><h2>冻结失败证据</h2><span>指纹 {{ shortFingerprint(optimizationDetail.evidence_fingerprint) }}</span></div>
+          <div class="optimization-evidence-list">
+            <div v-for="item in optimizationDetail.evidence" :key="item.result_id">
+              <span><strong>{{ item.case_name }}</strong><small>结果 #{{ item.result_id }} · {{ percent(item.score) }}</small></span>
+              <div><el-tag v-for="signal in item.failure_signals" :key="signal" type="danger" size="small" effect="plain">{{ signal }}</el-tag></div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="optimizationDetail.change_summary" class="detail-section">
+          <div class="section-heading"><h2>Optimizer 提案</h2><span>{{ optimizationDetail.optimizer_model || '默认模型' }}</span></div>
+          <p class="optimization-summary-copy">{{ optimizationDetail.change_summary }}</p>
+          <pre class="prompt-preview">{{ optimizationDetail.proposed_system_prompt }}</pre>
+        </section>
+
+        <section v-if="optimizationDetail.reviewer_reason" class="detail-section">
+          <div class="section-heading"><h2>Reviewer 结论</h2><el-tag :type="optimizationDetail.reviewer_approved ? 'success' : 'danger'" size="small" effect="plain">{{ optimizationDetail.reviewer_risk_level || '待审查' }}</el-tag></div>
+          <p class="reviewer-reason">{{ optimizationDetail.reviewer_reason }}</p>
+          <div class="safety-check-grid" aria-label="确定性 Prompt 安全检查">
+            <div v-for="check in optimizationSafetyChecks" :key="check.key" :class="check.passed ? 'safety-pass' : 'safety-fail'">
+              <CircleCheck v-if="check.passed" aria-hidden="true" />
+              <CircleClose v-else aria-hidden="true" />
+              <span>{{ check.label }}</span>
+            </div>
+          </div>
+        </section>
+
+        <div class="detail-actions optimization-detail-actions">
+          <el-button v-if="optimizationDetail.cancellable" :icon="Close" @click="cancelOptimizationJob(optimizationDetail)">取消任务</el-button>
+          <el-button v-if="optimizationDetail.retryable" :icon="RefreshRight" @click="retryOptimizationJob(optimizationDetail)">重试任务</el-button>
+          <el-button v-if="optimizationDetail.draft_version_id" type="primary" :icon="VideoPlay" @click="enterChallenger(optimizationDetail)">进入 Challenger 评测</el-button>
         </div>
       </div>
     </el-drawer>
@@ -574,8 +742,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Close, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { CircleCheck, CircleClose, Close, MagicStick, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
@@ -585,6 +753,8 @@ import { api } from '../api/client'
 import type {
   Agent,
   AgentEvaluationRelease,
+  AgentOptimizationJob,
+  AgentOptimizationJobDetail,
   AgentVersion,
   EvaluationCase,
   EvaluationCaseBootstrapResult,
@@ -596,7 +766,9 @@ import type {
 import { confirmDestructiveAction } from '../utils/confirm'
 
 const ACTIVE_STATUSES = new Set(['QUEUED', 'RUNNING', 'CANCELLING'])
+const ACTIVE_OPTIMIZATION_STATUSES = new Set(['QUEUED', 'RUNNING', 'CANCELLING'])
 const statusOptions = ['QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED']
+const optimizationStatusOptions = ['QUEUED', 'RUNNING', 'COMPLETED', 'REJECTED', 'FAILED', 'CANCELLED']
 const feedbackStatusOptions = [
   { label: '待复核', value: 'PENDING' },
   { label: '已转用例', value: 'CONVERTED' },
@@ -622,8 +794,10 @@ const cases = ref<EvaluationCase[]>([])
 const coverage = ref<EvaluationCoverage | null>(null)
 const feedback = ref<EvaluationFeedbackCandidate[]>([])
 const runs = ref<EvaluationRun[]>([])
+const optimizationJobs = ref<AgentOptimizationJob[]>([])
 const loading = ref(false)
 const loadingFeedback = ref(false)
+const loadingOptimizations = ref(false)
 const creatingRun = ref(false)
 const loadingVersions = ref(false)
 const publishingRelease = ref(false)
@@ -631,7 +805,9 @@ const rollingBackRelease = ref(false)
 const savingCase = ref(false)
 const bootstrappingCases = ref(false)
 const promotingFeedback = ref(false)
+const creatingOptimizationResultId = ref<number | null>(null)
 const activeView = ref('runs')
+const evaluationLauncher = ref<HTMLElement | null>(null)
 const baselineRunId = ref<number | null>(null)
 const runMode = ref<'TEAM' | 'CHALLENGER'>('TEAM')
 const candidateAgentId = ref<number | null>(null)
@@ -642,9 +818,14 @@ const caseQuery = ref('')
 const feedbackQuery = ref('')
 const feedbackStatus = ref('PENDING')
 const statusFilter = ref('')
+const optimizationQuery = ref('')
+const optimizationStatusFilter = ref('')
 const detailDrawer = ref(false)
 const detailLoading = ref(false)
 const detailRun = ref<EvaluationRunDetail | null>(null)
+const optimizationDrawer = ref(false)
+const optimizationDetailLoading = ref(false)
+const optimizationDetail = ref<AgentOptimizationJobDetail | null>(null)
 const caseDialog = ref(false)
 const promoteDialog = ref(false)
 const editingCaseId = ref<number | null>(null)
@@ -671,11 +852,13 @@ const promoteForm = reactive({
 let pollTimer: ReturnType<typeof window.setInterval> | null = null
 let pollBusy = false
 const feedbackRequestIds = new Map<string, string>()
+const optimizationRequestIds = new Map<number, string>()
 
 const enabledCases = computed(() => cases.value.filter((item) => item.enabled))
 const latestRun = computed(() => runs.value[0] || null)
 const activeRun = computed(() => runs.value.find((run) => isActive(run)) || null)
 const hasActiveRun = computed(() => Boolean(activeRun.value))
+const hasActiveOptimization = computed(() => optimizationJobs.value.some(isOptimizationActive))
 const baselineRuns = computed(() => runs.value.filter((run) => (
   run.status === 'COMPLETED' && run.gate_passed === true && run.suite_revision
 )))
@@ -709,6 +892,26 @@ const filteredCases = computed(() => {
     .join(' ')
     .toLocaleLowerCase()
     .includes(query))
+})
+const filteredOptimizationJobs = computed(() => {
+  const query = optimizationQuery.value.trim().toLocaleLowerCase()
+  return optimizationJobs.value.filter((job) => {
+    const matchesStatus = !optimizationStatusFilter.value || job.status === optimizationStatusFilter.value
+    const haystack = [job.id, job.evaluation_run_id, job.agent_name, job.agent_role, job.status, job.change_summary]
+      .join(' ')
+      .toLocaleLowerCase()
+    return matchesStatus && (!query || haystack.includes(query))
+  })
+})
+const optimizationSafetyChecks = computed(() => {
+  const checks = optimizationDetail.value?.safety_checks || {}
+  return [
+    { key: 'prompt_injection_safe', label: '提示注入', passed: checks.prompt_injection_safe === true },
+    { key: 'tool_scope_safe', label: '工具权限', passed: checks.tool_scope_safe === true },
+    { key: 'evaluation_gaming_safe', label: '评测迎合', passed: checks.evaluation_gaming_safe === true },
+    { key: 'governance_safe', label: '治理边界', passed: checks.governance_safe === true },
+    { key: 'reviewer_approved', label: '独立复核', passed: checks.reviewer_approved === true }
+  ]
 })
 const filteredFeedback = computed(() => {
   const query = feedbackQuery.value.trim().toLocaleLowerCase()
@@ -798,6 +1001,10 @@ function isActive(run: EvaluationRun) {
   return ACTIVE_STATUSES.has(run.status)
 }
 
+function isOptimizationActive(job: AgentOptimizationJob) {
+  return ACTIVE_OPTIMIZATION_STATUSES.has(job.status)
+}
+
 function canCancel(run: EvaluationRun) {
   return run.status === 'QUEUED' || run.status === 'RUNNING'
 }
@@ -869,6 +1076,60 @@ function statusType(status: string) {
   return 'info'
 }
 
+function optimizationStatusLabel(status: string) {
+  return ({
+    QUEUED: '等待调优',
+    RUNNING: '调优中',
+    CANCELLING: '取消中',
+    COMPLETED: '已生成草稿',
+    REJECTED: '安全拒绝',
+    FAILED: '执行失败',
+    CANCELLED: '已取消'
+  } as Record<string, string>)[status] || status
+}
+
+function optimizationStatusType(status: string) {
+  if (status === 'COMPLETED') return 'success'
+  if (status === 'REJECTED' || status === 'FAILED') return 'danger'
+  if (status === 'QUEUED' || status === 'RUNNING') return 'warning'
+  return 'info'
+}
+
+function optimizationStageLabel(stage: string) {
+  return ({
+    queued: '等待 worker',
+    optimizing: 'Optimizer 生成提案',
+    reviewing: 'Reviewer 独立复核',
+    persisting: '确定性门禁',
+    completed: '草稿已创建',
+    rejected: '安全门禁拒绝',
+    failed: '执行失败',
+    cancelled: '已取消'
+  } as Record<string, string>)[stage] || stage
+}
+
+function reviewerVerdictLabel(value: unknown) {
+  const job = value as AgentOptimizationJob
+  if (job.reviewer_approved === true) return job.reviewer_risk_level || '通过'
+  if (job.status === 'REJECTED') return '拒绝'
+  return '待复核'
+}
+
+function shortFingerprint(value: string) {
+  return value ? `${value.slice(0, 10)}…` : '—'
+}
+
+function pipelineState(stage: string, job: AgentOptimizationJob) {
+  const progress = stage === 'optimizing' ? 10 : stage === 'reviewing' ? 55 : 100
+  if (job.progress_percent >= progress) return 'pipeline-complete'
+  if (isOptimizationActive(job) && (
+    (stage === 'optimizing' && job.stage === 'optimizing')
+    || (stage === 'reviewing' && job.stage === 'reviewing')
+    || (stage === 'completed' && job.stage === 'persisting')
+  )) return 'pipeline-active'
+  return ''
+}
+
 function roleLabel(role: string) {
   return ({
     product_manager: '产品经理',
@@ -931,6 +1192,20 @@ async function loadCoverage() {
   coverage.value = data
 }
 
+async function loadOptimizationJobs() {
+  loadingOptimizations.value = true
+  try {
+    const { data } = await api.get<AgentOptimizationJob[]>('/evaluations/optimization-jobs')
+    optimizationJobs.value = data
+    if (optimizationDetail.value && isOptimizationActive(optimizationDetail.value)) {
+      await loadOptimizationDetail(optimizationDetail.value.id, false)
+    }
+    syncPolling()
+  } finally {
+    loadingOptimizations.value = false
+  }
+}
+
 async function bootstrapEvaluationCases() {
   if (!coverage.value?.missing_roles.length) return
   const missingNames = coverage.value.missing_roles.map(roleLabel).join('、')
@@ -966,20 +1241,22 @@ async function bootstrapEvaluationCases() {
 async function loadAll() {
   loading.value = true
   try {
-    const [agentsResponse, casesResponse, coverageResponse, feedbackResponse, runsResponse] = await Promise.all([
+    const [agentsResponse, casesResponse, coverageResponse, feedbackResponse, runsResponse, optimizationsResponse] = await Promise.all([
       api.get<Agent[]>('/agents'),
       api.get<EvaluationCase[]>('/evaluations/cases'),
       api.get<EvaluationCoverage>('/evaluations/coverage'),
       api.get<EvaluationFeedbackCandidate[]>('/evaluations/feedback', {
         params: { status: feedbackStatus.value }
       }),
-      api.get<EvaluationRun[]>('/evaluations/runs')
+      api.get<EvaluationRun[]>('/evaluations/runs'),
+      api.get<AgentOptimizationJob[]>('/evaluations/optimization-jobs')
     ])
     agents.value = agentsResponse.data
     cases.value = casesResponse.data
     coverage.value = coverageResponse.data
     feedback.value = feedbackResponse.data
     runs.value = runsResponse.data
+    optimizationJobs.value = optimizationsResponse.data
     const queryAgentId = Number(route.query.agent || 0)
     const queryVersionId = Number(route.query.version || 0)
     if (queryAgentId && agents.value.some((agent) => agent.id === queryAgentId)) {
@@ -1000,9 +1277,16 @@ async function refreshRuns() {
   if (pollBusy) return
   pollBusy = true
   try {
-    const { data } = await api.get<EvaluationRun[]>('/evaluations/runs')
-    runs.value = data
+    const [runsResponse, optimizationsResponse] = await Promise.all([
+      api.get<EvaluationRun[]>('/evaluations/runs'),
+      api.get<AgentOptimizationJob[]>('/evaluations/optimization-jobs')
+    ])
+    runs.value = runsResponse.data
+    optimizationJobs.value = optimizationsResponse.data
     if (detailRun.value && isActive(detailRun.value)) await loadRunDetail(detailRun.value.id, false)
+    if (optimizationDetail.value && isOptimizationActive(optimizationDetail.value)) {
+      await loadOptimizationDetail(optimizationDetail.value.id, false)
+    }
     syncPolling()
   } finally {
     pollBusy = false
@@ -1010,8 +1294,9 @@ async function refreshRuns() {
 }
 
 function syncPolling() {
-  if (hasActiveRun.value && !pollTimer) pollTimer = window.setInterval(refreshRuns, 1500)
-  if (!hasActiveRun.value && pollTimer) {
+  const shouldPoll = hasActiveRun.value || hasActiveOptimization.value
+  if (shouldPoll && !pollTimer) pollTimer = window.setInterval(refreshRuns, 1500)
+  if (!shouldPoll && pollTimer) {
     window.clearInterval(pollTimer)
     pollTimer = null
   }
@@ -1027,7 +1312,7 @@ async function createRun() {
     })
     runs.value = [data, ...runs.value.filter((run) => run.id !== data.id)]
     activeView.value = 'runs'
-    ElMessage.success(`团队评测 #${data.id} 已进入队列`)
+    ElMessage.success(`${runMode.value === 'CHALLENGER' ? '候选评测' : '团队评测'} #${data.id} 已进入队列`)
     syncPolling()
   } finally {
     creatingRun.value = false
@@ -1048,6 +1333,119 @@ async function openRun(value: unknown) {
   const run = value as EvaluationRun
   detailDrawer.value = true
   await loadRunDetail(run.id)
+}
+
+function optimizationForResult(resultId: number) {
+  return optimizationJobs.value.find((job) => job.source_result_ids.includes(resultId)) || null
+}
+
+function upsertOptimizationJob(job: AgentOptimizationJob) {
+  optimizationJobs.value = [job, ...optimizationJobs.value.filter((item) => item.id !== job.id)]
+  if (optimizationDetail.value?.id === job.id) {
+    optimizationDetail.value = { ...optimizationDetail.value, ...job }
+  }
+}
+
+async function startOptimizationFromResult(value: unknown) {
+  const result = value as EvaluationRunDetail['results'][number]
+  const existing = optimizationForResult(result.id)
+  if (existing) {
+    await openOptimizationJob(existing)
+    return
+  }
+  const run = detailRun.value
+  const agent = run?.agent_snapshots.find((item) => item.role === result.agent_role)
+  if (!run || !agent) {
+    ElMessage.error('失败结果缺少冻结 Agent 身份，无法发起调优')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将冻结结果 #${result.id}，由 Optimizer Agent 生成新 Prompt，再由独立 Reviewer Agent 检查角色漂移、提示注入、工具越权、评测迎合和治理绕过。通过后只创建草稿，不会自动发布。`,
+      '创建 Prompt 调优任务',
+      {
+        type: 'warning',
+        confirmButtonText: '创建调优任务',
+        cancelButtonText: '取消'
+      }
+    )
+  } catch {
+    return
+  }
+  creatingOptimizationResultId.value = result.id
+  try {
+    const idempotencyKey = optimizationRequestIds.get(result.id) || requestId()
+    optimizationRequestIds.set(result.id, idempotencyKey)
+    const { data } = await api.post<AgentOptimizationJobDetail>('/evaluations/optimization-jobs', {
+      request_id: idempotencyKey,
+      evaluation_run_id: run.id,
+      result_ids: [result.id],
+      agent_id: agent.id
+    })
+    upsertOptimizationJob(data)
+    optimizationRequestIds.delete(result.id)
+    detailDrawer.value = false
+    activeView.value = 'optimizations'
+    ElMessage.success(`Prompt 调优任务 #${data.id} 已进入队列`)
+    syncPolling()
+  } finally {
+    creatingOptimizationResultId.value = null
+  }
+}
+
+async function loadOptimizationDetail(id: number, showLoading = true) {
+  if (showLoading) optimizationDetailLoading.value = true
+  try {
+    const { data } = await api.get<AgentOptimizationJobDetail>(`/evaluations/optimization-jobs/${id}`)
+    optimizationDetail.value = data
+    upsertOptimizationJob(data)
+  } finally {
+    optimizationDetailLoading.value = false
+  }
+}
+
+async function openOptimizationJob(value: unknown) {
+  const job = value as AgentOptimizationJob
+  optimizationDrawer.value = true
+  await loadOptimizationDetail(job.id)
+}
+
+async function cancelOptimizationJob(value: unknown) {
+  const job = value as AgentOptimizationJob
+  if (!await confirmDestructiveAction(`确认取消 Prompt 调优任务 #${job.id} 吗？已冻结的评测证据会保留。`, '取消 Prompt 调优任务')) return
+  const { data } = await api.post<AgentOptimizationJobDetail>(`/evaluations/optimization-jobs/${job.id}/cancel`)
+  upsertOptimizationJob(data)
+  ElMessage.success(`Prompt 调优任务 #${job.id} 已请求取消`)
+  syncPolling()
+}
+
+async function retryOptimizationJob(value: unknown) {
+  const job = value as AgentOptimizationJob
+  const { data } = await api.post<AgentOptimizationJobDetail>(`/evaluations/optimization-jobs/${job.id}/retry`)
+  upsertOptimizationJob(data)
+  ElMessage.success(`Prompt 调优任务 #${job.id} 已重新入队`)
+  syncPolling()
+}
+
+async function enterChallenger(value: unknown) {
+  const job = value as AgentOptimizationJob
+  if (!job.draft_version_id) return
+  runMode.value = 'CHALLENGER'
+  candidateAgentId.value = job.agent_id
+  await loadCandidateVersions(job.agent_id, job.draft_version_id)
+  selectMatchingBaseline()
+  if (candidateVersionId.value !== job.draft_version_id) {
+    ElMessage.error('调优草稿已不可用，请刷新任务后重试')
+    return
+  }
+  optimizationDrawer.value = false
+  activeView.value = 'runs'
+  await nextTick()
+  evaluationLauncher.value?.scrollIntoView({
+    behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    block: 'start'
+  })
+  ElMessage.info(`已载入 ${job.agent_name} v${job.draft_version}，请选择生产基线并运行 Challenger`)
 }
 
 async function cancelRun(value: unknown) {
@@ -1302,8 +1700,8 @@ onBeforeUnmount(() => {
 .toolbar-filters { display: flex; align-items: center; gap: 8px; }
 .toolbar-filters .el-input { width: 250px; }
 .toolbar-filters .el-select { width: 150px; }
-.run-link { display: block; padding: 0; border: 0; background: transparent; color: var(--color-primary); font: inherit; font-weight: 750; cursor: pointer; }
-.run-link:hover { text-decoration: underline; }
+.run-link, .optimization-link { display: block; padding: 0; border: 0; background: transparent; color: var(--color-primary); font: inherit; font-weight: 750; cursor: pointer; }
+.run-link:hover, .optimization-link:hover { text-decoration: underline; }
 .run-revision, .case-input { display: block; overflow: hidden; color: var(--color-muted-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .agent-version-list { display: flex; flex-wrap: wrap; gap: 4px 8px; color: var(--color-secondary-text); font-size: 12px; }
 .agent-version-list small { color: var(--color-muted-text); }
@@ -1322,7 +1720,10 @@ onBeforeUnmount(() => {
 .feedback-answer { display: -webkit-box; margin-top: 3px; overflow: hidden; color: var(--color-muted-text); font-size: 12px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .feedback-meta { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
 .feedback-reviewed { color: var(--color-muted-text); font-size: 12px; }
-.mobile-run-list, .mobile-case-list, .mobile-feedback-list { display: none; }
+.optimization-stage, .optimization-stage + small { display: block; }
+.optimization-stage { color: var(--color-secondary-text); font-size: 12px; }
+.optimization-stage + small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; font-variant-numeric: tabular-nums; }
+.mobile-run-list, .mobile-case-list, .mobile-feedback-list, .mobile-optimization-list { display: none; }
 .run-detail { min-height: 180px; }
 .detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin-bottom: 18px; overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-border); }
 .detail-summary div { min-width: 0; padding: 12px; background: var(--color-surface); }
@@ -1374,6 +1775,31 @@ onBeforeUnmount(() => {
 .evidence-block strong { width: 72px; color: var(--color-secondary-text); font-size: 12px; }
 .evidence-block span { color: var(--color-muted-text); font-size: 12px; }
 .judge-reason { display: grid; grid-template-columns: 72px 1fr; gap: 5px; margin: 14px 0 0; color: var(--color-secondary-text); line-height: 1.6; }
+.result-actions { display: flex; justify-content: flex-end; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--color-border); }
+.optimization-detail { min-height: 180px; }
+.optimization-pipeline { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0 0 20px; padding: 0; border-block: 1px solid var(--color-border); list-style: none; }
+.optimization-pipeline li { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 9px; min-height: 76px; padding: 12px; color: var(--color-muted-text); }
+.optimization-pipeline li + li { border-left: 1px solid var(--color-border); }
+.optimization-pipeline li > span { display: grid; width: 26px; height: 26px; place-items: center; border: 1px solid var(--color-border); border-radius: 50%; background: var(--color-background); font-size: 12px; font-weight: 750; }
+.optimization-pipeline strong, .optimization-pipeline small { display: block; }
+.optimization-pipeline strong { color: var(--color-secondary-text); font-size: 13px; }
+.optimization-pipeline small { margin-top: 2px; line-height: 1.4; }
+.optimization-pipeline .pipeline-active > span { border-color: var(--color-primary); color: var(--color-primary); }
+.optimization-pipeline .pipeline-complete > span { border-color: var(--color-success); background: color-mix(in srgb, var(--color-success) 9%, var(--color-surface)); color: var(--color-success); }
+.optimization-evidence-list { border-top: 1px solid var(--color-border); }
+.optimization-evidence-list > div { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(240px, 1fr); align-items: center; gap: 14px; min-height: 66px; padding: 10px 0; border-bottom: 1px solid var(--color-border); }
+.optimization-evidence-list strong, .optimization-evidence-list small { display: block; }
+.optimization-evidence-list strong { color: var(--color-foreground); }
+.optimization-evidence-list small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
+.optimization-evidence-list > div > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.optimization-summary-copy, .reviewer-reason { margin: 0 0 12px; color: var(--color-secondary-text); line-height: 1.6; }
+.prompt-preview { max-height: 340px; margin: 0; overflow: auto; padding: 14px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-background); color: var(--color-foreground); font: inherit; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.safety-check-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.safety-check-grid > div { display: flex; align-items: center; gap: 5px; min-width: 0; min-height: 36px; padding: 7px 8px; border: 1px solid var(--color-border); border-radius: 6px; font-size: 12px; }
+.safety-check-grid svg { width: 16px; height: 16px; flex: 0 0 16px; }
+.safety-check-grid span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.safety-pass { color: var(--color-success); }
+.safety-fail { color: var(--color-danger); }
 .detail-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--color-border); }
 .case-rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .feedback-source { overflow: hidden; margin-bottom: 18px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-background); }
@@ -1419,9 +1845,9 @@ onBeforeUnmount(() => {
   .toolbar-filters .el-input { grid-column: 1 / -1; width: 100%; }
   .toolbar-filters .el-select { width: 100%; }
   .toolbar-filters .el-button { min-width: 44px; min-height: 44px; }
-  .desktop-run-table, .desktop-case-table, .desktop-feedback-table { display: none; }
-  .mobile-run-list, .mobile-case-list, .mobile-feedback-list { display: grid; gap: 10px; }
-  .run-card, .case-card, .feedback-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
+  .desktop-run-table, .desktop-case-table, .desktop-feedback-table, .desktop-optimization-table { display: none; }
+  .mobile-run-list, .mobile-case-list, .mobile-feedback-list, .mobile-optimization-list { display: grid; gap: 10px; }
+  .run-card, .case-card, .feedback-card, .optimization-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
   .run-card-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
   .run-card-main span span, .run-card-main strong, .run-card-main small { display: block; }
   .run-card-main small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
@@ -1430,6 +1856,17 @@ onBeforeUnmount(() => {
   .run-card dt { color: var(--color-muted-text); font-size: 11px; }
   .run-card dd { margin: 3px 0 0; font-weight: 700; font-variant-numeric: tabular-nums; }
   .run-card-foot { display: flex; align-items: center; justify-content: space-between; color: var(--color-muted-text); font-size: 11px; }
+  .optimization-card-main { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; width: 100%; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+  .optimization-card-main > span { min-width: 0; }
+  .optimization-card-main strong, .optimization-card-main small { display: block; }
+  .optimization-card-main strong { color: var(--color-foreground); }
+  .optimization-card-main small { margin-top: 2px; overflow: hidden; color: var(--color-muted-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .optimization-card .el-progress { margin-top: 10px; }
+  .optimization-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 12px 0 0; padding: 10px 0; border-block: 1px solid var(--color-border); }
+  .optimization-card dt { color: var(--color-muted-text); font-size: 11px; }
+  .optimization-card dd { margin: 3px 0 0; overflow: hidden; color: var(--color-secondary-text); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+  .optimization-card-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+  .optimization-card-actions .el-button { min-height: 44px; margin: 0; }
   .case-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
   .case-card > span { display: block; margin-top: 3px; color: var(--color-primary); font-size: 12px; }
   .case-card p { display: -webkit-box; margin: 10px 0; overflow: hidden; color: var(--color-secondary-text); line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
@@ -1459,6 +1896,15 @@ onBeforeUnmount(() => {
   .result-title .el-tag { display: none; }
   .answer-compare { grid-template-columns: 1fr; }
   .case-prompt, .judge-reason { grid-template-columns: 1fr; }
+  .result-actions .el-button { width: 100%; min-height: 44px; }
+  .optimization-pipeline { grid-template-columns: 1fr; }
+  .optimization-pipeline li { min-height: 66px; }
+  .optimization-pipeline li + li { border-top: 1px solid var(--color-border); border-left: 0; }
+  .optimization-evidence-list > div { grid-template-columns: 1fr; gap: 8px; }
+  .optimization-evidence-list > div > div { justify-content: flex-start; }
+  .safety-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .optimization-detail-actions { display: grid; grid-template-columns: 1fr; }
+  .optimization-detail-actions .el-button { width: 100%; min-height: 44px; margin: 0; }
   .case-rule-grid { grid-template-columns: 1fr 1fr; }
   .feedback-source-head { align-items: flex-start; flex-direction: column; }
   .feedback-source dl div { grid-template-columns: 1fr; gap: 4px; }

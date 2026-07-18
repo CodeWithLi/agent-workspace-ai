@@ -30,12 +30,13 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 - `evaluation_feedback_reviews`：生产负反馈的终态复核记录；唯一 `feedback_id` 防止重复生成用例，唯一 `request_id` 提供幂等，来源输入、回答、评论和 Agent 角色保存在不可变 JSON 快照中。
 - `evaluation_suite_revisions`：按内容指纹去重的不可变测试集快照。
 - `evaluation_runs`、`evaluation_results`：持久化异步运行、冻结 Agent/Challenger 版本、预期生产版本、租约进度、基线门禁、逐案例多维分数与证据。
+- `agent_optimization_jobs`：失败评测驱动的 Prompt 调优任务；保存幂等请求 hash、同一 Agent 的冻结证据与指纹、Optimizer/Reviewer 输出、确定性安全结论、草稿版本、重试计划和 fencing 租约。
 - `agent_evaluation_releases`：评测驱动发布的幂等请求、候选/原生产/恢复版本链、发布与回滚操作者和时间证据。
 - `audit_logs`：认证、权限、Agent 工具、文档和工作流关键动作。
 
 ## 迁移
 
-当前迁移头为 `20260718_0024`；生产反馈评测闭环位于 `20260718_0024`，评测驱动 Agent 发布位于 `20260718_0023`，工作流安全干预位于 `20260718_0022`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
+当前迁移头为 `20260718_0025`；失败评测 Prompt 调优位于 `20260718_0025`，生产反馈评测闭环位于 `20260718_0024`，评测驱动 Agent 发布位于 `20260718_0023`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
 
 ```bash
 cd backend

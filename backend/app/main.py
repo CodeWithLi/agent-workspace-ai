@@ -16,6 +16,7 @@ from app.core.database import SessionLocal, init_db
 from app.core.logging import configure_logging
 from app.core.llm import LLMGatewayError
 from app.services.notifications import notification_dispatcher
+from app.services.agent_optimizations import agent_optimization_dispatcher
 from app.services.prototype_generations import prototype_generation_dispatcher
 from app.services.trace_alerts import trace_alert_dispatcher
 from app.evaluation import evaluation_dispatcher
@@ -26,6 +27,7 @@ from app.core.runtime_config import apply_runtime_settings, runtime_config_refre
 from app.services.knowledge import knowledge_dispatcher
 from app.core.health import is_ready, readiness_components
 from app.core.metrics import (
+    AGENT_OPTIMIZATION_QUEUE,
     HTTP_DURATION,
     HTTP_IN_PROGRESS,
     HTTP_REQUESTS,
@@ -39,6 +41,7 @@ from app.core.metrics import (
 )
 from app.core.request_context import request_id_context
 from app.models import (
+    AgentOptimizationJob,
     KnowledgeDocument,
     EvaluationRun,
     Notification,
@@ -67,6 +70,7 @@ async def lifespan(_: FastAPI):
     await workflow_dispatcher.start()
     await prototype_generation_dispatcher.start()
     await evaluation_dispatcher.start()
+    await agent_optimization_dispatcher.start()
     await runtime_config_refresher.start()
     await knowledge_dispatcher.start()
     await trace_alert_dispatcher.start()
@@ -76,6 +80,7 @@ async def lifespan(_: FastAPI):
         await trace_alert_dispatcher.stop()
         await knowledge_dispatcher.stop()
         await runtime_config_refresher.stop()
+        await agent_optimization_dispatcher.stop()
         await evaluation_dispatcher.stop()
         await prototype_generation_dispatcher.stop()
         await workflow_dispatcher.stop()
@@ -191,6 +196,12 @@ def metrics() -> Response:
             select(EvaluationRun.status, func.count()).group_by(EvaluationRun.status)
         ):
             EVALUATION_QUEUE.labels(status=str(status_value)).set(count)
+        for status_value, count in db.execute(
+            select(AgentOptimizationJob.status, func.count()).group_by(
+                AgentOptimizationJob.status
+            )
+        ):
+            AGENT_OPTIMIZATION_QUEUE.labels(status=str(status_value)).set(count)
         for status_value, count in db.execute(
             select(WorkflowSagaStep.status, func.count()).group_by(WorkflowSagaStep.status)
         ):

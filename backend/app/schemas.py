@@ -1309,6 +1309,67 @@ class EvaluationRunDetailOut(EvaluationRunOut):
     results: list[EvaluationResultOut]
 
 
+class AgentOptimizationJobCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    request_id: str = Field(min_length=8, max_length=64)
+    evaluation_run_id: int = Field(ge=1)
+    result_ids: list[int] = Field(default_factory=list, max_length=20)
+    agent_id: int | None = Field(default=None, ge=1)
+
+
+class AgentOptimizationEvidenceOut(BaseModel):
+    result_id: int
+    case_id: int | None
+    case_name: str
+    score: float
+    regressed: bool
+    failure_signals: list[str]
+
+
+class AgentOptimizationJobOut(BaseModel):
+    id: int
+    request_id: str
+    evaluation_run_id: int
+    agent_id: int
+    agent_name: str
+    agent_role: str
+    source_version_id: int | None
+    source_version: int
+    source_result_ids: list[int]
+    evidence_count: int
+    evidence_fingerprint: str
+    status: str
+    stage: str
+    progress_percent: int
+    optimizer_model: str
+    reviewer_model: str
+    change_summary: str
+    reviewer_risk_level: str
+    reviewer_approved: bool | None
+    draft_version_id: int | None
+    draft_version: int | None
+    draft_status: str
+    error_code: str
+    error_message: str
+    attempt_count: int
+    max_attempts: int
+    retryable: bool
+    cancellable: bool
+    created_by_user_id: int | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class AgentOptimizationJobDetailOut(AgentOptimizationJobOut):
+    proposed_system_prompt: str
+    reviewer_reason: str
+    reviewer_risks: list[Any]
+    safety_checks: dict[str, Any]
+    evidence: list[AgentOptimizationEvidenceOut]
+
+
 class TokenTransactionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

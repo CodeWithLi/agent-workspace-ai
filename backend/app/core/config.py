@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     prototype_generation_retry_base_seconds: int = Field(default=5, ge=1, le=300)
     prototype_generation_retry_max_seconds: int = Field(default=300, ge=5, le=3600)
     prototype_generation_shutdown_grace_seconds: int = Field(default=15, ge=1, le=300)
+    agent_optimization_worker_enabled: bool = True
+    agent_optimization_poll_seconds: int = Field(default=1, ge=1, le=60)
+    agent_optimization_lease_seconds: int = Field(default=300, ge=60, le=3600)
+    agent_optimization_max_attempts: int = Field(default=3, ge=1, le=10)
+    agent_optimization_retry_base_seconds: int = Field(default=5, ge=1, le=300)
+    agent_optimization_retry_max_seconds: int = Field(default=300, ge=5, le=3600)
+    agent_optimization_shutdown_grace_seconds: int = Field(default=15, ge=1, le=300)
+    agent_optimization_optimizer_model: str | None = None
+    agent_optimization_reviewer_model: str | None = None
 
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
@@ -163,6 +172,8 @@ class Settings(BaseSettings):
             raise ValueError("RAG parser backend must be native, auto or docling")
         if self.prototype_generation_retry_max_seconds < self.prototype_generation_retry_base_seconds:
             raise ValueError("Prototype generation retry maximum must not be smaller than its base delay")
+        if self.agent_optimization_retry_max_seconds < self.agent_optimization_retry_base_seconds:
+            raise ValueError("Agent optimization retry maximum must not be smaller than its base delay")
         if self.environment == "production":
             if self.secret_key in {"change-me-in-production", "please-change-this-secret"} or len(self.secret_key) < 32:
                 raise ValueError("Production SECRET_KEY must be unique and at least 32 characters")

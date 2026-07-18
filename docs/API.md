@@ -58,6 +58,9 @@
 - `POST /evaluations/runs/{id}/cancel`、`POST /evaluations/runs/{id}/retry`
 - `POST /evaluations/runs/{id}/publish`：幂等发布已通过门禁且生产版本未漂移的 Challenger
 - `POST /evaluations/releases/{id}/rollback`：幂等创建恢复版本并保留原发布证据
+- `POST /evaluations/optimization-jobs`：仅管理员使用唯一 `request_id`、失败运行、同一 Agent 的失败结果 ID 发起持久化 Prompt 调优
+- `GET /evaluations/optimization-jobs`、`GET /evaluations/optimization-jobs/{id}`：仅管理员读取任务状态、Reviewer 结论、安全检查、冻结证据摘要和生成的草稿
+- `POST /evaluations/optimization-jobs/{id}/cancel`、`POST /evaluations/optimization-jobs/{id}/retry`：仅管理员取消活动任务或重试失败/已取消任务
 - `POST /evaluations/run` 保留为兼容入口；新客户端应使用带 `request_id` 的异步 `/evaluations/runs`。
 
 SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `conversation_id`、`agent_id` 和 `agent_name`。
@@ -73,6 +76,8 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 评测运行要求当前测试集覆盖所有已配置的核心协作角色；缺少任一角色时创建运行返回 `422`。worker 完成和 Challenger 发布会再次使用冻结测试集与当前核心 Agent 配置校验覆盖，防止运行期间新增角色或历史绿灯绕过门禁。
 
 基础套件按角色提供产品验收、可恢复架构、风险驱动测试、灰度运营和可执行交付计划模板。生成接口仅补当前没有启用用例的角色，返回新增角色、用例 ID 和最新覆盖状态；并发请求通过核心 Agent 行锁串行复核。
+
+Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回退或执行错误的结果。显式提交多个结果时必须属于同一 Agent 和同一冻结 Prompt 版本；团队运行存在多个失败角色时，客户端必须明确选择目标结果。响应和任务详情仅对管理员开放。任务完成只产生 `AgentPromptVersion(DRAFT)`；进入 Challenger 继续使用现有 `/evaluations/runs`，不能借调优接口发布。
 
 ## 工作流与知识库
 

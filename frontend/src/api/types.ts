@@ -485,6 +485,58 @@ export interface EvaluationRunDetail extends EvaluationRun {
   results: EvaluationResult[]
 }
 
+export interface AgentOptimizationEvidence {
+  result_id: number
+  case_id?: number | null
+  case_name: string
+  score: number
+  regressed: boolean
+  failure_signals: string[]
+}
+
+export interface AgentOptimizationJob {
+  id: number
+  request_id: string
+  evaluation_run_id: number
+  agent_id: number
+  agent_name: string
+  agent_role: string
+  source_version_id?: number | null
+  source_version: number
+  source_result_ids: number[]
+  evidence_count: number
+  evidence_fingerprint: string
+  status: string
+  stage: string
+  progress_percent: number
+  optimizer_model: string
+  reviewer_model: string
+  change_summary: string
+  reviewer_risk_level: string
+  reviewer_approved?: boolean | null
+  draft_version_id?: number | null
+  draft_version?: number | null
+  draft_status: string
+  error_code: string
+  error_message: string
+  attempt_count: number
+  max_attempts: number
+  retryable: boolean
+  cancellable: boolean
+  created_by_user_id?: number | null
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface AgentOptimizationJobDetail extends AgentOptimizationJob {
+  proposed_system_prompt: string
+  reviewer_reason: string
+  reviewer_risks: unknown[]
+  safety_checks: Record<string, unknown>
+  evidence: AgentOptimizationEvidence[]
+}
+
 export interface RechargeOrder {
   id: number
   order_no: string

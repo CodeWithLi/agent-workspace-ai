@@ -1101,6 +1101,73 @@ class EvaluationRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AgentOptimizationJob(Base):
+    __tablename__ = "agent_optimization_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'CANCELLING', 'CANCELLED', 'COMPLETED', 'REJECTED', 'FAILED')",
+            name="ck_agent_optimization_job_status",
+        ),
+        CheckConstraint(
+            "progress_percent >= 0 AND progress_percent <= 100",
+            name="ck_agent_optimization_job_progress",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_agent_optimization_job_attempt_count"),
+        CheckConstraint("max_attempts > 0", name="ck_agent_optimization_job_max_attempts"),
+        Index(
+            "ix_agent_optimization_jobs_queue",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    request_payload_hash: Mapped[str] = mapped_column(String(64))
+    evaluation_run_id: Mapped[int] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="RESTRICT"), index=True
+    )
+    agent_id: Mapped[int] = mapped_column(
+        ForeignKey("agents.id", ondelete="RESTRICT"), index=True
+    )
+    source_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_prompt_versions.id", ondelete="SET NULL"), index=True
+    )
+    source_version: Mapped[int] = mapped_column(Integer)
+    result_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    evidence_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    evidence_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
+    stage: Mapped[str] = mapped_column(String(30), default="queued")
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    optimizer_model: Mapped[str] = mapped_column(String(100), default="")
+    reviewer_model: Mapped[str] = mapped_column(String(100), default="")
+    optimizer_output_json: Mapped[str] = mapped_column(Text, default="{}")
+    reviewer_output_json: Mapped[str] = mapped_column(Text, default="{}")
+    safety_checks_json: Mapped[str] = mapped_column(Text, default="{}")
+    draft_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_prompt_versions.id", ondelete="SET NULL"), unique=True, index=True
+    )
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    error_message: Mapped[str] = mapped_column(String(1000), default="")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AgentEvaluationRelease(Base):
     __tablename__ = "agent_evaluation_releases"
     __table_args__ = (

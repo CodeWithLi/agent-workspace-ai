@@ -265,6 +265,41 @@ class LLMGateway:
         return [value / norm for value in resized] if norm else resized
 
     def _mock_response(self, system_prompt: str, user_prompt: str) -> str:
+        if "PROMPT_OPTIMIZER_AGENT_V1" in system_prompt:
+            try:
+                payload = json.loads(user_prompt)
+                source_prompt = str(payload["source_agent"]["system_prompt"]).strip()
+            except (json.JSONDecodeError, KeyError, TypeError):
+                source_prompt = "You are a governed enterprise Agent."
+            proposed_prompt = (
+                source_prompt
+                + "\n\nUse failure evidence to improve general reasoning. State assumptions, "
+                "preserve role and tool boundaries, cite decision evidence, and route sensitive "
+                "actions through the configured human approval policy."
+            )
+            return json.dumps(
+                {
+                    "proposed_system_prompt": proposed_prompt,
+                    "change_summary": "补充证据、边界和人工审批要求。",
+                    "rationale": "本地开发回退用于验证调优工作流。",
+                },
+                ensure_ascii=False,
+            )
+        if "PROMPT_SAFETY_REVIEWER_AGENT_V1" in system_prompt:
+            return json.dumps(
+                {
+                    "approved": True,
+                    "role_alignment": True,
+                    "prompt_injection_safe": True,
+                    "tool_scope_safe": True,
+                    "evaluation_gaming_safe": True,
+                    "governance_safe": True,
+                    "risk_level": "LOW",
+                    "risks": [],
+                    "reason": "本地安全审查确认角色、工具和审批边界保持不变。",
+                },
+                ensure_ascii=False,
+            )
         if (
             "原型质量门禁判定 Agent" in system_prompt
             or "JSON 质量门禁归一化器" in system_prompt

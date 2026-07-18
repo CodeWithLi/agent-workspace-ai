@@ -4,10 +4,12 @@
 
 - Liveness: `GET /health/live` only proves that the API process can serve requests.
 - Readiness: `GET /health/ready` checks PostgreSQL, Redis, MinIO, Milvus, LLM configuration/connectivity and optional SMTP connectivity.
-- Metrics: `GET /metrics` exposes HTTP rate/latency/in-progress requests plus workflow, knowledge and notification queue gauges.
+- Metrics: `GET /metrics` exposes HTTP rate/latency/in-progress requests plus workflow, knowledge, notification, evaluation and Agent optimization queue gauges.
 - Every HTTP response includes `X-Request-ID`; application logs are one JSON object per line with the same ID.
 
 Alert on sustained readiness failures, HTTP 5xx rate, p95 latency, `FAILED` queue states, workflows stuck in `RUNNING`, documents stuck in `INDEXING`, notification failures, database storage and backup age. Treat any `COMPENSATION_FAILED` workflow or non-zero `agent_workspace_saga_steps{status="COMPENSATION_FAILED"}` as a business-consistency incident. Track `agent_workspace_saga_compensation_duration_seconds` for rollback latency.
+
+For Prompt optimization, alert on sustained `agent_workspace_agent_optimization_queue{status="RUNNING"}`, any growing `FAILED` count, lease recovery exhaustion, and abnormal `agent_workspace_agent_optimization_duration_seconds`. `REJECTED` is an expected governance outcome: inspect the task's failed check names and Reviewer risk level, but do not copy Prompt or evidence bodies into alerts. Retry only `FAILED`/`CANCELLED`; create a new request after changing evidence or optimization policy.
 
 RAG-specific metrics are `agent_workspace_rag_index_duration_seconds`, `agent_workspace_rag_index_chunks`, `agent_workspace_rag_embedding_chunks_total`, `agent_workspace_rag_search_duration_seconds`, `agent_workspace_rag_search_results`, `agent_workspace_rag_query_rewrite_total` and `agent_workspace_rag_reranker_total`. The embedding counter's `source` label distinguishes `generated`, `reused`, `generated_parent`, and `reused_parent`; a same-content reindex should reuse both child and parent vectors. Alert on a rising `failed`/`fallback` ratio, search p95 above the deployment SLO, indexing timeouts, or a sustained zero-result increase. Correlate provider cost and token volume through `llm_usage.operation` values `embedding`, `query_rewrite` and `rerank`.
 
