@@ -61,6 +61,54 @@ def rank_scores(values: list[float]) -> list[float]:
     return [1 / (1 + (ranks[index] - 1) / 10) if value > 0 else 0.0 for index, value in enumerate(values)]
 
 
+def build_evaluation_config(
+    args: argparse.Namespace,
+    settings,
+    gateway,
+    *,
+    reranker_enabled: bool,
+    embedding_dimensions: int,
+    rerank_min_score: float,
+    rerank_min_query_coverage: float,
+    rerank_relevance_threshold: float,
+) -> dict:
+    payload = {
+        "schema_version": 1,
+        "provider": args.provider,
+        "answer_model": gateway.model,
+        "embedding_model": getattr(gateway, "embedding_model_name", settings.embedding_model),
+        "embedding_dimensions": embedding_dimensions,
+        "reranker_model": (
+            getattr(gateway, "reranker_model_name", settings.reranker_model)
+            if reranker_enabled
+            else None
+        ),
+        "judge_model": args.judge_model or getattr(gateway, "judge_model_name", gateway.model),
+        "model_revisions": getattr(gateway, "model_revisions", {}),
+        "top_k": args.top_k,
+        "min_score": args.min_score,
+        "query_rewrite_enabled": settings.rag_query_rewrite_enabled,
+        "query_rewrite_max_variants": settings.rag_query_rewrite_max_variants,
+        "reranker_candidate_limit": settings.reranker_candidate_limit,
+        "rag_min_query_coverage": settings.rag_min_query_coverage,
+        "rag_dense_override_score": settings.rag_dense_override_score,
+        "rerank_min_score": rerank_min_score,
+        "rerank_min_query_coverage": rerank_min_query_coverage,
+        "rerank_relevance_threshold": rerank_relevance_threshold,
+        "rag_context_max_tokens": settings.rag_context_max_tokens,
+    }
+    payload["sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
 async def candidate_rows(
     documents: dict[str, bytes],
     strategy: str,
@@ -575,6 +623,16 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             gate_failures.append(f"{metric} {metrics[metric]:.4f} < {minimum:.4f}")
     if metrics["p95_end_to_end_ms"] > args.max_p95_end_to_end_ms:
         gate_failures.append(f"p95_end_to_end_ms {metrics['p95_end_to_end_ms']:.3f} > {args.max_p95_end_to_end_ms:.3f}")
+    evaluation_config = build_evaluation_config(
+        args,
+        settings,
+        gateway,
+        reranker_enabled=reranker_enabled,
+        embedding_dimensions=len(candidate_vectors[0]) if candidate_vectors else 0,
+        rerank_min_score=rerank_min_score,
+        rerank_min_query_coverage=rerank_min_query_coverage,
+        rerank_relevance_threshold=rerank_relevance_threshold,
+    )
     return (
         {
             "status": "completed",
@@ -582,19 +640,17 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             "parsing": parsing,
             "provider": args.provider,
             "chunk_strategy": args.chunk_strategy,
-            "model": gateway.model,
-            "embedding_model": getattr(gateway, "embedding_model_name", settings.embedding_model),
+            "evaluation_config": evaluation_config,
+            "model": evaluation_config["answer_model"],
+            "embedding_model": evaluation_config["embedding_model"],
             "multi_vector_enabled": settings.rag_multi_vector_enabled,
             "parent_embedding_count": len(parent_vectors),
-            "reranker_model": getattr(gateway, "reranker_model_name", settings.reranker_model)
-            if reranker_enabled
-            else None,
+            "reranker_model": evaluation_config["reranker_model"],
             "rerank_min_score": rerank_min_score,
             "rerank_min_query_coverage": rerank_min_query_coverage,
             "rerank_relevance_threshold": rerank_relevance_threshold,
-            "judge_model": args.judge_model
-            or getattr(gateway, "judge_model_name", gateway.model),
-            "model_revisions": getattr(gateway, "model_revisions", {}),
+            "judge_model": evaluation_config["judge_model"],
+            "model_revisions": evaluation_config["model_revisions"],
             "model_warmup_ms": round(model_warmup_ms, 3),
             "duration_ms": round((perf_counter() - started) * 1000, 3),
             "metrics": metrics,

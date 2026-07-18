@@ -226,7 +226,7 @@ python scripts/evaluate_rag_end_to_end.py `
 发布审批必须逐项确认：
 
 - 两份报告的 `dataset.corpus_sha256` 相同，且 `cases_sha256`、`documents_sha256` 和每份文档 SHA-256 完整。
-- 两份报告的 `parsing.parsed_corpus_sha256` 相同。
+- 两份报告的 `parsing.parsed_corpus_sha256` 和 `evaluation_config.sha256` 分别相同；后者锁定回答、embedding、reranker、judge、检索阈值和上下文预算，不能把模型升级误算成分块收益。
 - `parsing.backend` 为 `docling`，`fallback_enabled` 为 `false`，每份文档 `fallback_from` 为 `null`，解析器名称和版本符合固定部署版本。
 - `status` 为 `completed`，`evaluation_errors` 为空，`gates.passed` 和 `ab_comparison.passed` 都为 `true`。
 - Recall@5 不低于 `0.90`，Faithfulness 不低于 `0.95`，judge citation correctness 不低于 `0.98`，答案断言和拒答准确率均为 `1.0`。

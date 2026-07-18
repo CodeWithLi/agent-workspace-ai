@@ -23,22 +23,23 @@
 | 指标、成本、延迟与运维告警 | 已实现，固定真实模型已验证 | Prometheus、`llm_usage`、运维手册；Run #10 业务 p95 `76.10 s`、judge p95 `272.54 s`、本地模型 API 成本 `0` |
 | 后台策略、索引版本、重建、激活与回滚 | 已实现 | API、runtime setting、Knowledge UI 与 E2E 测试 |
 | native/Docling/Unstructured/MinerU 同样本比较 | 已实现，Linux 全矩阵已验证 | `RAG Parser Benchmark #2` 在同一 corpus hash 上完成四后端报告，严格 comparison gate 绿色并留存 artifact |
-| 脱敏业务语料自定义评测入口 | 已实现，待业务语料运行 | 分块和端到端脚本支持 `--cases`/`--documents-dir`；递归纳入干扰文档，校验 case 与路径，记录原始及解析后 corpus SHA-256、解析器版本并禁止跨语料 A/B；操作见 `docs/RAG_BUSINESS_CORPUS.md` |
+| 脱敏业务语料自定义评测入口 | 已实现，待业务语料运行 | 分块和端到端脚本支持 `--cases`/`--documents-dir`；递归纳入干扰文档，校验 case 与路径，记录原始及解析后 corpus SHA-256、解析器版本与 evaluation stack 指纹，并禁止跨语料/解析/模型配置 A/B；操作见 `docs/RAG_BUSINESS_CORPUS.md` |
 | 真实业务复杂 PDF/DOCX/中文表格/公式/代码验证 | 缺失 | 需要业务方提供脱敏样本；仓库合成样本不能替代 |
 | 新方案显著优于 `900/140` | 已证明（固定仓库语料） | Run #10：Recall `0.8333 -> 1.0`、MRR `0.75 -> 1.0`、nDCG `0.7718 -> 1.0`、Context Precision `0.3667 -> 0.6583`，全部防回归门禁绿色 |
 
 ## 当前验收证据
 
-- 后端全量测试在当前 RAG 代码上的最近完整结果：`204 passed, 7 skipped`；skip 仅对应需要独立真实服务的可选集成路径。
+- 后端全量测试在当前 RAG 代码上的最近完整结果：`207 passed, 7 skipped`；skip 仅对应需要独立真实服务的可选集成路径。
 - 前端当前验证：ESLint 通过、`10 passed` unit tests、TypeScript/Vite production build 通过。
 - 固定语料门禁通过：标题元数据 `0 -> 1.0`，最大 chunk `676 -> 391 tokens`，索引 token `7201 -> 6990`，Context Precision `0.1972 -> 0.2250`。
-- 自定义语料入口本地回归通过：`10 passed`；RAG 解析、分块、检索、向量库、reranker 和索引任务专项回归为 `69 passed, 2 skipped`。默认固定语料的新 corpus SHA-256 为 `6c19a309...80930`，分块门禁绿色。
+- 自定义语料与 evaluation stack 指纹本地回归通过：`11 passed`；RAG 解析、分块、检索、向量库、reranker 和索引任务专项回归为 `70 passed, 2 skipped`。默认固定语料的新 corpus SHA-256 为 `6c19a309...80930`，分块门禁绿色。
 - native parser 基准：成功率 `0.6667`、marker recall `0.6667`、结构 recall `0.3333`、阅读顺序 `0.6667`、PDF 页码覆盖 `0.5`、bbox 覆盖 `0`。
 - Docling Serve 1.26.0 真实集成测试：DOCX 表格与扫描 PDF OCR 通过；同样本质量分 `1.0`、p95 `12.79 s`、峰值内存 `2,112.6 MB`、本地环境加模型 `2,592.67 MB`。
 - MinerU 3.4.4 pipeline 同样本质量分 `1.0`、p95 `60.41 s`、峰值内存 `1,811.98 MB`、本地环境加模型 `2,678.15 MB`；实测发现并补齐其未声明的 `six` 依赖。
 - Unstructured 0.24.1 的 DOCX 单项通过；本机 Xeon E5-2680 v2 无 AVX2，ONNX Windows wheel 在 PDF 路径原生加载失败，不能据此给出候选质量结论。
 - 远程 `CI #6` 的 compose/frontend 已通过；backend 与 rag-integration 都在加载 `tests/conftest.py` 时因 `ModuleNotFoundError: No module named 'app'` 以 pytest 退出码 `4` 失败，尚未执行测试逻辑。workflow 已统一改用 `python -m pytest`，修复结果仍须以新的远程运行证明。
 - 远程 [`CI #7`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629583160) 与 [`CI #8`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629841019) 整套绿色；真实 PostgreSQL + Milvus v4 的多向量、owner 隔离、并发和 p95 集成 job 已执行通过。
+- 远程 [`CI #39`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29647694158) 在业务语料入口提交 `e98ca2f` 上整套绿色；compose、backend、真实 PostgreSQL + Milvus `rag-integration` 和 frontend 全部通过，Playwright 为 `48 passed, 2 skipped`。
 - 远程 [`RAG Docling Integration #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629854246) 绿色；官方 v1.26.0 CPU 镜像固定到不可变 digest，真实 DOCX 表格和扫描 PDF OCR 测试通过。
 - 远程 [`RAG Parser Benchmark #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629969071) 全矩阵及严格 comparison gate 绿色，artifact 保留 30 天。共同 corpus hash 为 `70e00e55...3dea1c`；质量排序为 MinerU `1.0000`、Docling `0.9167`、Unstructured `0.9167`、native `0.4792`。
 - 远程 [`RAG Model Quality Gate #10`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29644078245) 在提交 `c945780` 上绿色；artifact ID `8429990285`，SHA-256 `574cbff039e1a83d6f90d23c440e4d3f492fb47b08b26f7d858422e75eb657f9`。Candidate Recall/MRR/nDCG/Context Recall/引用目标/忠实度/答案相关性/引用正确率/答案断言/拒答均为 `1.0`，Context Precision `0.6583`，业务 p95 `76.10 s`，A/B 全部通过。

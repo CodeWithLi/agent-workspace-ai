@@ -204,6 +204,12 @@ def compare_end_to_end_reports(
         for field in ("backend", "fallback_enabled"):
             if baseline_parsing.get(field) != candidate_parsing.get(field):
                 raise ValueError("baseline and candidate reports use different parsing configurations")
+    baseline_evaluation_config = (baseline.get("evaluation_config") or {}).get("sha256")
+    candidate_evaluation_config = (candidate.get("evaluation_config") or {}).get("sha256")
+    if bool(baseline_evaluation_config) != bool(candidate_evaluation_config):
+        raise ValueError("baseline and candidate reports must both identify their evaluation configuration")
+    if baseline_evaluation_config and baseline_evaluation_config != candidate_evaluation_config:
+        raise ValueError("baseline and candidate reports use different evaluation configurations")
 
     guarded_metrics = (
         "recall_at_k",

@@ -19,6 +19,57 @@ def load_evaluation_script() -> ModuleType:
     return module
 
 
+def test_evaluation_config_fingerprint_ignores_strategy_but_locks_model_stack() -> None:
+    module = load_evaluation_script()
+    args = SimpleNamespace(
+        provider="local-open-models",
+        judge_model=None,
+        top_k=5,
+        min_score=0.2,
+        chunk_strategy="legacy",
+    )
+    settings = SimpleNamespace(
+        embedding_model="fallback-embedding",
+        reranker_model="fallback-reranker",
+        rag_query_rewrite_enabled=True,
+        rag_query_rewrite_max_variants=3,
+        reranker_candidate_limit=40,
+        rag_min_query_coverage=0.15,
+        rag_dense_override_score=0.72,
+        rag_context_max_tokens=4000,
+        rag_multi_vector_enabled=False,
+    )
+    gateway = SimpleNamespace(
+        model="answer-v1",
+        embedding_model_name="embedding-v1",
+        reranker_model_name="reranker-v1",
+        judge_model_name="judge-v1",
+        model_revisions={"answer": {"revision": "abc"}},
+    )
+    keyword_args = {
+        "reranker_enabled": True,
+        "embedding_dimensions": 384,
+        "rerank_min_score": 0.08,
+        "rerank_min_query_coverage": 0.08,
+        "rerank_relevance_threshold": 0.12,
+    }
+
+    baseline = module.build_evaluation_config(args, settings, gateway, **keyword_args)
+    args.chunk_strategy = "semantic"
+    settings.rag_multi_vector_enabled = True
+    candidate = module.build_evaluation_config(args, settings, gateway, **keyword_args)
+    changed_model = module.build_evaluation_config(
+        args,
+        settings,
+        SimpleNamespace(**{**vars(gateway), "model": "answer-v2"}),
+        **keyword_args,
+    )
+
+    assert baseline == candidate
+    assert len(baseline["sha256"]) == 64
+    assert changed_model["sha256"] != baseline["sha256"]
+
+
 @pytest.mark.asyncio
 async def test_candidate_rows_use_production_parser_and_fingerprint_result(
     monkeypatch: pytest.MonkeyPatch,

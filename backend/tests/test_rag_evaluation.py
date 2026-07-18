@@ -337,3 +337,17 @@ def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> No
                 "evaluation_errors": [],
             },
         )
+
+    with pytest.raises(ValueError, match="different evaluation configurations"):
+        compare_end_to_end_reports(
+            {
+                "evaluation_config": {"sha256": "e" * 64},
+                "metrics": baseline_metrics,
+                "evaluation_errors": [],
+            },
+            {
+                "evaluation_config": {"sha256": "f" * 64},
+                "metrics": candidate_metrics,
+                "evaluation_errors": [],
+            },
+        )
