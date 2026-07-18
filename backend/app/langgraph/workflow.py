@@ -52,6 +52,8 @@ class ProjectState(TypedDict, total=False):
     report: str
     agent_snapshot: dict[str, dict[str, Any]]
     execution_plan: dict[str, Any]
+    plan_version: int
+    plan_revisions: list[dict[str, Any]]
     require_plan_approval: bool
     plan_approved: bool
     plan_revision_count: int
@@ -105,6 +107,8 @@ def initial_state(
         "report": "",
         "agent_snapshot": agent_snapshot or {},
         "execution_plan": {},
+        "plan_version": 0,
+        "plan_revisions": [],
         "require_plan_approval": require_plan_approval,
         "plan_approved": not require_plan_approval,
         "plan_revision_count": 0,
@@ -120,6 +124,37 @@ def initial_state(
 
 def append_message(state: WorkspaceGraphState, role: str, content: str) -> list[dict[str, str]]:
     return [*state.get("messages", []), {"role": role, "content": content}]
+
+
+def select_execution_plan_version(
+    state: dict[str, Any],
+    requested_version: int | None = None,
+) -> tuple[dict[str, Any], int]:
+    if requested_version is not None and requested_version < 1:
+        raise ValueError("Execution plan version must be at least 1")
+    revisions = state.get("plan_revisions")
+    revisions = revisions if isinstance(revisions, list) else []
+    stored_versions = [
+        int(item["version"])
+        for item in revisions
+        if isinstance(item, dict) and isinstance(item.get("version"), int)
+    ]
+    current_version = int(state.get("plan_version") or (max(stored_versions, default=0) or 1))
+    selected_version = requested_version or current_version
+    candidate = state.get("execution_plan") if selected_version == current_version else None
+    if candidate is None:
+        candidate = next(
+            (
+                item.get("plan")
+                for item in revisions
+                if isinstance(item, dict) and item.get("version") == selected_version
+            ),
+            None,
+        )
+    if not isinstance(candidate, dict):
+        raise ValueError(f"Execution plan version {selected_version} was not found")
+    plan = MultiAgentExecutionPlan.model_validate(candidate)
+    return plan.model_dump(mode="json"), selected_version
 
 
 def without_analysis(value: dict[str, Any]) -> dict[str, Any]:
@@ -351,6 +386,26 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         )
         plan = parse_execution_plan(planner_output, state["user_input"])
         approval_required = bool(state.get("require_plan_approval", False))
+        revisions = state.get("plan_revisions")
+        revisions = revisions if isinstance(revisions, list) else []
+        plan_version = max(
+            (
+                int(item.get("version", 0))
+                for item in revisions
+                if isinstance(item, dict)
+            ),
+            default=0,
+        ) + 1
+        plan_snapshot = plan.model_dump(mode="json")
+        plan_revisions = [
+            *revisions,
+            {
+                "version": plan_version,
+                "plan": plan_snapshot,
+                "feedback": revision_feedback,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        ]
         record_workflow_event(
             db,
             workflow,
@@ -362,10 +417,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "success_criteria_count": len(plan.success_criteria),
                 "revision_count": int(state.get("plan_revision_count", 0)),
                 "approval_required": approval_required,
+                "plan_version": plan_version,
             },
         )
         return complete_node(db, workflow, "planning", state, {
-            "execution_plan": plan.model_dump(mode="json"),
+            "execution_plan": plan_snapshot,
+            "plan_version": plan_version,
+            "plan_revisions": plan_revisions,
             "messages": append_message(
                 state,
                 "planning_agent",
@@ -744,6 +802,7 @@ async def continue_workspace_graph(
     workflow: WorkflowRun,
     human_feedback: str = "",
     decision: Literal["APPROVE", "REVISE"] | None = None,
+    plan_version: int | None = None,
 ) -> WorkflowRun:
     if workflow.status != WorkflowStatus.paused or workflow.current_node not in {
         "plan_review",
@@ -754,7 +813,12 @@ async def continue_workspace_graph(
     gate = workflow.current_node
     persisted = json.loads(workflow.state_json or "{}")
     pause_before_report = workflow.pause_before_report
+    reviewed_plan_version: int | None = None
     if gate == "plan_review":
+        selected_plan, selected_version = select_execution_plan_version(persisted, plan_version)
+        reviewed_plan_version = selected_version
+        persisted["execution_plan"] = selected_plan
+        persisted["plan_version"] = selected_version
         if decision == "APPROVE":
             persisted["plan_approved"] = True
             workflow.current_node = "specialists"
@@ -767,6 +831,7 @@ async def continue_workspace_graph(
                 payload={
                     "branch_count": len(persisted.get("execution_plan", {}).get("assignments", [])),
                     "revision_count": int(persisted.get("plan_revision_count", 0)),
+                    "plan_version": selected_version,
                 },
             )
         elif decision == "REVISE":
@@ -786,6 +851,7 @@ async def continue_workspace_graph(
                 payload={
                     "instruction_chars": len(feedback),
                     "revision_count": persisted["plan_revision_count"],
+                    "source_plan_version": selected_version,
                 },
             )
         else:
@@ -811,7 +877,7 @@ async def continue_workspace_graph(
         workflow,
         "CONTINUED",
         "Workflow continued after human review",
-        payload={"approval_gate": gate},
+        payload={"approval_gate": gate, "plan_version": reviewed_plan_version},
     )
     db.commit()
     return await execute_workspace_graph(db, workflow, pause_before_report=pause_before_report)

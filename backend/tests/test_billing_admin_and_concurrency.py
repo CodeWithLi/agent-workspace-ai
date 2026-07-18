@@ -792,6 +792,15 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
         state_json=json.dumps(
             {
                 "execution_plan": plan,
+                "plan_version": 1,
+                "plan_revisions": [
+                    {
+                        "version": 1,
+                        "plan": plan,
+                        "feedback": "",
+                        "created_at": "2026-07-19T08:00:00+00:00",
+                    }
+                ],
                 "require_plan_approval": True,
                 "plan_approved": False,
                 "plan_revision_count": 0,
@@ -839,11 +848,39 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
     assert revision.state["plan_revision_feedback"] == "增加安全评审角色并量化回滚验收标准"
 
     workflow = db.get(WorkflowRun, workflow.id)
+    revised_plan = {**plan, "objective": "增加安全边界后的 v2 方案"}
+    revised_state = json.loads(workflow.state_json)
+    revised_state["execution_plan"] = revised_plan
+    revised_state["plan_version"] = 2
+    revised_state["plan_revisions"] = [
+        *revised_state["plan_revisions"],
+        {
+            "version": 2,
+            "plan": revised_plan,
+            "feedback": "增加安全评审角色并量化回滚验收标准",
+            "created_at": "2026-07-19T08:05:00+00:00",
+        },
+    ]
+    workflow.state_json = json.dumps(revised_state, ensure_ascii=False)
     workflow.status = WorkflowStatus.paused
     workflow.current_node = "plan_review"
     db.commit()
+
+    with pytest.raises(HTTPException) as invalid_version:
+        await continue_workflow(
+            WorkflowContinueRequest(
+                workflow_id=workflow.id,
+                decision="APPROVE",
+                plan_version=99,
+            ),
+            http_request("/api/v1/workflow/continue"),
+            user,
+            db,
+        )
+    assert invalid_version.value.status_code == 422
+
     approval = await continue_workflow(
-        WorkflowContinueRequest(workflow_id=workflow.id, decision="APPROVE"),
+        WorkflowContinueRequest(workflow_id=workflow.id, decision="APPROVE", plan_version=1),
         http_request("/api/v1/workflow/continue"),
         user,
         db,
@@ -851,6 +888,9 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
     assert approval.status == WorkflowStatus.queued
     assert approval.current_node == "specialists"
     assert approval.state["plan_approved"] is True
+    assert approval.state["plan_version"] == 1
+    assert approval.state["execution_plan"]["objective"] == plan["objective"]
+    assert len(approval.state["plan_revisions"]) == 2
     assert db.scalar(
         select(func.count(WorkflowEvent.id)).where(
             WorkflowEvent.workflow_id == workflow.id,
@@ -872,6 +912,15 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
         )
     )
     assert {"workflow.plan_revision_requested", "workflow.plan_approved"} <= actions
+    approval_audit = db.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.action == "workflow.plan_approved",
+            AuditLog.resource_id == str(workflow.id),
+        )
+        .order_by(AuditLog.id.desc())
+    )
+    assert json.loads(approval_audit.details)["plan_version"] == 1
 
 
 @pytest.mark.asyncio

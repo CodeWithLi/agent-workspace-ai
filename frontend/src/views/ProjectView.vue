@@ -126,6 +126,12 @@
         </el-steps>
       </div>
       <section v-if="executionPlan" class="workflow-orchestration" aria-label="多 Agent 执行计划">
+        <div v-if="workflowPlanReview && planRevisions.length > 1" class="plan-version-toolbar">
+          <div><strong>计划版本</strong><span>当前生成 v{{ latestPlanVersion }}</span></div>
+          <div class="plan-version-selector">
+            <el-segmented v-model="selectedPlanVersion" :options="planVersionOptions" aria-label="执行计划版本" />
+          </div>
+        </div>
         <div class="orchestration-heading">
           <div class="orchestration-copy">
             <h4>动态执行计划</h4>
@@ -133,9 +139,16 @@
             <small>{{ executionPlan.rationale }}</small>
           </div>
           <div class="orchestration-tags">
+            <el-tag type="info">v{{ displayedPlanVersion }}</el-tag>
             <el-tag v-if="executionPlanApprovalLabel" :type="executionPlanApprovalType">{{ executionPlanApprovalLabel }}</el-tag>
             <el-tag type="primary">{{ executionPlan.assignments.length }} 个并行分支</el-tag>
           </div>
+        </div>
+        <div v-if="workflowPlanReview && selectedPlanRevision" class="plan-version-diff">
+          <strong>{{ previousPlanRevision ? `相较 v${previousPlanRevision.version} 的变化` : '初始计划' }}</strong>
+          <ul v-if="planVersionChanges.length"><li v-for="change in planVersionChanges" :key="change">{{ change }}</li></ul>
+          <span v-else-if="previousPlanRevision">结构化计划内容未发生变化</span>
+          <p v-if="selectedPlanRevision.feedback">重规划意见：{{ selectedPlanRevision.feedback }}</p>
         </div>
         <div class="plan-success-criteria">
           <strong>本轮成功标准</strong>
@@ -198,7 +211,7 @@
             :icon="Connection"
             :loading="workflowActionBusy"
             @click="continueWorkflow('APPROVE')"
-          >批准并启动 {{ executionPlan?.assignments.length || 0 }} 个分支</el-button>
+          >批准 v{{ displayedPlanVersion }} 并启动 {{ executionPlan?.assignments.length || 0 }} 个分支</el-button>
         </div>
       </section>
       <el-table v-if="workflowSagaSteps.length" :data="workflowSagaSteps" class="data-table">
@@ -322,6 +335,13 @@ interface WorkflowExecutionPlan {
   success_criteria: string[]
 }
 
+interface WorkflowPlanRevision {
+  version: number
+  plan: WorkflowExecutionPlan
+  feedback: string
+  created_at: string
+}
+
 interface WorkflowHandoff extends WorkflowAssignment {
   content: string
   revision_round: number
@@ -354,6 +374,7 @@ const workflowStatus = ref('')
 const workflowCurrentNode = ref('')
 const workflowError = ref('')
 const workflowFeedback = ref('')
+const selectedPlanVersion = ref(1)
 const workflowEvents = ref<WorkflowEvent[]>([])
 const workflowSagaSteps = ref<WorkflowSagaStep[]>([])
 const workflowActionBusy = ref(false)
@@ -400,7 +421,7 @@ const workflowPlanReview = computed(() => (
 const workflowFeedbackRequired = computed(() => workflowOperatorPaused.value || workflowCurrentNode.value === 'quality_review')
 const workflowApprovalTitle = computed(() => {
   if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
-  if (workflowPlanReview.value) return '执行计划等待批准'
+  if (workflowPlanReview.value) return `执行计划 v${displayedPlanVersion.value} 等待批准`
   return workflowCurrentNode.value === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认'
 })
 const workflowApprovalDescription = computed(() => {
@@ -440,7 +461,70 @@ const workflowConnectionNotice = computed(() => {
   }
   return '正在恢复实时进度，后台 Agent 会继续执行。'
 })
+const planRevisions = computed<WorkflowPlanRevision[]>(() => {
+  const revisions = workflowState.value?.plan_revisions
+  if (Array.isArray(revisions)) {
+    const valid = revisions.filter((item): item is WorkflowPlanRevision => (
+      Number.isInteger(item?.version)
+      && item.version > 0
+      && item.plan
+      && Array.isArray(item.plan.assignments)
+      && Array.isArray(item.plan.success_criteria)
+    ))
+    if (valid.length) return [...valid].sort((left, right) => left.version - right.version)
+  }
+  const plan = workflowState.value?.execution_plan
+  if (!plan || !Array.isArray(plan.assignments) || !Array.isArray(plan.success_criteria)) return []
+  return [{
+    version: Number(workflowState.value?.plan_version) || 1,
+    plan: plan as WorkflowExecutionPlan,
+    feedback: '',
+    created_at: ''
+  }]
+})
+const latestPlanVersion = computed(() => planRevisions.value[planRevisions.value.length - 1]?.version || 1)
+const planVersionOptions = computed(() => planRevisions.value.map((revision) => ({
+  label: `v${revision.version}`,
+  value: revision.version
+})))
+const displayedPlanVersion = computed(() => {
+  if (workflowPlanReview.value && selectedPlanVersion.value) return selectedPlanVersion.value
+  return Number(workflowState.value?.plan_version) || latestPlanVersion.value
+})
+const selectedPlanRevision = computed(() => (
+  planRevisions.value.find((revision) => revision.version === displayedPlanVersion.value) || null
+))
+const previousPlanRevision = computed(() => {
+  const selectedIndex = planRevisions.value.findIndex((revision) => revision.version === displayedPlanVersion.value)
+  return selectedIndex > 0 ? planRevisions.value[selectedIndex - 1] : null
+})
+const planVersionChanges = computed(() => {
+  const current = selectedPlanRevision.value?.plan
+  const previous = previousPlanRevision.value?.plan
+  if (!current || !previous) return []
+  const changes: string[] = []
+  if (current.objective !== previous.objective) changes.push('调整总体目标')
+  if (current.rationale !== previous.rationale) changes.push('更新编排理由')
+  const currentByRole = new Map(current.assignments.map((assignment) => [assignment.role, assignment]))
+  const previousByRole = new Map(previous.assignments.map((assignment) => [assignment.role, assignment]))
+  const addedRoles = [...currentByRole.keys()].filter((role) => !previousByRole.has(role))
+  const removedRoles = [...previousByRole.keys()].filter((role) => !currentByRole.has(role))
+  if (addedRoles.length) changes.push(`新增角色：${addedRoles.map(specialistRoleLabel).join('、')}`)
+  if (removedRoles.length) changes.push(`移除角色：${removedRoles.map(specialistRoleLabel).join('、')}`)
+  const updatedRoles = [...currentByRole.keys()].filter((role) => {
+    const prior = previousByRole.get(role)
+    const next = currentByRole.get(role)
+    return prior && next && (prior.objective !== next.objective || prior.deliverable !== next.deliverable)
+  })
+  if (updatedRoles.length) changes.push(`更新分支：${updatedRoles.map(specialistRoleLabel).join('、')}`)
+  const addedCriteria = current.success_criteria.filter((criterion) => !previous.success_criteria.includes(criterion))
+  const removedCriteria = previous.success_criteria.filter((criterion) => !current.success_criteria.includes(criterion))
+  if (addedCriteria.length) changes.push(`新增 ${addedCriteria.length} 项成功标准`)
+  if (removedCriteria.length) changes.push(`移除 ${removedCriteria.length} 项成功标准`)
+  return changes
+})
 const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
+  if (workflowPlanReview.value && selectedPlanRevision.value) return selectedPlanRevision.value.plan
   const plan = workflowState.value?.execution_plan
   return plan && Array.isArray(plan.assignments) ? plan as WorkflowExecutionPlan : null
 })
@@ -652,6 +736,7 @@ function activityLabel(action: string) {
 function applyWorkflow(workflow: WorkflowRun) {
   const enteredTerminalState = ['COMPLETED', 'FAILED', 'CANCELLED'].includes(workflow.status)
     && workflowStatus.value !== workflow.status
+  const previousPlanVersion = Number(workflowState.value?.plan_version) || 0
   if (workflowCurrentNode.value !== workflow.current_node) workflowFeedback.value = ''
   workflowId.value = workflow.workflow_id
   workflowParentId.value = workflow.parent_workflow_id
@@ -663,6 +748,17 @@ function applyWorkflow(workflow: WorkflowRun) {
   workflowStatus.value = workflow.status
   workflowCurrentNode.value = workflow.current_node
   workflowState.value = workflow.state
+  const nextRevisions = Array.isArray(workflow.state?.plan_revisions) ? workflow.state.plan_revisions : []
+  const nextPlanVersion = Number(workflow.state?.plan_version)
+    || Math.max(0, ...nextRevisions.map((item: { version?: number }) => Number(item?.version) || 0))
+    || (workflow.state?.execution_plan ? 1 : 0)
+  const availableVersions = new Set(nextRevisions.map((item: { version?: number }) => Number(item?.version)))
+  if (
+    nextPlanVersion > previousPlanVersion
+    || (availableVersions.size && !availableVersions.has(selectedPlanVersion.value))
+  ) {
+    selectedPlanVersion.value = nextPlanVersion || 1
+  }
   workflowError.value = workflow.error
   if (enteredTerminalState) workflowRequestId.value = crypto.randomUUID()
 }
@@ -854,14 +950,15 @@ async function continueWorkflow(decision?: 'APPROVE' | 'REVISE') {
     const { data } = await api.post<WorkflowRun>('/workflow/continue', {
       workflow_id: workflowId.value,
       human_feedback: feedback,
-      decision
+      decision,
+      plan_version: workflowPlanReview.value ? displayedPlanVersion.value : undefined
     })
     workflowFeedback.value = ''
     applyWorkflow(data)
     const cursor = await loadWorkflowEventHistory(data.workflow_id)
     watchWorkflowEvents(cursor)
     if (operatorResume) ElMessage.success('恢复指令已应用')
-    else if (decision === 'APPROVE') ElMessage.success('执行计划已批准，专业分支开始执行')
+    else if (decision === 'APPROVE') ElMessage.success(`执行计划 v${displayedPlanVersion.value} 已批准，专业分支开始执行`)
     else if (decision === 'REVISE') ElMessage.success('重新规划要求已提交')
     else ElMessage.success('工作流已继续')
   } finally {
@@ -1111,6 +1208,40 @@ onBeforeUnmount(disposeWorkflowEventStream)
   border-block: 1px solid var(--color-border);
 }
 
+.plan-version-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.plan-version-toolbar > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.plan-version-toolbar strong {
+  font-size: 13px;
+}
+
+.plan-version-toolbar span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.plan-version-selector {
+  max-width: 60%;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.plan-version-selector :deep(.el-segmented) {
+  min-width: max-content;
+}
+
 .orchestration-heading {
   display: flex;
   align-items: flex-start;
@@ -1151,6 +1282,38 @@ onBeforeUnmount(disposeWorkflowEventStream)
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.plan-version-diff {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-primary-soft);
+}
+
+.plan-version-diff strong,
+.plan-version-diff span,
+.plan-version-diff li,
+.plan-version-diff p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.plan-version-diff ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 22px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--color-secondary-text);
+}
+
+.plan-version-diff p {
+  margin: 0;
+  color: var(--color-secondary-text);
+  overflow-wrap: anywhere;
 }
 
 .plan-success-criteria {
@@ -1336,6 +1499,19 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .workflow-approval-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .plan-version-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .plan-version-selector {
+    max-width: 100%;
+  }
+
+  .plan-version-selector :deep(.el-segmented) {
+    min-height: 44px;
   }
 }
 

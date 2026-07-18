@@ -121,6 +121,7 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "decision",
     "next_node",
     "output_chars",
+    "plan_version",
     "revision_roles",
     "revision_round",
     "revision_count",
@@ -128,6 +129,7 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "roles",
     "score",
     "success_criteria_count",
+    "source_plan_version",
 }
 
 

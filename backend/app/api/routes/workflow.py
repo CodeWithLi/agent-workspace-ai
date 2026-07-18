@@ -14,7 +14,7 @@ from app.api.routes.projects import get_project_for_user
 from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import SessionLocal, get_db
-from app.langgraph.workflow import initial_state, record_workflow_event, snapshot_agent_configs
+from app.langgraph.workflow import initial_state, record_workflow_event, select_execution_plan_version, snapshot_agent_configs
 from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
 from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
 from app.services.billing import InsufficientTokensError, apply_token_change
@@ -473,6 +473,12 @@ async def continue_workflow(
     feedback = payload.human_feedback.strip()
     operator_pause = workflow.pause_requested_at is not None
     gate = "operator" if operator_pause else workflow.current_node
+    reviewed_plan_version: int | None = None
+    if payload.plan_version is not None and (operator_pause or workflow.current_node != "plan_review"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Plan version can only be selected during plan review",
+        )
     if operator_pause:
         if not feedback:
             raise HTTPException(
@@ -497,6 +503,15 @@ async def continue_workflow(
             workflow.current_node = "specialists"
             workflow.pause_before_report = True
         elif workflow.current_node == "plan_review":
+            try:
+                selected_plan, reviewed_plan_version = select_execution_plan_version(state)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+            state["execution_plan"] = selected_plan
+            state["plan_version"] = reviewed_plan_version
             state["plan_approved"] = False
             state["plan_revision_feedback"] = feedback
             state["plan_revision_count"] = int(state.get("plan_revision_count", 0)) + 1
@@ -510,6 +525,7 @@ async def continue_workflow(
                 payload={
                     "instruction_chars": len(feedback),
                     "revision_count": state["plan_revision_count"],
+                    "source_plan_version": reviewed_plan_version,
                 },
             )
         elif workflow.current_node == "report":
@@ -536,6 +552,16 @@ async def continue_workflow(
                 detail="Plan review decision must be APPROVE or REVISE",
             )
         state = workflow_state(workflow)
+        try:
+            selected_plan, selected_version = select_execution_plan_version(state, payload.plan_version)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+        state["execution_plan"] = selected_plan
+        state["plan_version"] = selected_version
+        reviewed_plan_version = selected_version
         if payload.decision == "REVISE":
             if not feedback:
                 raise HTTPException(
@@ -555,6 +581,7 @@ async def continue_workflow(
                 payload={
                     "instruction_chars": len(feedback),
                     "revision_count": state["plan_revision_count"],
+                    "source_plan_version": selected_version,
                 },
             )
         else:
@@ -569,6 +596,7 @@ async def continue_workflow(
                 payload={
                     "branch_count": len(state.get("execution_plan", {}).get("assignments", [])),
                     "revision_count": int(state.get("plan_revision_count", 0)),
+                    "plan_version": selected_version,
                 },
             )
         workflow.state_json = json.dumps(state, ensure_ascii=False)
@@ -599,7 +627,11 @@ async def continue_workflow(
         workflow,
         "QUEUED",
         "Workflow continued after human review",
-        payload={"approval_gate": gate, "decision": payload.decision},
+        payload={
+            "approval_gate": gate,
+            "decision": payload.decision,
+            "plan_version": reviewed_plan_version,
+        },
     )
     audit_action = "workflow.continue"
     if gate == "plan_review" and payload.decision == "APPROVE":
@@ -617,6 +649,7 @@ async def continue_workflow(
             "approval_gate": gate,
             "decision": payload.decision,
             "instruction_chars": len(feedback),
+            "plan_version": reviewed_plan_version,
         },
         request,
     )

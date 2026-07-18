@@ -187,6 +187,9 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert workflow.status == WorkflowStatus.paused
     assert workflow.current_node == "plan_review"
     assert first_state["plan_approved"] is False
+    assert first_state["plan_version"] == 1
+    assert len(first_state["plan_revisions"]) == 1
+    assert first_state["plan_revisions"][0]["plan"]["objective"] == "首版交付计划"
     assert first_state["plan_revision_count"] == 0
     assert first_state["specialist_handoffs"] == []
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
@@ -204,17 +207,44 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert workflow.status == WorkflowStatus.paused
     assert workflow.current_node == "plan_review"
     assert revised_state["execution_plan"]["objective"] == "修订后的可审计交付计划"
+    assert revised_state["plan_version"] == 2
+    assert len(revised_state["plan_revisions"]) == 2
+    assert revised_state["plan_revisions"][0]["plan"]["objective"] == "首版交付计划"
+    assert revised_state["plan_revisions"][1]["feedback"] == "补充安全边界，并为失败场景指定负责人"
     assert revised_state["plan_revision_count"] == 1
     assert revised_state["plan_approved"] is False
     assert "补充安全边界" in planner_prompts[-1]
     assert "首版交付计划" in planner_prompts[-1]
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
 
-    workflow = await continue_workspace_graph(db, workflow, decision="APPROVE")
+    with pytest.raises(ValueError, match="version 99 was not found"):
+        await continue_workspace_graph(db, workflow, decision="APPROVE", plan_version=99)
+
+    workflow = await continue_workspace_graph(
+        db,
+        workflow,
+        "基于首版重新规划，保留原始交付边界",
+        decision="REVISE",
+        plan_version=1,
+    )
+    historical_revision_state = json.loads(workflow.state_json)
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "plan_review"
+    assert historical_revision_state["plan_version"] == 3
+    assert len(historical_revision_state["plan_revisions"]) == 3
+    assert historical_revision_state["plan_revisions"][2]["feedback"] == "基于首版重新规划，保留原始交付边界"
+    assert "基于首版重新规划" in planner_prompts[-1]
+    assert "首版交付计划" in planner_prompts[-1]
+    assert "修订后的可审计交付计划" not in planner_prompts[-1]
+
+    workflow = await continue_workspace_graph(db, workflow, decision="APPROVE", plan_version=1)
     approved_state = json.loads(workflow.state_json)
     assert workflow.status == WorkflowStatus.paused
     assert workflow.current_node == "report"
     assert approved_state["plan_approved"] is True
+    assert approved_state["plan_version"] == 1
+    assert approved_state["execution_plan"]["objective"] == "首版交付计划"
+    assert len(approved_state["plan_revisions"]) == 3
     assert len(approved_state["specialist_handoffs"]) == 2
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 4
     event_types = list(
@@ -224,9 +254,18 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
             .order_by(WorkflowEvent.id)
         )
     )
-    assert event_types.count("PLAN_REVISION_REQUESTED") == 1
+    assert event_types.count("PLAN_REVISION_REQUESTED") == 2
     assert event_types.count("PLAN_APPROVED") == 1
-    assert event_types.count("PLAN_CREATED") == 2
+    assert event_types.count("PLAN_CREATED") == 3
+    approved_event = db.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "PLAN_APPROVED",
+        )
+        .order_by(WorkflowEvent.id.desc())
+    )
+    assert json.loads(approved_event.payload_json)["plan_version"] == 1
 
 
 @pytest.mark.asyncio

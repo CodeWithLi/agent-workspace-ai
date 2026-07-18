@@ -410,6 +410,7 @@ class WorkflowContinueRequest(BaseModel):
     workflow_id: int
     human_feedback: str = Field(default="", max_length=4000)
     decision: Literal["APPROVE", "REVISE"] | None = None
+    plan_version: int | None = Field(default=None, ge=1)
 
 
 class WorkflowPauseRequest(BaseModel):
