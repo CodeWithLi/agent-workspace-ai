@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.langgraph.workflow import WorkflowCancelled, execute_workspace_graph, record_workflow_event
+from app.langgraph.workflow import WorkflowCancelled, WorkflowPauseRequested, execute_workspace_graph, record_workflow_event
 from app.models import WorkflowRun, WorkflowStatus
 from app.services.billing import refund_consumption
 from app.services.workflow_saga import (
@@ -113,6 +113,9 @@ def finish_workflow_compensation(
         workflow.status = WorkflowStatus.compensation_failed
         workflow.locked_at = None
         workflow.lease_token = None
+        workflow.pause_requested_at = None
+        workflow.pause_requested_by_user_id = None
+        workflow.pause_reason = ""
         workflow.error = f"{reason}; compensation failed: {exc}"[:2000]
         refund_workflow_charge(db, workflow, "Multi-agent workflow failed and requires reconciliation")
         record_workflow_event(
@@ -141,6 +144,9 @@ def finish_workflow_compensation(
     workflow.status = target
     workflow.locked_at = None
     workflow.lease_token = None
+    workflow.pause_requested_at = None
+    workflow.pause_requested_by_user_id = None
+    workflow.pause_reason = ""
     workflow.finished_at = utc_now()
     workflow.error = reason[:2000] if target == WorkflowStatus.failed else ""
     refund_workflow_charge(db, workflow, f"Multi-agent workflow {target.value.lower()}")
@@ -254,6 +260,47 @@ async def process_workflow(db: Session, workflow_id: int, *, claimed: bool = Fal
             target_status=WorkflowStatus.cancelled,
             reason="Workflow cancellation requested",
         )
+    except WorkflowPauseRequested:
+        db.rollback()
+        workflow = db.get(WorkflowRun, workflow_id)
+        if workflow.status == WorkflowStatus.cancelling:
+            return finish_workflow_compensation(
+                db,
+                workflow,
+                target_status=WorkflowStatus.cancelled,
+                reason="Workflow cancellation superseded an operator pause",
+            )
+        workflow.status = WorkflowStatus.paused
+        workflow.locked_at = None
+        workflow.lease_token = None
+        workflow.error = ""
+        workflow.intervention_count += 1
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow paused at a committed node boundary",
+            payload={
+                "approval_gate": "operator",
+                "requested_by_user_id": workflow.pause_requested_by_user_id,
+                "reason_chars": len(workflow.pause_reason),
+                "intervention_count": workflow.intervention_count,
+            },
+        )
+        record_audit(
+            db,
+            "workflow.operator_paused",
+            workflow.pause_requested_by_user_id or workflow.user_id,
+            workflow.project_id,
+            "workflow",
+            workflow.id,
+            {
+                "reason_chars": len(workflow.pause_reason),
+                "intervention_count": workflow.intervention_count,
+            },
+        )
+        db.commit()
+        return workflow
     except Exception as exc:
         db.rollback()
         workflow = db.get(WorkflowRun, workflow_id)

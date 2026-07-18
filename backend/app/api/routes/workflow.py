@@ -16,7 +16,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal, get_db
 from app.langgraph.workflow import initial_state, record_workflow_event, snapshot_agent_configs
 from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
-from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
+from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
 from app.services.billing import InsufficientTokensError, apply_token_change
 from app.services.workflows import finish_workflow_compensation, refund_workflow_charge
 from app.rag.service import DuplicateDocumentError, queue_document
@@ -78,6 +78,10 @@ def to_response(workflow: WorkflowRun) -> WorkflowResponse:
         parent_workflow_id=workflow.parent_workflow_id,
         retry_from_node=workflow.retry_from_node,
         retry_sequence=workflow.retry_sequence,
+        pause_requested_at=workflow.pause_requested_at,
+        pause_requested_by_user_id=workflow.pause_requested_by_user_id,
+        pause_reason=workflow.pause_reason,
+        intervention_count=workflow.intervention_count,
         status=workflow.status,
         current_node=workflow.current_node,
         state=state,
@@ -91,13 +95,16 @@ def to_response(workflow: WorkflowRun) -> WorkflowResponse:
     )
 
 
-def retry_checkpoint_state(db: Session, workflow: WorkflowRun) -> dict:
+def workflow_state(workflow: WorkflowRun) -> dict:
     try:
         state = json.loads(workflow.state_json or "{}")
     except (json.JSONDecodeError, TypeError):
         state = {}
-    if not isinstance(state, dict):
-        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def retry_checkpoint_state(db: Session, workflow: WorkflowRun) -> dict:
+    state = workflow_state(workflow)
 
     latest_started_node = db.scalar(
         select(WorkflowEvent.node)
@@ -367,6 +374,79 @@ async def stream_workflow_events(
     )
 
 
+@router.post("/{workflow_id}/pause", response_model=WorkflowResponse)
+def pause_workflow(
+    workflow_id: int,
+    payload: WorkflowPauseRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> WorkflowResponse:
+    workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.id == workflow_id).with_for_update())
+    if not workflow or workflow.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
+    get_project_for_user(workflow.project_id, current_user, db, write=True)
+    if workflow.pause_request_id == payload.request_id:
+        return to_response(workflow)
+    if workflow.pause_requested_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow already has a pending pause request")
+    if workflow.status not in {WorkflowStatus.queued, WorkflowStatus.running}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only queued or running workflows can be paused")
+
+    workflow.pause_requested_at = utc_now()
+    workflow.pause_requested_by_user_id = current_user.id
+    workflow.pause_reason = payload.reason.strip()
+    workflow.pause_request_id = payload.request_id
+    record_workflow_event(
+        db,
+        workflow,
+        "PAUSE_REQUESTED",
+        "Operator requested a safe-boundary pause",
+        payload={"requested_by_user_id": current_user.id, "reason_chars": len(workflow.pause_reason)},
+    )
+    if workflow.status == WorkflowStatus.queued:
+        workflow.status = WorkflowStatus.paused
+        workflow.intervention_count += 1
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow paused before worker execution",
+            payload={
+                "approval_gate": "operator",
+                "requested_by_user_id": current_user.id,
+                "reason_chars": len(workflow.pause_reason),
+                "intervention_count": workflow.intervention_count,
+            },
+        )
+        record_audit(
+            db,
+            "workflow.operator_paused",
+            current_user.id,
+            workflow.project_id,
+            "workflow",
+            workflow.id,
+            {
+                "reason_chars": len(workflow.pause_reason),
+                "intervention_count": workflow.intervention_count,
+            },
+            request,
+        )
+    record_audit(
+        db,
+        "workflow.pause_requested",
+        current_user.id,
+        workflow.project_id,
+        "workflow",
+        workflow.id,
+        {"request_id": payload.request_id, "reason_chars": len(workflow.pause_reason)},
+        request,
+    )
+    db.commit()
+    db.refresh(workflow)
+    return to_response(workflow)
+
+
 @router.post("/continue", response_model=WorkflowResponse, status_code=status.HTTP_202_ACCEPTED)
 async def continue_workflow(
     payload: WorkflowContinueRequest,
@@ -378,14 +458,81 @@ async def continue_workflow(
     if not workflow or workflow.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
     get_project_for_user(workflow.project_id, current_user, db, write=True)
-    if workflow.status != WorkflowStatus.paused or workflow.current_node != "report":
+    if workflow.status != WorkflowStatus.paused:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow is not waiting for human confirmation")
-    workflow.human_feedback = payload.human_feedback
-    workflow.pause_before_report = False
+
+    feedback = payload.human_feedback.strip()
+    operator_pause = workflow.pause_requested_at is not None
+    gate = "operator" if operator_pause else workflow.current_node
+    if operator_pause:
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Resume instruction is required after an operator pause",
+            )
+        state = workflow_state(workflow)
+        interventions = state.get("interventions")
+        if not isinstance(interventions, list):
+            interventions = []
+        state["interventions"] = [
+            *interventions,
+            {
+                "reason": workflow.pause_reason,
+                "instruction": feedback,
+                "resume_from_node": workflow.current_node,
+            },
+        ][-10:]
+        if workflow.current_node == "quality_review":
+            state["revision_feedback"] = feedback
+            state["manual_revision_count"] = int(state.get("manual_revision_count", 0)) + 1
+            workflow.current_node = "specialists"
+            workflow.pause_before_report = True
+        elif workflow.current_node == "report":
+            workflow.pause_before_report = False
+        workflow.state_json = json.dumps(state, ensure_ascii=False)
+        workflow.pause_requested_at = None
+        workflow.pause_requested_by_user_id = None
+        workflow.pause_reason = ""
+        record_workflow_event(
+            db,
+            workflow,
+            "INTERVENTION_APPLIED",
+            "Operator instruction applied to workflow context",
+            payload={
+                "resume_from_node": state["interventions"][-1]["resume_from_node"],
+                "instruction_chars": len(feedback),
+                "intervention_count": workflow.intervention_count,
+            },
+        )
+    elif workflow.current_node == "quality_review":
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Revision instruction is required for quality review",
+            )
+        state = workflow_state(workflow)
+        state["revision_feedback"] = feedback
+        state["manual_revision_count"] = int(state.get("manual_revision_count", 0)) + 1
+        workflow.state_json = json.dumps(state, ensure_ascii=False)
+        workflow.current_node = "specialists"
+        workflow.pause_before_report = True
+    elif workflow.current_node == "report":
+        workflow.pause_before_report = False
+    else:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow is not waiting for human confirmation")
+
+    if not operator_pause:
+        workflow.human_feedback = feedback
     workflow.status = WorkflowStatus.queued
     workflow.error = ""
     workflow.finished_at = None
-    record_workflow_event(db, workflow, "QUEUED", "Workflow continued after human review")
+    record_workflow_event(
+        db,
+        workflow,
+        "QUEUED",
+        "Workflow continued after human review",
+        payload={"approval_gate": gate},
+    )
     record_audit(
         db,
         "workflow.continue",
@@ -393,7 +540,8 @@ async def continue_workflow(
         workflow.project_id,
         "workflow",
         workflow.id,
-        request=request,
+        {"approval_gate": gate, "instruction_chars": len(feedback)},
+        request,
     )
     db.commit()
     db.refresh(workflow)

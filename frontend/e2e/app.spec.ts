@@ -502,14 +502,14 @@ async function mockApi(page: Page) {
     recent_runs: [
       {
         workflow_id: 88, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
-        parent_workflow_id: 87, retry_from_node: 'architect', retry_sequence: 1,
+        parent_workflow_id: 87, retry_from_node: 'architect', retry_sequence: 1, intervention_count: 2,
         status: 'COMPLETED', current_node: 'completed', duration_ms: 480000, queue_ms: 30000,
         total_tokens: 2350, total_cost_micros: 11800, llm_call_count: 2, agent_count: 2, event_count: 8,
         error: '', created_at: '2026-07-18T08:00:00Z', started_at: '2026-07-18T08:00:30Z', finished_at: '2026-07-18T08:08:00Z'
       },
       {
         workflow_id: 87, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
-        parent_workflow_id: null, retry_from_node: '', retry_sequence: 0,
+        parent_workflow_id: null, retry_from_node: '', retry_sequence: 0, intervention_count: 0,
         status: 'COMPLETED', current_node: 'completed', duration_ms: 600000, queue_ms: 45000,
         total_tokens: 1850, total_cost_micros: 8000, llm_call_count: 3, agent_count: 2, event_count: 9,
         error: '', created_at: '2026-07-18T07:00:00Z', started_at: '2026-07-18T07:00:45Z', finished_at: '2026-07-18T07:10:00Z'
@@ -1265,6 +1265,7 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
   await expect(page).toHaveURL(/\/traces\?run=88$/)
   await expect(page.getByRole('heading', { name: '#88 · 灰度发布工作台' })).toBeVisible()
   await expect(page.getByText('检查点重试 #1', { exact: true })).toBeVisible()
+  await expect(page.getByText('人工干预 2', { exact: true })).toBeVisible()
   await expect(page.getByText('来源运行 #87 · 架构设计检查点', { exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: '执行时间线' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '模型调用' })).toBeVisible()
@@ -1525,6 +1526,123 @@ test('creates an immutable checkpoint retry and links back to the failed run', a
 
   await sourceLink.click()
   await expect(page).toHaveURL(/\/traces\?run=120$/)
+})
+
+test('pauses a running workflow at a safe boundary and resumes with operator context', async ({ page }, testInfo) => {
+  let pauseRequested = false
+  let resumed = false
+  let pauseReason = ''
+  let resumeInstruction = ''
+  let workflow = {
+    workflow_id: 130,
+    project_id: 2,
+    parent_workflow_id: null,
+    retry_from_node: '',
+    retry_sequence: 0,
+    pause_requested_at: null as string | null,
+    pause_requested_by_user_id: null as number | null,
+    pause_reason: '',
+    intervention_count: 0,
+    status: 'RUNNING',
+    current_node: 'architect',
+    state: { messages: [], documents: [{ type: 'PRD', content: '# 产品需求' }], interventions: [] as Array<Record<string, string>> },
+    attempt_count: 1,
+    max_attempts: 2,
+    error: '',
+    created_at: '2026-07-18T09:00:00Z',
+    updated_at: '2026-07-18T09:02:00Z',
+    started_at: '2026-07-18T09:00:01Z',
+    finished_at: null as string | null
+  }
+  let workflowEvents: Array<Record<string, unknown>> = []
+
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: [workflow] }))
+  await page.route(/\/api\/v1\/workflow\/130$/, (route) => route.fulfill({ json: workflow }))
+  await page.route(/\/api\/v1\/workflow\/130\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/130\/events\/history(?:\?.*)?$/, (route) => route.fulfill({ json: workflowEvents }))
+  await page.route(/\/api\/v1\/workflow\/130\/pause$/, async (route) => {
+    const input = route.request().postDataJSON() as { request_id: string; reason: string }
+    pauseReason = input.reason
+    pauseRequested = true
+    workflow = {
+      ...workflow,
+      pause_requested_at: '2026-07-18T09:02:30Z',
+      pause_requested_by_user_id: 1,
+      pause_reason: input.reason,
+      updated_at: '2026-07-18T09:02:30Z'
+    }
+    workflowEvents = [{
+      id: 20, workflow_id: 130, node: 'architect', event_type: 'PAUSE_REQUESTED',
+      message: 'Operator requested a safe-boundary pause', payload: { reason_chars: input.reason.length },
+      created_at: '2026-07-18T09:02:30Z'
+    }]
+    await route.fulfill({ json: workflow })
+  })
+  await page.route(/\/api\/v1\/workflow\/130\/events$/, async (route) => {
+    if (!pauseRequested || resumed) {
+      return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 10000\n\n' })
+    }
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    if (resumed) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 10000\n\n' })
+    workflow = { ...workflow, status: 'PAUSED', intervention_count: 1, updated_at: '2026-07-18T09:03:00Z' }
+    const pausedEvent = {
+      id: 21, workflow_id: 130, node: 'architect', event_type: 'PAUSED',
+      message: 'Workflow paused at a committed node boundary', payload: { approval_gate: 'operator', intervention_count: 1 },
+      created_at: '2026-07-18T09:03:00Z'
+    }
+    workflowEvents = [...workflowEvents, pausedEvent]
+    return route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `retry: 10000\n\nid: 21\nevent: workflow\ndata: ${JSON.stringify(pausedEvent)}\n\n`
+    })
+  })
+  await page.route(/\/api\/v1\/workflow\/continue$/, async (route) => {
+    const input = route.request().postDataJSON() as { workflow_id: number; human_feedback: string }
+    resumeInstruction = input.human_feedback
+    resumed = true
+    workflow = {
+      ...workflow,
+      status: 'QUEUED',
+      pause_requested_at: null,
+      pause_requested_by_user_id: null,
+      pause_reason: '',
+      state: {
+        ...workflow.state,
+        interventions: [{ reason: pauseReason, instruction: input.human_feedback, resume_from_node: 'architect' }]
+      },
+      updated_at: '2026-07-18T09:04:00Z'
+    }
+    workflowEvents = [
+      ...workflowEvents,
+      { id: 22, workflow_id: 130, node: 'architect', event_type: 'INTERVENTION_APPLIED', message: 'Operator instruction applied', payload: { instruction_chars: input.human_feedback.length }, created_at: '2026-07-18T09:04:00Z' },
+      { id: 23, workflow_id: 130, node: 'architect', event_type: 'QUEUED', message: 'Workflow continued after human review', payload: { approval_gate: 'operator' }, created_at: '2026-07-18T09:04:00Z' }
+    ]
+    await route.fulfill({ json: workflow })
+  })
+
+  await page.goto('/projects/2')
+  await page.getByRole('button', { name: '安全暂停' }).click()
+  const dialog = page.getByRole('dialog', { name: '安全暂停工作流' })
+  await dialog.getByLabel('暂停原因').fill('补充数据驻留边界后再继续')
+  const pauseButton = dialog.getByRole('button', { name: '请求安全暂停' })
+  if (testInfo.project.name === 'mobile-chromium') await expect(pauseButton).toHaveCSS('min-height', '44px')
+  await pauseButton.click()
+
+  await expect(page.getByText('安全暂停已请求', { exact: true })).toBeVisible()
+  await expect(page.getByText('等待安全暂停', { exact: true })).toBeVisible()
+  await expect(page.getByText('人工干预中', { exact: true })).toBeVisible({ timeout: 8_000 })
+  await expect(page.getByText('运行已在“架构设计”安全暂停', { exact: true })).toBeVisible()
+  await expect(page.getByText('暂停原因：补充数据驻留边界后再继续', { exact: true })).toBeVisible()
+  await page.getByLabel('工作流人工反馈').fill('所有数据限定批准区域，并让测试 Agent 验证。')
+  await page.getByRole('button', { name: '应用指令并继续' }).click()
+
+  await expect(page.getByText('等待执行', { exact: true })).toBeVisible()
+  await expect(page.getByText('人工干预 1 次', { exact: true })).toBeVisible()
+  await expect(page.locator('.workflow-events').getByText('已应用恢复指令', { exact: true })).toBeVisible()
+  expect(pauseReason).toBe('补充数据驻留边界后再继续')
+  expect(resumeInstruction).toBe('所有数据限定批准区域，并让测试 Agent 验证。')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('restores workflow history and reconnects live progress without duplicate events', async ({ page }) => {

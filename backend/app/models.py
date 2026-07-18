@@ -775,6 +775,7 @@ class WorkflowRun(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (
         CheckConstraint("retry_sequence >= 0", name="ck_workflow_runs_retry_sequence"),
+        CheckConstraint("intervention_count >= 0", name="ck_workflow_runs_intervention_count"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -793,6 +794,13 @@ class WorkflowRun(Base):
     )
     retry_from_node: Mapped[str] = mapped_column(String(100), default="")
     retry_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    pause_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pause_requested_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    pause_reason: Mapped[str] = mapped_column(Text, default="")
+    pause_request_id: Mapped[str | None] = mapped_column(String(64))
+    intervention_count: Mapped[int] = mapped_column(Integer, default=0)
     billing_transaction_id: Mapped[int | None] = mapped_column(ForeignKey("token_transactions.id", ondelete="SET NULL"))
     pause_before_report: Mapped[bool] = mapped_column(Boolean, default=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)

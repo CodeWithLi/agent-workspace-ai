@@ -338,19 +338,20 @@ def _pair_event_spans(
             "STARTED",
             "CANCEL_REQUESTED",
         }:
+            pause_payload = _public_payload(open_pause)
             spans.append(
                 _SpanDraft(
                     span_id=f"wait-{open_pause.id}",
                     kind="wait",
                     node=open_pause.node,
-                    label="人工确认等待",
+                    label="人工干预等待" if pause_payload.get("approval_gate") == "operator" else "人工确认等待",
                     agent_role="",
                     status="COMPLETED",
                     attempt=1,
                     started_at=open_pause.created_at,
                     finished_at=event.created_at,
                     duration_ms=_duration_ms(open_pause.created_at, event.created_at),
-                    payload=_public_payload(open_pause),
+                    payload=pause_payload,
                 )
             )
             open_pause = None
@@ -393,19 +394,20 @@ def _pair_event_spans(
                 )
             )
     if open_pause:
+        pause_payload = _public_payload(open_pause)
         spans.append(
             _SpanDraft(
                 span_id=f"wait-{open_pause.id}",
                 kind="wait",
                 node=open_pause.node,
-                label="人工确认等待",
+                label="人工干预等待" if pause_payload.get("approval_gate") == "operator" else "人工确认等待",
                 agent_role="",
                 status="PAUSED" if workflow.status == WorkflowStatus.paused else open_status,
                 attempt=1,
                 started_at=open_pause.created_at,
                 finished_at=workflow.finished_at,
                 duration_ms=_duration_ms(open_pause.created_at, open_end),
-                payload=_public_payload(open_pause),
+                payload=pause_payload,
             )
         )
     return sorted(spans, key=lambda item: (_utc(item.started_at), item.kind != "node", item.span_id))
@@ -487,6 +489,7 @@ def _run_out(
         parent_workflow_id=workflow.parent_workflow_id,
         retry_from_node=workflow.retry_from_node,
         retry_sequence=workflow.retry_sequence,
+        intervention_count=workflow.intervention_count,
         project_name=project.name if project else f"Project #{workflow.project_id}",
         owner_id=workflow.user_id,
         owner_name=owner.name if owner else f"User #{workflow.user_id}",

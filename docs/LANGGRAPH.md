@@ -20,7 +20,8 @@
   "specialist_handoffs": [],
   "quality_gate": {},
   "revision_round": 0,
-  "revision_feedback": ""
+  "revision_feedback": "",
+  "interventions": []
 }
 ```
 
@@ -40,7 +41,7 @@
 
 规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，无效模型输出使用确定性默认计划。专业分支通过 `asyncio.gather` 并行执行；质量门禁检查角色覆盖、交付内容、成功标准和并行广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，人工反馈只重跑指定分支。
 
-除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`。
+除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
 
 ## 运行追踪与成本归属
 
@@ -76,6 +77,14 @@ SLO 健康度只使用已结束的成功或失败运行，按当前追踪权限�
 `POST /api/v1/workflow/continue` 可在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。最终报告写入 `reports` 表。项目页先从 `GET /workflow/{id}/events/history` 恢复最近事件，再以 `Last-Event-ID` 连接 `GET /workflow/{id}/events`；凭证过期时只执行一次共享刷新，断线后按服务端提示指数退避重连，已确认游标不会重复应用。
 
 继续操作只允许对 `PAUSED` 运行执行一次；任务创建按标题幂等，重复继续返回 `409`，不会重复落任务或报告。
+
+### 操作员安全干预
+
+`POST /api/v1/workflow/{id}/pause` 不会中断正在进行的模型调用，也不会留下半个节点状态。暂停请求与节点提交都锁定同一 `workflow_runs` 行：如果请求先提交，`begin_node/complete_node` 在最近边界发现请求；如果节点先提交，请求会在下一节点开始前被发现。`complete_node` 总是先原子持久化 `state_json`、`current_node` 和 `NODE_COMPLETED`，再抛出受控暂停信号，worker 随后释放租约并转为 `PAUSED`。
+
+暂停请求使用 `pause_request_id` 幂等，保存请求人、时间和最长 1000 字的原因。恢复时必须提供最长 4000 字的指令；平台把原因、指令和恢复节点追加到最近 10 条 `interventions`，并将该结构化上下文传给需求、产品、架构、规划、专业分支、质量门禁、项目计划、测试和报告 Agent。追踪事件只公开干预类型和字符数，不返回原因或指令正文。
+
+排队运行可以在 worker 认领前立即暂停。若请求到达时最终报告节点已提交并进入 `completed`，平台记录 `PAUSE_SKIPPED` 并正常完成，避免出现无法恢复的 `PAUSED/completed` 组合。取消优先于暂停；失败补偿和取消终态会清理未应用的暂停元数据。
 
 创建工作流时锁定项目记录，并检查是否已有 `QUEUED/RUNNING/CANCELLING/PAUSED` 工作流。同一 `request_id` 重试返回已有结果，其他并发工作流返回 `409`。自动重试不重复扣费，达到最大尝试次数或取消后按当前消费流水幂等退款。
 

@@ -269,7 +269,7 @@
         <template v-else>
           <el-table :data="overview.recent_runs" class="trace-table desktop-table" table-layout="fixed" row-key="workflow_id">
             <el-table-column label="运行" width="100">
-              <template #default="{ row }"><div class="run-id-cell"><button class="trace-link" @click="openTrace(row.workflow_id)">#{{ row.workflow_id }}</button><small v-if="row.retry_sequence">重试 #{{ row.retry_sequence }}</small></div></template>
+              <template #default="{ row }"><div class="run-id-cell"><button class="trace-link" @click="openTrace(row.workflow_id)">#{{ row.workflow_id }}</button><small v-if="row.retry_sequence">重试 #{{ row.retry_sequence }}</small><small v-if="row.intervention_count">干预 {{ row.intervention_count }}</small></div></template>
             </el-table-column>
             <el-table-column label="项目 / 发起人" min-width="190">
               <template #default="{ row }"><div class="node-cell"><strong>{{ row.project_name }}</strong><small>{{ row.owner_name }}</small></div></template>
@@ -296,7 +296,7 @@
           <div class="mobile-card-list" aria-label="最近运行列表">
             <article v-for="run in overview.recent_runs" :key="run.workflow_id" class="mobile-data-card run-card">
               <button class="run-card-button" @click="openTrace(run.workflow_id)">
-                <span><strong :title="`#${run.workflow_id} · ${run.project_name}`">#{{ run.workflow_id }} · {{ run.project_name }}</strong><small>{{ run.owner_name }} · {{ formatDateTime(run.created_at) }}<template v-if="run.retry_sequence"> · 重试 #{{ run.retry_sequence }}</template></small></span>
+                <span><strong :title="`#${run.workflow_id} · ${run.project_name}`">#{{ run.workflow_id }} · {{ run.project_name }}</strong><small>{{ run.owner_name }} · {{ formatDateTime(run.created_at) }}<template v-if="run.retry_sequence"> · 重试 #{{ run.retry_sequence }}</template><template v-if="run.intervention_count"> · 干预 {{ run.intervention_count }}</template></small></span>
                 <el-tag :type="statusTagType(run.status)" effect="plain">{{ statusLabel(run.status) }}</el-tag>
               </button>
               <dl>
@@ -321,7 +321,7 @@
       <div class="drawer-head">
         <div>
           <span>工作流运行追踪</span>
-          <div><h2 :title="detail ? `#${detail.run.workflow_id} · ${detail.run.project_name}` : undefined">{{ detail ? `#${detail.run.workflow_id} · ${detail.run.project_name}` : `#${selectedRunId || ''}` }}</h2><el-tag v-if="detail" :type="statusTagType(detail.run.status)" effect="plain">{{ statusLabel(detail.run.status) }}</el-tag></div>
+          <div><h2 :title="detail ? `#${detail.run.workflow_id} · ${detail.run.project_name}` : undefined">{{ detail ? `#${detail.run.workflow_id} · ${detail.run.project_name}` : `#${selectedRunId || ''}` }}</h2><el-tag v-if="detail" :type="statusTagType(detail.run.status)" effect="plain">{{ statusLabel(detail.run.status) }}</el-tag><el-tag v-if="detail?.run.intervention_count" type="warning" effect="plain">人工干预 {{ detail.run.intervention_count }}</el-tag></div>
         </div>
         <el-button :icon="Close" circle aria-label="关闭运行追踪" title="关闭" @click="closeTrace" />
       </div>
@@ -472,6 +472,7 @@ const eventLabels: Record<string, string> = {
   QUEUED: '进入队列', STARTED: '开始运行', CONTINUED: '继续运行', NODE_STARTED: '节点开始',
   NODE_COMPLETED: '节点完成', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
   RETRY_CREATED: '已创建重试运行', RETRY_QUEUED: '检查点重试入队',
+  PAUSE_REQUESTED: '请求安全暂停', PAUSE_SKIPPED: '暂停未生效', INTERVENTION_APPLIED: '应用恢复指令',
   PLAN_CREATED: '计划已生成', QUALITY_GATE_PASSED: '质量门禁通过',
   QUALITY_GATE_FAILED: '质量门禁未通过', REVISION_REQUESTED: '请求修订', PAUSED: '等待人工确认',
   CANCEL_REQUESTED: '请求取消', CANCELLED: '已取消', COMPLETED: '运行完成', FAILED: '运行失败'
@@ -943,6 +944,8 @@ onBeforeUnmount(() => {
 @media (max-width: 520px) {
   .trace-retry-lineage { align-items: flex-start; flex-wrap: wrap; }
   .trace-retry-lineage .el-button { width: 100%; min-height: 44px; }
+  .drawer-head > div > div { flex-wrap: wrap; }
+  .drawer-head h2 { flex-basis: 100%; }
   .trace-head { margin-bottom: 18px; }.trace-head h1 { font-size: 24px; }.trace-toolbar { grid-template-columns: minmax(0, 1fr) 44px; }.window-switch { display: flex; width: 100%; }.window-switch :deep(.el-radio-button) { flex: 1; }.window-switch :deep(.el-radio-button__inner) { width: 100%; min-height: 44px; padding: 12px 8px; }.trace-toolbar > .project-filter { grid-column: 1; grid-row: 2; }.trace-toolbar > .status-filter { grid-column: 1 / -1; grid-row: 3; }.trace-toolbar > .refresh-command { grid-column: 2; grid-row: 2; }.trace-toolbar > .compare-command { grid-column: 1 / -1; grid-row: 4; width: 100%; min-height: 44px; }.metric-grid { gap: 8px; }.metric-card { min-height: 104px; padding: 13px; }.metric-card strong { overflow: visible; font-size: 21px; white-space: normal; }.metric-card small { white-space: normal; }.status-strip { gap: 8px 14px; }.trace-section { padding: 20px 0; }.section-head { flex-direction: column; }.chart-legend { justify-content: flex-start; }.trend-chart { height: 250px; }.drawer-head { min-height: 70px; padding: 12px 14px; }.drawer-head h2 { max-width: none; font-size: 16px; }.drawer-head > .el-button { width: 44px; min-width: 44px; height: 44px; flex-basis: 44px; }.drawer-loading, .trace-detail { padding: 14px; }.detail-metrics > div { padding: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) 110px; gap: 9px; }.span-copy { grid-template-columns: 46px minmax(0, 1fr); }.span-kind { font-size: 9px; }.span-numbers small { display: none; }.event-list li { grid-template-columns: 58px 12px minmax(0, 1fr); gap: 7px; }
 }
 @media (prefers-reduced-motion: reduce) { .span-bar { transition: none; } }

@@ -442,6 +442,10 @@ export interface WorkflowRun {
   parent_workflow_id: number | null
   retry_from_node: string
   retry_sequence: number
+  pause_requested_at?: string | null
+  pause_requested_by_user_id?: number | null
+  pause_reason: string
+  intervention_count: number
   status: string
   current_node: string
   state: Record<string, unknown>
@@ -568,6 +572,7 @@ export interface TraceRun {
   parent_workflow_id: number | null
   retry_from_node: string
   retry_sequence: number
+  intervention_count: number
   project_name: string
   owner_id: number
   owner_name: string

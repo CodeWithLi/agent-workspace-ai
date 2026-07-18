@@ -13,12 +13,12 @@ from app.agent import concurrency
 from app.agent.service import ensure_default_agents
 from app.api.routes.agents import create_agent_run
 from app.api.routes.billing import fake_recharge
-from app.api.routes.workflow import cancel_workflow, continue_workflow, retry_workflow, run_workflow
+from app.api.routes.workflow import cancel_workflow, continue_workflow, pause_workflow, retry_workflow, run_workflow
 from app.core.database import get_db
 from app.core.llm import get_llm
 from app.core.security import hash_password
 from app.models import Agent, AgentRole, AgentRun, Project, RechargeOrder, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
-from app.schemas import ChatRequest, RechargeRequest, WorkflowContinueRequest, WorkflowRequest, WorkflowRetryRequest
+from app.schemas import ChatRequest, RechargeRequest, WorkflowContinueRequest, WorkflowPauseRequest, WorkflowRequest, WorkflowRetryRequest
 from app.services.agent_runs import fail_agent_run
 from app.services import agent_run_reaper as reaper_module
 from app.services.billing import InsufficientTokensError, apply_token_change, refund_consumption
@@ -569,6 +569,189 @@ def test_workflow_retry_cleans_compensated_checkpoint_and_supports_descendants(d
     assert grandchild.retry_from_node == child.current_node
     assert grandchild.retry_sequence == 4
     assert db.get(WorkflowRun, child.id).status == WorkflowStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_queued_workflow_pause_is_idempotent_and_resume_applies_operator_instruction(
+    db: Session,
+) -> None:
+    with pytest.raises(ValueError):
+        WorkflowPauseRequest(request_id="workflow-empty-pause", reason="   ")
+
+    user = User(
+        email="workflow-intervention@example.com",
+        name="Workflow Intervention",
+        password_hash="hash",
+        permissions="projects:write",
+        ai_token_balance=500,
+    )
+    db.add(user)
+    db.flush()
+    project = Project(name="Intervention Project", owner_id=user.id)
+    db.add(project)
+    db.commit()
+    created = await run_workflow(
+        WorkflowRequest(
+            project_id=project.id,
+            user_input="构建可人工干预的多 Agent 发布流程",
+            request_id="workflow-intervention-run",
+        ),
+        http_request("/api/v1/workflow/run"),
+        user,
+        db,
+    )
+
+    pause_payload = WorkflowPauseRequest(
+        request_id="workflow-intervention-pause",
+        reason="补充生产数据驻留边界后再继续",
+    )
+    paused = pause_workflow(
+        created.workflow_id,
+        pause_payload,
+        http_request(f"/api/v1/workflow/{created.workflow_id}/pause"),
+        user,
+        db,
+    )
+    assert paused.status == WorkflowStatus.paused
+    assert paused.pause_requested_at is not None
+    assert paused.pause_requested_by_user_id == user.id
+    assert paused.pause_reason == pause_payload.reason
+    assert paused.intervention_count == 1
+    assert db.get(User, user.id).ai_token_balance == 400
+
+    repeated = pause_workflow(
+        created.workflow_id,
+        pause_payload,
+        http_request(f"/api/v1/workflow/{created.workflow_id}/pause"),
+        user,
+        db,
+    )
+    assert repeated.status == WorkflowStatus.paused
+    assert repeated.intervention_count == 1
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == created.workflow_id,
+            WorkflowEvent.event_type == "PAUSE_REQUESTED",
+        )
+    ) == 1
+
+    resumed = await continue_workflow(
+        WorkflowContinueRequest(
+            workflow_id=created.workflow_id,
+            human_feedback="所有存储限定中国大陆区域，并在测试方案中验证。",
+        ),
+        http_request("/api/v1/workflow/continue"),
+        user,
+        db,
+    )
+    state = resumed.state
+    assert resumed.status == WorkflowStatus.queued
+    assert resumed.current_node == "requirement"
+    assert resumed.pause_requested_at is None
+    assert resumed.pause_requested_by_user_id is None
+    assert resumed.pause_reason == ""
+    assert resumed.intervention_count == 1
+    assert state["interventions"] == [
+        {
+            "reason": pause_payload.reason,
+            "instruction": "所有存储限定中国大陆区域，并在测试方案中验证。",
+            "resume_from_node": "requirement",
+        }
+    ]
+
+    stale_repeat = pause_workflow(
+        created.workflow_id,
+        pause_payload,
+        http_request(f"/api/v1/workflow/{created.workflow_id}/pause"),
+        user,
+        db,
+    )
+    assert stale_repeat.status == WorkflowStatus.queued
+    assert stale_repeat.pause_requested_at is None
+
+
+@pytest.mark.asyncio
+async def test_running_workflow_pauses_at_safe_boundary_and_quality_review_can_resume(
+    db: Session,
+) -> None:
+    user = User(
+        email="workflow-safe-pause@example.com",
+        name="Workflow Safe Pause",
+        password_hash="hash",
+        permissions="projects:write",
+    )
+    db.add(user)
+    db.flush()
+    project = Project(name="Safe Pause Project", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.running,
+        current_node="requirement",
+        state_json=json.dumps({"requirements": {}, "messages": [], "interventions": []}),
+        request_id="workflow-safe-pause-run",
+        lease_token="safe-pause-lease",
+    )
+    db.add(workflow)
+    db.commit()
+
+    requested = pause_workflow(
+        workflow.id,
+        WorkflowPauseRequest(
+            request_id="workflow-safe-pause-request",
+            reason="在架构生成前核对安全要求",
+        ),
+        http_request(f"/api/v1/workflow/{workflow.id}/pause"),
+        user,
+        db,
+    )
+    assert requested.status == WorkflowStatus.running
+    assert requested.intervention_count == 0
+
+    paused = await process_workflow(db, workflow.id, claimed=True)
+    assert paused.status == WorkflowStatus.paused
+    assert paused.current_node == "requirement"
+    assert paused.intervention_count == 1
+    assert paused.locked_at is None
+    assert paused.lease_token is None
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "PAUSED",
+        )
+    ) == 1
+
+    review = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.paused,
+        current_node="quality_review",
+        state_json=json.dumps(
+            {
+                "revision_feedback": "旧反馈",
+                "manual_revision_count": 1,
+                "interventions": [],
+            }
+        ),
+    )
+    db.add(review)
+    db.commit()
+    resumed = await continue_workflow(
+        WorkflowContinueRequest(
+            workflow_id=review.id,
+            human_feedback="补充失败恢复证据和明确负责人",
+        ),
+        http_request("/api/v1/workflow/continue"),
+        user,
+        db,
+    )
+    resumed_state = resumed.state
+    assert resumed.status == WorkflowStatus.queued
+    assert resumed.current_node == "specialists"
+    assert resumed_state["revision_feedback"] == "补充失败恢复证据和明确负责人"
+    assert resumed_state["manual_revision_count"] == 2
 
 
 @pytest.mark.asyncio

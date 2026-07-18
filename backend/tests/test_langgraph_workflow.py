@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import func, select
@@ -8,7 +9,9 @@ from sqlalchemy.orm import Session
 from app.core.llm import get_llm
 from app.agent.service import ensure_default_agents
 from app.langgraph.workflow import (
+    WorkflowPauseRequested,
     build_workspace_graph,
+    complete_node,
     execute_workspace_graph,
     initial_state,
     continue_workspace_graph,
@@ -16,6 +19,51 @@ from app.langgraph.workflow import (
     snapshot_agent_configs,
 )
 from app.models import Agent, AgentRole, Project, Report, Task, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
+
+
+def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) -> None:
+    user = User(email="boundary-pause@example.com", name="Boundary Pause", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Boundary Pause Project", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.running,
+        current_node="requirement",
+        state_json="{}",
+        lease_token="boundary-pause-lease",
+        pause_requested_at=datetime.now(timezone.utc),
+        pause_reason="等待人工检查",
+    )
+    db.add(workflow)
+    db.commit()
+
+    with pytest.raises(WorkflowPauseRequested):
+        complete_node(
+            db,
+            workflow,
+            "requirement",
+            {"requirements": {}, "messages": [], "interventions": []},
+            {
+                "requirements": {"summary": "checkpoint persisted"},
+                "current_node": "product",
+            },
+            expected_lease_token="boundary-pause-lease",
+        )
+
+    db.expire_all()
+    persisted = db.get(WorkflowRun, workflow.id)
+    assert persisted.current_node == "product"
+    assert json.loads(persisted.state_json)["requirements"] == {"summary": "checkpoint persisted"}
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "NODE_COMPLETED",
+        )
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -172,12 +220,20 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
     frozen_architect_prompt = frozen[AgentRole.architect.value]["system_prompt"]
     architect = db.scalar(select(Agent).where(Agent.role == AgentRole.architect))
     architect.system_prompt = "MUTATED AFTER WORKFLOW CREATION"
+    persisted_state = initial_state(project, "Build handoffs", frozen)
+    persisted_state["interventions"] = [
+        {
+            "reason": "Security review",
+            "instruction": "Keep all durable data in the approved region",
+            "resume_from_node": "requirement",
+        }
+    ]
     workflow = WorkflowRun(
         project_id=project.id,
         user_id=user.id,
         status=WorkflowStatus.running,
         current_node="requirement",
-        state_json=json.dumps(initial_state(project, "Build handoffs", frozen), ensure_ascii=False),
+        state_json=json.dumps(persisted_state, ensure_ascii=False),
         lease_token="handoff-lease",
     )
     db.add(workflow)
@@ -206,3 +262,6 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
     architect_call = next(call for call in calls if call[0].startswith(frozen_architect_prompt))
     assert "PRODUCT-ARTIFACT" in architect_call[1]
     assert all(not system_prompt.startswith("MUTATED AFTER WORKFLOW CREATION") for system_prompt, _prompt in calls)
+    assert calls
+    for _system_prompt, user_prompt in calls:
+        assert json.loads(user_prompt)["operator_interventions"] == persisted_state["interventions"]

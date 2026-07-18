@@ -797,6 +797,47 @@ def test_trace_detail_exposes_immutable_retry_lineage(db: Session) -> None:
     assert f'"parent_workflow_id":{data["completed"].id}' in detail.model_dump_json()
 
 
+def test_trace_detail_labels_operator_intervention_wait_without_exposing_reason(db: Session) -> None:
+    data = _seed_trace_data(db)
+    workflow = WorkflowRun(
+        project_id=data["completed"].project_id,
+        user_id=data["alice"].id,
+        status=WorkflowStatus.paused,
+        current_node="architect",
+        state_json="{}",
+        pause_requested_at=NOW - timedelta(minutes=2),
+        pause_requested_by_user_id=data["alice"].id,
+        pause_reason="secret operator reason",
+        intervention_count=2,
+        created_at=NOW - timedelta(minutes=5),
+        started_at=NOW - timedelta(minutes=4),
+    )
+    db.add(workflow)
+    db.flush()
+    db.add(
+        _event(
+            workflow,
+            "PAUSED",
+            NOW - timedelta(minutes=2),
+            node="architect",
+            payload={
+                "approval_gate": "operator",
+                "reason_chars": len(workflow.pause_reason),
+                "private_reason": workflow.pause_reason,
+            },
+        )
+    )
+    db.commit()
+
+    detail = get_trace_detail(db, data["alice"], workflow.id)
+    wait_span = next(span for span in detail.spans if span.kind == "wait")
+
+    assert detail.run.intervention_count == 2
+    assert wait_span.label == "人工干预等待"
+    assert wait_span.payload == {"approval_gate": "operator"}
+    assert "secret operator reason" not in detail.model_dump_json()
+
+
 def test_trace_detail_revalidates_project_membership(db: Session) -> None:
     data = _seed_trace_data(db)
     member = User(

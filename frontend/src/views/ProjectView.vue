@@ -67,13 +67,28 @@
       <div class="page-head compact">
         <div><h3>Agent 工作流</h3><p>{{ workflowCompletedStages }} / {{ workflowStages.length }} 个阶段已完成</p></div>
         <div class="inline-actions">
+          <el-button
+            v-if="['QUEUED', 'RUNNING'].includes(workflowStatus)"
+            :icon="VideoPause"
+            :disabled="workflowPausePending"
+            @click="openWorkflowPauseDialog"
+          >{{ workflowPausePending ? '等待节点暂停' : '安全暂停' }}</el-button>
           <el-button v-if="['QUEUED', 'RUNNING'].includes(workflowStatus)" :icon="CircleClose" :loading="workflowActionBusy" @click="cancelWorkflow">取消</el-button>
           <el-button v-if="workflowStatus === 'FAILED'" type="primary" :icon="RefreshRight" :loading="workflowActionBusy" @click="retryWorkflow">重试失败节点</el-button>
           <el-button v-if="workflowStatus === 'COMPENSATION_FAILED'" type="danger" :icon="RefreshRight" :loading="workflowActionBusy" @click="retryCompensation">重试回滚</el-button>
         </div>
       </div>
       <el-tag :type="workflowTagType">{{ workflowStatusLabel }}</el-tag>
+      <el-tag v-if="workflowInterventionCount" class="workflow-intervention-count" type="warning" effect="plain">人工干预 {{ workflowInterventionCount }} 次</el-tag>
       <p v-if="workflowError" class="workflow-error">{{ workflowError }}</p>
+      <div v-if="workflowPausePending" class="workflow-intervention-notice" role="status" aria-live="polite">
+        <el-icon aria-hidden="true"><VideoPause /></el-icon>
+        <div>
+          <strong>安全暂停已请求</strong>
+          <span>当前“{{ workflowStageLabel(workflowCurrentNode) }}”节点提交检查点后停止。</span>
+          <small>{{ workflowPauseReason }}</small>
+        </div>
+      </div>
       <div v-if="workflowRetrySequence > 0" class="workflow-retry-lineage" role="status">
         <el-icon aria-hidden="true"><RefreshRight /></el-icon>
         <div>
@@ -142,22 +157,23 @@
       </div>
       <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate">
         <div>
-          <strong>{{ workflowCurrentNode === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认' }}</strong>
-          <p>{{ workflowCurrentNode === 'quality_review' ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。' : '确认当前需求、架构、任务和测试产物后继续生成最终报告。' }}</p>
+          <strong>{{ workflowApprovalTitle }}</strong>
+          <p>{{ workflowApprovalDescription }}</p>
+          <small v-if="workflowOperatorPaused" class="workflow-pause-reason">暂停原因：{{ workflowPauseReason }}</small>
         </div>
         <el-input
           v-model="workflowFeedback"
           type="textarea"
           :rows="3"
-          :placeholder="workflowCurrentNode === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'"
+          :placeholder="workflowFeedbackPlaceholder"
           aria-label="工作流人工反馈"
         />
         <el-button
           type="warning"
           :loading="workflowActionBusy"
-          :disabled="workflowCurrentNode === 'quality_review' && !workflowFeedback.trim()"
+          :disabled="workflowFeedbackRequired && !workflowFeedback.trim()"
           @click="continueWorkflow"
-        >{{ workflowCurrentNode === 'quality_review' ? '提交修订意见' : '确认并生成报告' }}</el-button>
+        >{{ workflowContinueLabel }}</el-button>
       </section>
       <el-table v-if="workflowSagaSteps.length" :data="workflowSagaSteps" class="data-table">
         <el-table-column label="写操作" min-width="150">
@@ -188,6 +204,33 @@
       </el-tabs>
       <el-empty v-else description="工作流正在准备产物" />
     </section>
+
+    <el-dialog v-model="workflowPauseDialog" title="安全暂停工作流" width="min(520px, 94vw)" destroy-on-close>
+      <p class="workflow-pause-dialog-copy">运行会在当前 Agent 节点完成并提交检查点后暂停。</p>
+      <el-form label-position="top" @submit.prevent="submitWorkflowPause">
+        <el-form-item label="暂停原因" required>
+          <el-input
+            v-model="workflowPauseFormReason"
+            type="textarea"
+            :rows="4"
+            maxlength="1000"
+            show-word-limit
+            placeholder="例如：需要补充数据驻留边界后再继续"
+            aria-label="暂停原因"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="workflowPauseDialog = false">取消</el-button>
+        <el-button
+          type="primary"
+          :icon="VideoPause"
+          :loading="workflowPauseSubmitting"
+          :disabled="workflowPauseFormReason.trim().length < 3"
+          @click="submitWorkflowPause"
+        >请求安全暂停</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="memberDialog" title="邀请项目成员" width="460">
       <el-form label-position="top">
@@ -227,7 +270,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight, View } from '@element-plus/icons-vue'
+import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
@@ -278,6 +321,9 @@ const workflowId = ref<number | null>(null)
 const workflowParentId = ref<number | null>(null)
 const workflowRetryFromNode = ref('')
 const workflowRetrySequence = ref(0)
+const workflowPauseRequestedAt = ref<string | null>(null)
+const workflowPauseReason = ref('')
+const workflowInterventionCount = ref(0)
 const workflowStatus = ref('')
 const workflowCurrentNode = ref('')
 const workflowError = ref('')
@@ -293,6 +339,10 @@ const memberForm = reactive<{ email: string; role: 'editor' | 'viewer' }>({ emai
 const workflowRequestId = ref(crypto.randomUUID())
 const projectEditDialog = ref(false)
 const projectSaving = ref(false)
+const workflowPauseDialog = ref(false)
+const workflowPauseSubmitting = ref(false)
+const workflowPauseFormReason = ref('')
+const workflowPauseRequestId = ref(crypto.randomUUID())
 const projectForm = reactive({ name: '', description: '', status: 'ACTIVE' })
 const activeWorkflowDocument = ref('PRD')
 const workflowStages = ['需求分析', '产品方案', '架构设计', '动态规划', '专业分支', '质量门禁', '项目计划', '测试方案', '项目报告']
@@ -314,6 +364,27 @@ const {
   }
 })
 const workflowStreamActive = computed(() => ['QUEUED', 'RUNNING', 'CANCELLING', 'COMPENSATING'].includes(workflowStatus.value))
+const workflowPausePending = computed(() => workflowStatus.value === 'RUNNING' && Boolean(workflowPauseRequestedAt.value))
+const workflowOperatorPaused = computed(() => workflowStatus.value === 'PAUSED' && Boolean(workflowPauseRequestedAt.value))
+const workflowFeedbackRequired = computed(() => workflowOperatorPaused.value || workflowCurrentNode.value === 'quality_review')
+const workflowApprovalTitle = computed(() => {
+  if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
+  return workflowCurrentNode.value === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认'
+})
+const workflowApprovalDescription = computed(() => {
+  if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
+  return workflowCurrentNode.value === 'quality_review'
+    ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。'
+    : '确认当前需求、架构、任务和测试产物后继续生成最终报告。'
+})
+const workflowFeedbackPlaceholder = computed(() => {
+  if (workflowOperatorPaused.value) return '输入恢复指令，后续 Agent 将基于该约束继续执行'
+  return workflowCurrentNode.value === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'
+})
+const workflowContinueLabel = computed(() => {
+  if (workflowOperatorPaused.value) return '应用指令并继续'
+  return workflowCurrentNode.value === 'quality_review' ? '提交修订意见' : '确认并生成报告'
+})
 const workflowRunLocked = computed(() => [
   'QUEUED',
   'RUNNING',
@@ -375,7 +446,9 @@ const workflowCompletedStages = computed(() => {
   return completed
 })
 const workflowStatusLabel = computed(() => {
+  if (workflowPausePending.value) return '等待安全暂停'
   if (workflowStatus.value === 'PAUSED') {
+    if (workflowOperatorPaused.value) return '人工干预中'
     return workflowCurrentNode.value === 'quality_review' ? '等待质量修订' : '等待报告确认'
   }
   return ({
@@ -400,7 +473,7 @@ const workflowTagType = computed(() => ({
   PAUSED: 'warning',
   COMPLETED: 'success',
   FAILED: 'danger'
-}[workflowStatus.value] as 'primary' | 'success' | 'warning' | 'info' | 'danger' | undefined))
+}[workflowPausePending.value ? 'PAUSED' : workflowStatus.value] as 'primary' | 'success' | 'warning' | 'info' | 'danger' | undefined))
 
 function documentLabel(type: string) {
   return {
@@ -444,6 +517,9 @@ function workflowEventLabel(eventType: string) {
     RETRY_SCHEDULED: '自动重试',
     RETRY_CREATED: '已创建重试运行',
     RETRY_QUEUED: '检查点重试入队',
+    PAUSE_REQUESTED: '已请求安全暂停',
+    PAUSE_SKIPPED: '运行结束，暂停未生效',
+    INTERVENTION_APPLIED: '已应用恢复指令',
     SAGA_STEP_COMPLETED: '写操作已提交',
     COMPENSATION_STARTED: '开始事务回滚',
     SAGA_STEP_COMPENSATED: '写操作已回滚',
@@ -512,6 +588,8 @@ function activityLabel(action: string) {
     'workflow.artifact_publish': '工作流产物已发布',
     'workflow.queued': '工作流已入队',
     'workflow.continue': '工作流已继续',
+    'workflow.pause_requested': '工作流已请求安全暂停',
+    'workflow.operator_paused': '工作流已在安全节点暂停',
     'workflow.retry': '工作流已重试',
     'workflow.cancel_requested': '工作流已请求取消',
     'workflow.compensation_retry': '工作流回滚已重试'
@@ -526,6 +604,9 @@ function applyWorkflow(workflow: WorkflowRun) {
   workflowParentId.value = workflow.parent_workflow_id
   workflowRetryFromNode.value = workflow.retry_from_node
   workflowRetrySequence.value = workflow.retry_sequence
+  workflowPauseRequestedAt.value = workflow.pause_requested_at || null
+  workflowPauseReason.value = workflow.pause_reason || ''
+  workflowInterventionCount.value = workflow.intervention_count || 0
   workflowStatus.value = workflow.status
   workflowCurrentNode.value = workflow.current_node
   workflowState.value = workflow.state
@@ -682,8 +763,34 @@ async function runWorkflow() {
   }
 }
 
+function openWorkflowPauseDialog() {
+  if (!workflowId.value || workflowPausePending.value) return
+  workflowPauseFormReason.value = ''
+  workflowPauseRequestId.value = crypto.randomUUID()
+  workflowPauseDialog.value = true
+}
+
+async function submitWorkflowPause() {
+  if (!workflowId.value || workflowPauseFormReason.value.trim().length < 3) return
+  workflowPauseSubmitting.value = true
+  try {
+    const { data } = await api.post<WorkflowRun>(`/workflow/${workflowId.value}/pause`, {
+      request_id: workflowPauseRequestId.value,
+      reason: workflowPauseFormReason.value.trim()
+    })
+    applyWorkflow(data)
+    workflowPauseDialog.value = false
+    const cursor = await loadWorkflowEventHistory(data.workflow_id)
+    watchWorkflowEvents(cursor)
+    ElMessage.success(data.status === 'PAUSED' ? '工作流已安全暂停' : '安全暂停请求已提交')
+  } finally {
+    workflowPauseSubmitting.value = false
+  }
+}
+
 async function continueWorkflow() {
   if (!workflowId.value) return
+  const operatorResume = workflowOperatorPaused.value
   workflowActionBusy.value = true
   try {
     const feedback = workflowFeedback.value.trim() || '人工确认通过，请生成最终项目报告。'
@@ -695,6 +802,7 @@ async function continueWorkflow() {
     applyWorkflow(data)
     const cursor = await loadWorkflowEventHistory(data.workflow_id)
     watchWorkflowEvents(cursor)
+    ElMessage.success(operatorResume ? '恢复指令已应用' : '工作流已继续')
   } finally {
     workflowActionBusy.value = false
   }
@@ -882,6 +990,60 @@ onBeforeUnmount(disposeWorkflowEventStream)
   line-height: 1.5;
 }
 
+.workflow-intervention-count {
+  margin-left: 8px;
+}
+
+.workflow-intervention-notice {
+  display: flex;
+  min-height: 44px;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-warning);
+  background: #fffbeb;
+  color: var(--color-secondary-text);
+}
+
+.workflow-intervention-notice > .el-icon {
+  margin-top: 2px;
+  flex: 0 0 auto;
+  color: var(--color-warning);
+  font-size: 18px;
+}
+
+.workflow-intervention-notice > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.workflow-intervention-notice strong {
+  color: var(--color-foreground);
+  font-size: 13px;
+}
+
+.workflow-intervention-notice span,
+.workflow-intervention-notice small,
+.workflow-pause-reason {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workflow-intervention-notice small,
+.workflow-pause-reason {
+  color: var(--color-muted-text);
+}
+
+.workflow-pause-dialog-copy {
+  margin: 0 0 16px;
+  color: var(--color-secondary-text);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .workflow-orchestration {
   margin: 18px 0;
   padding: 16px 0;
@@ -1055,6 +1217,10 @@ onBeforeUnmount(disposeWorkflowEventStream)
 }
 
 @media (max-width: 640px) {
+  .report-panel > .page-head .inline-actions .el-button {
+    min-height: 44px;
+  }
+
   .workflow-retry-lineage {
     align-items: flex-start;
     flex-wrap: wrap;
@@ -1062,6 +1228,10 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .workflow-retry-lineage .el-button {
     width: 100%;
+    min-height: 44px;
+  }
+
+  :global(.el-dialog[aria-label="安全暂停工作流"] .el-dialog__footer .el-button) {
     min-height: 44px;
   }
 

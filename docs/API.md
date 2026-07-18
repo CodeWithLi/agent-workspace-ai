@@ -64,12 +64,13 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 ## 工作流与知识库
 
 - `POST /workflow/run`
-- `POST /workflow/continue`
 - `GET /workflow?project_id=...`
 - `GET /workflow/{workflow_id}`
 - `GET /workflow/{workflow_id}/events/history`：按时间顺序读取最近 1-200 条持久化事件，用于页面刷新恢复。
 - `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限。
 - `GET /workflow/{workflow_id}/saga-steps`：查看写工具执行快照、状态、补偿次数和人工介入原因。
+- `POST /workflow/{workflow_id}/pause`：使用唯一 `request_id` 和暂停原因请求安全暂停。排队运行立即进入 `PAUSED`；运行中的 Agent 完成并提交当前节点后暂停，相同请求幂等返回。
+- `POST /workflow/continue`：恢复报告/质量门禁或操作员暂停。操作员暂停必须提供恢复指令，该指令会持久化到结构化运行上下文并传递给后续 Agent。
 - `POST /workflow/{workflow_id}/cancel`
 - `POST /workflow/{workflow_id}/retry`：仅接受 `FAILED` 源运行和唯一 `request_id`；源运行保持只读，接口独立扣费并从失败检查点创建新的 `QUEUED` 子运行。相同源运行与 `request_id` 返回同一子运行，项目存在其他活动运行时返回 `409`。
 - `POST /workflow/{workflow_id}/retry-compensation`：仅用于 `COMPENSATION_FAILED`，人工核对业务数据后重试确定性补偿。

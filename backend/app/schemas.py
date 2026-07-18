@@ -407,7 +407,20 @@ class WorkflowRequest(BaseModel):
 
 class WorkflowContinueRequest(BaseModel):
     workflow_id: int
-    human_feedback: str = ""
+    human_feedback: str = Field(default="", max_length=4000)
+
+
+class WorkflowPauseRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+    reason: str = Field(min_length=3, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 3:
+            raise ValueError("Pause reason must contain at least 3 non-whitespace characters")
+        return normalized
 
 
 class WorkflowRetryRequest(BaseModel):
@@ -420,6 +433,10 @@ class WorkflowResponse(BaseModel):
     parent_workflow_id: int | None
     retry_from_node: str
     retry_sequence: int
+    pause_requested_at: datetime | None
+    pause_requested_by_user_id: int | None
+    pause_reason: str
+    intervention_count: int
     status: WorkflowStatus
     current_node: str
     state: dict[str, Any]
@@ -571,6 +588,7 @@ class TraceRunOut(BaseModel):
     parent_workflow_id: int | None
     retry_from_node: str
     retry_sequence: int
+    intervention_count: int
     project_name: str
     owner_id: int
     owner_name: str

@@ -36,6 +36,10 @@ class WorkflowCancelled(RuntimeError):
     pass
 
 
+class WorkflowPauseRequested(RuntimeError):
+    pass
+
+
 class ProjectState(TypedDict, total=False):
     user_input: str
     project: dict[str, Any]
@@ -53,6 +57,7 @@ class ProjectState(TypedDict, total=False):
     revision_round: int
     revision_feedback: str
     manual_revision_count: int
+    interventions: list[dict[str, Any]]
 
 
 class WorkspaceGraphState(ProjectState, total=False):
@@ -100,6 +105,7 @@ def initial_state(
         "revision_round": 0,
         "revision_feedback": "",
         "manual_revision_count": 0,
+        "interventions": [],
     }
 
 
@@ -109,6 +115,14 @@ def append_message(state: WorkspaceGraphState, role: str, content: str) -> list[
 
 def without_analysis(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "analysis"}
+
+
+def agent_context(state: WorkspaceGraphState, payload: dict[str, Any]) -> dict[str, Any]:
+    interventions = state.get("interventions", [])
+    if not isinstance(interventions, list):
+        interventions = []
+    safe_interventions = [item for item in interventions if isinstance(item, dict)][-10:]
+    return {**payload, "operator_interventions": safe_interventions}
 
 
 def document_content(state: WorkspaceGraphState, document_type: str, limit: int = 12000) -> str:
@@ -162,6 +176,8 @@ def begin_node(
     locked = lock_workflow_lease(db, workflow, expected_lease_token)
     if locked.status == WorkflowStatus.cancelling:
         raise WorkflowCancelled("Workflow cancellation requested")
+    if locked.pause_requested_at is not None:
+        raise WorkflowPauseRequested("Workflow pause requested")
     locked.current_node = node
     locked.locked_at = datetime.now(timezone.utc)
     record_workflow_event(db, locked, "NODE_STARTED", f"Started {node}", node=node)
@@ -192,6 +208,8 @@ def complete_node(
         payload={"next_node": workflow.current_node},
     )
     db.commit()
+    if locked.pause_requested_at is not None and locked.current_node != "completed":
+        raise WorkflowPauseRequested("Workflow paused after committing a node checkpoint")
     return output
 
 
@@ -245,7 +263,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         requirements["analysis"] = await invoke_agent(
             AgentRole.product_manager,
             "你是需求分析 Agent。识别目标、约束、缺失信息和验收标准。",
-            state["user_input"],
+            json.dumps(
+                agent_context(state, {"user_input": state["user_input"]}),
+                ensure_ascii=False,
+            ),
         )
         return complete_node(db, workflow, "requirement", state, {
             "requirements": requirements,
@@ -258,7 +279,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         content = await invoke_agent(
             AgentRole.product_manager,
             "你是AI产品经理，生成完整PRD。",
-            json.dumps(without_analysis(state["requirements"]), ensure_ascii=False),
+            json.dumps(
+                agent_context(state, {"requirements": without_analysis(state["requirements"])}),
+                ensure_ascii=False,
+            ),
         )
         return complete_node(db, workflow, "product", state, {
             "documents": [*state.get("documents", []), {"type": "PRD", "content": content}],
@@ -273,11 +297,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             AgentRole.architect,
             "你是AI架构师，生成系统设计。",
             json.dumps(
-                {
+                agent_context(state, {
                     "requirements": without_analysis(state["requirements"]),
                     "product_prd": document_content(state, "PRD"),
                     "architecture_baseline": architecture,
-                },
+                }),
                 ensure_ascii=False,
             ),
         )
@@ -299,13 +323,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "knowledge_admin、notification_secretary。"
             ),
             json.dumps(
-                {
+                agent_context(state, {
                     "user_input": state["user_input"],
                     "requirements": without_analysis(state["requirements"]),
                     "architecture": state["architecture"],
                     "product_prd": document_content(state, "PRD"),
                     "system_design": document_content(state, "SYSTEM_DESIGN"),
-                },
+                }),
                 ensure_ascii=False,
             ),
         )
@@ -374,7 +398,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "必须包含范围判断、关键决策、风险、边界场景、验收证据和下一步负责人。"
                 ),
                 json.dumps(
-                    {
+                    agent_context(state, {
                         "workflow_objective": plan.objective,
                         "assignment": assignment.model_dump(mode="json"),
                         "success_criteria": plan.success_criteria,
@@ -382,7 +406,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "architecture": state["architecture"],
                         "revision_feedback": revision_feedback,
                         "previous_handoff": previous.content if previous else "",
-                    },
+                    }),
                     ensure_ascii=False,
                 ),
                 isolated_usage=True,
@@ -437,11 +461,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "revision_roles、summary。检查可追溯性、冲突、边界场景、验收证据和发布风险。"
             ),
             json.dumps(
-                {
+                agent_context(state, {
                     "execution_plan": plan.model_dump(mode="json"),
                     "handoffs": [handoff.model_dump(mode="json") for handoff in handoffs],
                     "deterministic_gate": deterministic.model_dump(mode="json"),
-                },
+                }),
                 ensure_ascii=False,
             ),
         )
@@ -492,7 +516,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             AgentRole.project_manager,
             "你是AI项目经理。根据需求和架构生成里程碑、依赖关系、风险与资源计划。",
             json.dumps(
-                {
+                agent_context(state, {
                     "requirements": without_analysis(state["requirements"]),
                     "architecture": state["architecture"],
                     "product_prd": document_content(state, "PRD"),
@@ -501,7 +525,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "execution_plan": state["execution_plan"],
                     "specialist_handoffs": state.get("specialist_handoffs", []),
                     "quality_gate": state.get("quality_gate", {}),
-                },
+                }),
                 ensure_ascii=False,
             ),
         )
@@ -525,7 +549,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             AgentRole.test_engineer,
             "你是AI测试工程师。根据需求、架构和任务生成测试策略、边界场景和验收门禁。",
             json.dumps(
-                {
+                agent_context(state, {
                     "requirements": without_analysis(state["requirements"]),
                     "architecture": state["architecture"],
                     "tasks": state["tasks"],
@@ -535,7 +559,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "execution_plan": state.get("execution_plan", {}),
                     "specialist_handoffs": state.get("specialist_handoffs", []),
                     "quality_gate": state.get("quality_gate", {}),
-                },
+                }),
                 ensure_ascii=False,
             ),
         )
@@ -556,7 +580,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             AgentRole.operations_analyst,
             "你是项目报告生成器。请生成最终项目报告，包含需求、架构、任务、测试、风险。",
             json.dumps(
-                {
+                agent_context(state, {
                     "project": state["project"],
                     "requirements": without_analysis(state["requirements"]),
                     "architecture": state["architecture"],
@@ -569,7 +593,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         document_type: document_content(state, document_type, limit=8000)
                         for document_type in ("PRD", "SYSTEM_DESIGN", "PROJECT_PLAN", "TEST_PLAN")
                     },
-                },
+                }),
                 ensure_ascii=False,
             )
             + feedback,
@@ -722,6 +746,17 @@ async def execute_workspace_graph(db: Session, workflow: WorkflowRun, pause_befo
     workflow.locked_at = None
     workflow.lease_token = None
     if workflow.current_node == "completed":
+        if workflow.pause_requested_at is not None:
+            record_workflow_event(
+                db,
+                workflow,
+                "PAUSE_SKIPPED",
+                "Workflow reached completion before the pause could be applied",
+                payload={"reason_chars": len(workflow.pause_reason)},
+            )
+            workflow.pause_requested_at = None
+            workflow.pause_requested_by_user_id = None
+            workflow.pause_reason = ""
         workflow.status = WorkflowStatus.completed
         workflow.finished_at = datetime.now(timezone.utc)
         record_workflow_event(db, workflow, "COMPLETED", "Workflow completed")
