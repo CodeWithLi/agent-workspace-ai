@@ -13,14 +13,19 @@ from app.rag.evaluation import (  # noqa: E402
     evaluate_candidates,
     chonkie_sentence_candidates,
     legacy_candidates,
-    load_cases,
-    load_documents,
+    load_evaluation_corpus,
     structural_candidates,
 )
 
 
+DEFAULT_CASES_PATH = ROOT / "backend" / "tests" / "rag_eval_cases.json"
+DEFAULT_DOCUMENTS_DIRECTORY = ROOT / "backend" / "tests" / "rag_eval_documents"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare legacy and structural RAG chunking")
+    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
+    parser.add_argument("--documents-dir", type=Path, default=DEFAULT_DOCUMENTS_DIRECTORY)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--include-chonkie", action="store_true")
@@ -32,8 +37,10 @@ def main() -> int:
     parser.add_argument("--max-p95-retrieval-ms", type=float, default=100.0)
     args = parser.parse_args()
 
-    cases = load_cases(ROOT / "backend" / "tests" / "rag_eval_cases.json")
-    documents = load_documents(cases, ROOT / "backend" / "tests" / "rag_eval_documents")
+    try:
+        cases, documents, dataset = load_evaluation_corpus(args.cases, args.documents_dir)
+    except ValueError as exc:
+        parser.error(str(exc))
     chunker = StructuralChunker()
     strategies = [
         ("legacy-characters-900-140", lambda: legacy_candidates(documents, chunker.tokens.count)),
@@ -79,6 +86,7 @@ def main() -> int:
             f"p95 retrieval {structural['p95_retrieval_ms']:.3f}ms > {args.max_p95_retrieval_ms:.3f}ms"
         )
     payload = {
+        "dataset": dataset,
         "top_k": args.top_k,
         "min_score": args.min_score,
         "min_query_coverage": args.min_query_coverage,

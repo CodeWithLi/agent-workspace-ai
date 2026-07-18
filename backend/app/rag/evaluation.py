@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from statistics import mean
 from time import perf_counter
 from typing import Callable
@@ -16,6 +17,7 @@ from app.rag.service import query_coverage, sparse_scores, split_text
 
 
 JUDGE_CONTEXT_MAX_TOKENS = 2200
+EVALUATION_DOCUMENT_SUFFIXES = {".pdf", ".docx", ".md", ".markdown", ".txt"}
 judge_context_tokens = TokenCounter("cl100k_base")
 
 
@@ -184,6 +186,24 @@ def compare_end_to_end_reports(
         raise ValueError("baseline report contains evaluation errors")
     if candidate.get("evaluation_errors"):
         raise ValueError("candidate report contains evaluation errors")
+    baseline_corpus = (baseline.get("dataset") or {}).get("corpus_sha256")
+    candidate_corpus = (candidate.get("dataset") or {}).get("corpus_sha256")
+    if bool(baseline_corpus) != bool(candidate_corpus):
+        raise ValueError("baseline and candidate reports must both identify their corpus")
+    if baseline_corpus and baseline_corpus != candidate_corpus:
+        raise ValueError("baseline and candidate reports use different corpora")
+    baseline_parsed_corpus = (baseline.get("parsing") or {}).get("parsed_corpus_sha256")
+    candidate_parsed_corpus = (candidate.get("parsing") or {}).get("parsed_corpus_sha256")
+    if bool(baseline_parsed_corpus) != bool(candidate_parsed_corpus):
+        raise ValueError("baseline and candidate reports must both identify their parsed corpus")
+    if baseline_parsed_corpus and baseline_parsed_corpus != candidate_parsed_corpus:
+        raise ValueError("baseline and candidate reports use different parsed corpora")
+    if baseline_parsed_corpus:
+        baseline_parsing = baseline["parsing"]
+        candidate_parsing = candidate["parsing"]
+        for field in ("backend", "fallback_enabled"):
+            if baseline_parsing.get(field) != candidate_parsing.get(field):
+                raise ValueError("baseline and candidate reports use different parsing configurations")
 
     guarded_metrics = (
         "recall_at_k",
@@ -224,21 +244,139 @@ def compare_end_to_end_reports(
 
 
 def load_cases(path: Path) -> list[RetrievalCase]:
-    rows = json.loads(path.read_text(encoding="utf-8"))
-    cases = []
-    for source in rows:
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load evaluation cases: {exc}") from exc
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("evaluation cases must be a non-empty JSON array")
+    cases: list[RetrievalCase] = []
+    seen_names: set[str] = set()
+    for index, source in enumerate(rows):
+        if not isinstance(source, dict):
+            raise ValueError(f"evaluation case {index} must be an object")
         row = dict(source)
-        row["answer_required_groups"] = tuple(
-            tuple(group) for group in row.get("answer_required_groups", ())
-        )
-        row["answer_forbidden_terms"] = tuple(row.get("answer_forbidden_terms", ()))
-        cases.append(RetrievalCase(**row))
+        name = row.get("name")
+        query = row.get("query")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"evaluation case {index} must have a non-empty name")
+        if name in seen_names:
+            raise ValueError(f"duplicate evaluation case name: {name}")
+        seen_names.add(name)
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(f"evaluation case {name} must have a non-empty query")
+        document = row.get("document")
+        if document is not None:
+            if not isinstance(document, str) or not document.strip():
+                raise ValueError(f"evaluation case {name} has an invalid document path")
+            normalized = PurePosixPath(document.replace("\\", "/"))
+            if normalized.is_absolute() or ".." in normalized.parts:
+                raise ValueError(f"evaluation case {name} document must stay inside the corpus")
+            row["document"] = normalized.as_posix()
+        groups = row.get("answer_required_groups", [])
+        if not isinstance(groups, list) or any(
+            not isinstance(group, list)
+            or not group
+            or any(not isinstance(term, str) or not term for term in group)
+            for group in groups
+        ):
+            raise ValueError(f"evaluation case {name} has invalid answer_required_groups")
+        forbidden = row.get("answer_forbidden_terms", [])
+        if not isinstance(forbidden, list) or any(
+            not isinstance(term, str) or not term for term in forbidden
+        ):
+            raise ValueError(f"evaluation case {name} has invalid answer_forbidden_terms")
+        row["answer_required_groups"] = tuple(tuple(group) for group in groups)
+        row["answer_forbidden_terms"] = tuple(forbidden)
+        try:
+            case = RetrievalCase(**row)
+        except TypeError as exc:
+            raise ValueError(f"evaluation case {name} has invalid fields: {exc}") from exc
+        if case.answerable and (
+            not case.document
+            or not isinstance(case.evidence, str)
+            or not case.evidence.strip()
+            or not case.answer_required_groups
+        ):
+            raise ValueError(
+                f"answerable evaluation case {name} requires document, evidence, and answer assertions"
+            )
+        cases.append(case)
     return cases
 
 
 def load_documents(cases: list[RetrievalCase], directory: Path) -> dict[str, bytes]:
     filenames = sorted({case.document for case in cases if case.document is not None})
     return {filename: (directory / filename).read_bytes() for filename in filenames}
+
+
+def load_document_directory(directory: Path) -> dict[str, bytes]:
+    if not directory.is_dir():
+        raise ValueError(f"evaluation documents directory does not exist: {directory}")
+    if directory.is_symlink():
+        raise ValueError(f"evaluation corpus cannot be a symlink: {directory}")
+    documents: dict[str, bytes] = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"evaluation corpus cannot contain symlinks: {path}")
+        if not path.is_file() or path.suffix.lower() not in EVALUATION_DOCUMENT_SUFFIXES:
+            continue
+        relative = path.relative_to(directory).as_posix()
+        data = path.read_bytes()
+        if not data:
+            raise ValueError(f"evaluation document is empty: {relative}")
+        documents[relative] = data
+    if not documents:
+        supported = ", ".join(sorted(EVALUATION_DOCUMENT_SUFFIXES))
+        raise ValueError(f"evaluation corpus contains no supported documents ({supported})")
+    return documents
+
+
+def load_evaluation_corpus(
+    cases_path: Path,
+    documents_directory: Path,
+) -> tuple[list[RetrievalCase], dict[str, bytes], dict]:
+    cases = load_cases(cases_path)
+    documents = load_document_directory(documents_directory)
+    missing = sorted(
+        {
+            case.document
+            for case in cases
+            if case.answerable and case.document not in documents
+        }
+    )
+    if missing:
+        raise ValueError(f"evaluation cases reference missing documents: {', '.join(missing)}")
+    if not any(case.answerable for case in cases) or not any(not case.answerable for case in cases):
+        raise ValueError("evaluation corpus must contain answerable and unanswerable cases")
+
+    cases_bytes = cases_path.read_bytes()
+    cases_sha256 = hashlib.sha256(cases_bytes).hexdigest()
+    document_digest = hashlib.sha256()
+    document_rows: list[dict] = []
+    for name, data in sorted(documents.items()):
+        name_bytes = name.encode("utf-8")
+        digest = hashlib.sha256(data).hexdigest()
+        document_digest.update(len(name_bytes).to_bytes(8, "big"))
+        document_digest.update(name_bytes)
+        document_digest.update(len(data).to_bytes(8, "big"))
+        document_digest.update(data)
+        document_rows.append({"name": name, "bytes": len(data), "sha256": digest})
+    documents_sha256 = document_digest.hexdigest()
+    corpus_digest = hashlib.sha256()
+    corpus_digest.update(bytes.fromhex(cases_sha256))
+    corpus_digest.update(bytes.fromhex(documents_sha256))
+    metadata = {
+        "case_count": len(cases),
+        "answerable_cases": sum(1 for case in cases if case.answerable),
+        "unanswerable_cases": sum(1 for case in cases if not case.answerable),
+        "document_count": len(documents),
+        "cases_sha256": cases_sha256,
+        "documents_sha256": documents_sha256,
+        "corpus_sha256": corpus_digest.hexdigest(),
+        "documents": document_rows,
+    }
+    return cases, documents, metadata
 
 
 def legacy_candidates(documents: dict[str, bytes], token_count: Callable[[str], int]) -> list[CandidateChunk]:

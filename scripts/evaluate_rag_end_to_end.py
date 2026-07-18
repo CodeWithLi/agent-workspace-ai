@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import sys
@@ -15,6 +16,7 @@ from app.core.config import get_settings  # noqa: E402
 from app.core.llm import LLMGatewayError, get_llm  # noqa: E402
 from app.core.llm_usage import calculate_cost_micros, estimate_tokens  # noqa: E402
 from app.rag.chunking import ChunkingConfig, build_chunker  # noqa: E402
+from app.rag.advanced_parser import parse_document_with_backend  # noqa: E402
 from app.rag.evaluation import (  # noqa: E402
     answer_judge_prompt,
     answer_citations,
@@ -22,11 +24,10 @@ from app.rag.evaluation import (  # noqa: E402
     deterministic_answer_assertion_score,
     deterministic_citation_score,
     first_relevant_rank,
-    load_cases,
-    load_documents,
+    load_evaluation_corpus,
     parse_answer_judge_response,
 )
-from app.rag.parsers import parse_document_elements  # noqa: E402
+from app.rag.parsers import DocumentParseError, validate_parsed_document  # noqa: E402
 from app.rag.reranker import reranker  # noqa: E402
 from app.rag.service import (  # noqa: E402
     average_vectors,
@@ -40,6 +41,10 @@ from app.rag.service import (  # noqa: E402
     sparse_scores,
     split_text,
 )
+
+
+DEFAULT_CASES_PATH = ROOT / "backend" / "tests" / "rag_eval_cases.json"
+DEFAULT_DOCUMENTS_DIRECTORY = ROOT / "backend" / "tests" / "rag_eval_documents"
 
 
 def percentile(values: list[float], percentile_value: float) -> float:
@@ -56,7 +61,12 @@ def rank_scores(values: list[float]) -> list[float]:
     return [1 / (1 + (ranks[index] - 1) / 10) if value > 0 else 0.0 for index, value in enumerate(values)]
 
 
-async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, gateway) -> tuple[list[dict], int]:
+async def candidate_rows(
+    documents: dict[str, bytes],
+    strategy: str,
+    settings,
+    gateway,
+) -> tuple[list[dict], int, dict]:
     config = ChunkingConfig(
         child_tokens=settings.rag_child_chunk_tokens,
         parent_tokens=settings.rag_parent_chunk_tokens,
@@ -78,11 +88,63 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
                 embedding_base_url=settings.embedding_base_url or gateway.base_url,
             )
     rows: list[dict] = []
+    parsed_corpus_digest = hashlib.sha256()
+    parser_documents: list[dict] = []
     semantic_boundary_tokens = 0
     for document_id, (filename, data) in enumerate(documents.items(), start=1):
-        parsed = parse_document_elements(filename, data)
+        parsed = await parse_document_with_backend(filename, data)
+        validate_parsed_document(
+            parsed,
+            max_characters=settings.rag_max_document_chars,
+            max_pages=settings.rag_max_pdf_pages,
+            max_elements=settings.rag_max_elements,
+        )
+        parsed_payload = {
+            "parser_name": parsed.parser_name,
+            "parser_version": parsed.parser_version,
+            "metadata": parsed.metadata,
+            "text": parsed.text,
+            "elements": [
+                {
+                    "kind": element.kind,
+                    "content": element.content,
+                    "heading_path": list(element.heading_path),
+                    "page_start": element.page_start,
+                    "page_end": element.page_end,
+                    "char_start": element.char_start,
+                    "char_end": element.char_end,
+                    "metadata": element.metadata,
+                }
+                for element in parsed.elements
+            ],
+        }
+        parsed_bytes = json.dumps(
+            parsed_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        parsed_sha256 = hashlib.sha256(parsed_bytes).hexdigest()
+        filename_bytes = filename.encode("utf-8")
+        parsed_corpus_digest.update(len(filename_bytes).to_bytes(8, "big"))
+        parsed_corpus_digest.update(filename_bytes)
+        parsed_corpus_digest.update(bytes.fromhex(parsed_sha256))
+        parser_documents.append(
+            {
+                "name": filename,
+                "parser_name": parsed.parser_name,
+                "parser_version": parsed.parser_version,
+                "element_count": len(parsed.elements),
+                "page_count": parsed.metadata.get("page_count"),
+                "fallback_from": parsed.metadata.get("parser_fallback_from"),
+                "parsed_sha256": parsed_sha256,
+            }
+        )
         if strategy == "legacy":
             chunks = split_text(parsed.text, chunk_size=900, overlap=140)
+            if len(chunks) > settings.rag_max_chunks:
+                raise DocumentParseError("document produces too many chunks")
             for chunk_index, content in enumerate(chunks):
                 rows.append(
                     {
@@ -108,6 +170,8 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
         else:
             assert chunker is not None
             chunks = chunker.chunk(parsed)
+        if len(chunks) > settings.rag_max_chunks:
+            raise DocumentParseError("document produces too many chunks")
         for chunk in chunks:
             rows.append(
                 {
@@ -125,11 +189,24 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
                     "page_end": chunk.page_end,
                 }
             )
-    return rows, semantic_boundary_tokens
+    return (
+        rows,
+        semantic_boundary_tokens,
+        {
+            "backend": settings.rag_parser_backend,
+            "fallback_enabled": settings.rag_parser_fallback_enabled,
+            "parsed_corpus_sha256": parsed_corpus_digest.hexdigest(),
+            "documents": parser_documents,
+        },
+    )
 
 
 async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     settings = get_settings()
+    try:
+        cases, documents, dataset = load_evaluation_corpus(args.cases, args.documents_dir)
+    except ValueError as exc:
+        return {"status": "configuration_error", "errors": [str(exc)]}, 2
     if args.provider == "local-open-models":
         from app.rag.local_evaluation_models import LocalOpenModelSuite
 
@@ -189,8 +266,6 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             }, 2
         model_warmup_ms = (perf_counter() - warmup_started) * 1000
 
-    cases = load_cases(ROOT / "backend" / "tests" / "rag_eval_cases.json")
-    documents = load_documents(cases, ROOT / "backend" / "tests" / "rag_eval_documents")
     if args.baseline_report:
         missing_queries = [case.name for case in cases if not baseline_queries.get(case.name)]
         if missing_queries:
@@ -199,13 +274,13 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                 "errors": [f"baseline report is missing queries for: {', '.join(missing_queries)}"],
             }, 2
     try:
-        candidates, semantic_boundary_tokens = await candidate_rows(
+        candidates, semantic_boundary_tokens, parsing = await candidate_rows(
             documents,
             args.chunk_strategy,
             settings,
             gateway,
         )
-    except ValueError as exc:
+    except (DocumentParseError, ValueError) as exc:
         return {"status": "configuration_error", "errors": [str(exc)]}, 2
     contents = [row["content"] for row in candidates]
     started = perf_counter()
@@ -503,6 +578,8 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     return (
         {
             "status": "completed",
+            "dataset": dataset,
+            "parsing": parsing,
             "provider": args.provider,
             "chunk_strategy": args.chunk_strategy,
             "model": gateway.model,
@@ -536,6 +613,8 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate model-backed end-to-end RAG quality with an LLM judge")
+    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
+    parser.add_argument("--documents-dir", type=Path, default=DEFAULT_DOCUMENTS_DIRECTORY)
     parser.add_argument("--provider", choices=("external", "local-open-models"), default="external")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--judge-model")

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from app.rag.chunking import StructuralChunker
@@ -13,6 +14,7 @@ from app.rag.evaluation import (
     first_relevant_rank,
     legacy_candidates,
     load_cases,
+    load_evaluation_corpus,
     load_documents,
     judge_context_tokens,
     parse_answer_judge_response,
@@ -74,6 +76,122 @@ def test_repository_rag_chunking_evaluation_is_reproducible() -> None:
     assert structural.citation_target_accuracy >= legacy.citation_target_accuracy
     assert 0 <= structural.refusal_accuracy <= 1
     assert 0 < structural.index_tokens <= legacy.index_tokens
+
+
+def test_external_evaluation_corpus_loads_distractors_and_has_stable_identity(tmp_path: Path) -> None:
+    documents_directory = tmp_path / "documents"
+    nested_directory = documents_directory / "policies"
+    nested_directory.mkdir(parents=True)
+    (nested_directory / "security.md").write_text("authoritative control", encoding="utf-8")
+    (documents_directory / "distractor.docx").write_bytes(b"distractor bytes")
+    (documents_directory / "ignored.exe").write_bytes(b"ignored")
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "control",
+                    "query": "What is authoritative?",
+                    "document": "policies/security.md",
+                    "evidence": "authoritative control",
+                    "answer_required_groups": [["authoritative"]],
+                },
+                {
+                    "name": "unknown",
+                    "query": "What is the cafeteria password?",
+                    "document": None,
+                    "evidence": None,
+                    "answerable": False,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cases, documents, metadata = load_evaluation_corpus(cases_path, documents_directory)
+    _, _, repeated_metadata = load_evaluation_corpus(cases_path, documents_directory)
+
+    assert [case.name for case in cases] == ["control", "unknown"]
+    assert sorted(documents) == ["distractor.docx", "policies/security.md"]
+    assert metadata == repeated_metadata
+    assert metadata["case_count"] == 2
+    assert metadata["answerable_cases"] == metadata["unanswerable_cases"] == 1
+    assert metadata["document_count"] == 2
+    assert len(metadata["corpus_sha256"]) == 64
+
+    (documents_directory / "distractor.docx").write_bytes(b"changed distractor bytes")
+    _, _, changed_metadata = load_evaluation_corpus(cases_path, documents_directory)
+    assert changed_metadata["corpus_sha256"] != metadata["corpus_sha256"]
+
+
+def test_external_evaluation_corpus_rejects_missing_and_unsafe_documents(tmp_path: Path) -> None:
+    documents_directory = tmp_path / "documents"
+    documents_directory.mkdir()
+    (documents_directory / "present.md").write_text("present evidence", encoding="utf-8")
+    cases_path = tmp_path / "cases.json"
+    base_case = {
+        "name": "control",
+        "query": "What is authoritative?",
+        "evidence": "present evidence",
+        "answer_required_groups": [["present"]],
+    }
+    refusal = {
+        "name": "unknown",
+        "query": "Unknown?",
+        "document": None,
+        "evidence": None,
+        "answerable": False,
+    }
+
+    cases_path.write_text(
+        json.dumps([{**base_case, "document": "missing.md"}, refusal]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing documents"):
+        load_evaluation_corpus(cases_path, documents_directory)
+
+    cases_path.write_text(
+        json.dumps([{**base_case, "document": "../present.md"}, refusal]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stay inside the corpus"):
+        load_evaluation_corpus(cases_path, documents_directory)
+
+
+def test_external_evaluation_corpus_rejects_document_symlink(tmp_path: Path) -> None:
+    documents_directory = tmp_path / "documents"
+    documents_directory.mkdir()
+    target = tmp_path / "outside.md"
+    target.write_text("authoritative evidence", encoding="utf-8")
+    try:
+        (documents_directory / "linked.md").symlink_to(target)
+    except OSError:
+        pytest.skip("symbolic links are unavailable on this platform")
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "control",
+                    "query": "What is authoritative?",
+                    "document": "linked.md",
+                    "evidence": "authoritative evidence",
+                    "answer_required_groups": [["authoritative"]],
+                },
+                {
+                    "name": "unknown",
+                    "query": "Unknown?",
+                    "document": None,
+                    "evidence": None,
+                    "answerable": False,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cannot contain symlinks"):
+        load_evaluation_corpus(cases_path, documents_directory)
 
 
 def test_answer_judge_parser_and_citation_gate_are_strict() -> None:
@@ -165,3 +283,57 @@ def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> No
     assert passed["deltas"]["recall_at_k"] == 0.06
     assert regressed["passed"] is False
     assert any("citation_target_accuracy regressed" in failure for failure in regressed["failures"])
+
+    with pytest.raises(ValueError, match="different corpora"):
+        compare_end_to_end_reports(
+            {
+                "dataset": {"corpus_sha256": "a" * 64},
+                "metrics": baseline_metrics,
+                "evaluation_errors": [],
+            },
+            {
+                "dataset": {"corpus_sha256": "b" * 64},
+                "metrics": candidate_metrics,
+                "evaluation_errors": [],
+            },
+        )
+
+    with pytest.raises(ValueError, match="different parsed corpora"):
+        compare_end_to_end_reports(
+            {
+                "dataset": {"corpus_sha256": "a" * 64},
+                "parsing": {"parsed_corpus_sha256": "c" * 64},
+                "metrics": baseline_metrics,
+                "evaluation_errors": [],
+            },
+            {
+                "dataset": {"corpus_sha256": "a" * 64},
+                "parsing": {"parsed_corpus_sha256": "d" * 64},
+                "metrics": candidate_metrics,
+                "evaluation_errors": [],
+            },
+        )
+
+    with pytest.raises(ValueError, match="different parsing configurations"):
+        compare_end_to_end_reports(
+            {
+                "dataset": {"corpus_sha256": "a" * 64},
+                "parsing": {
+                    "parsed_corpus_sha256": "c" * 64,
+                    "backend": "native",
+                    "fallback_enabled": False,
+                },
+                "metrics": baseline_metrics,
+                "evaluation_errors": [],
+            },
+            {
+                "dataset": {"corpus_sha256": "a" * 64},
+                "parsing": {
+                    "parsed_corpus_sha256": "c" * 64,
+                    "backend": "docling",
+                    "fallback_enabled": False,
+                },
+                "metrics": candidate_metrics,
+                "evaluation_errors": [],
+            },
+        )
