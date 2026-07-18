@@ -20,7 +20,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.observability import compare_trace_runs, get_trace_detail, get_trace_overview
+from app.observability import compare_trace_runs, get_trace_detail, get_trace_health, get_trace_overview
 
 
 NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
@@ -345,6 +345,78 @@ def _add_comparison_candidate(db: Session, data: dict[str, object]) -> WorkflowR
     return candidate
 
 
+def _add_health_history(db: Session, owner: User) -> tuple[Project, WorkflowRun]:
+    project = Project(name="Health", description="Health history", owner_id=owner.id)
+    db.add(project)
+    db.flush()
+    db.add(ProjectMember(project_id=project.id, user_id=owner.id, role=ProjectMemberRole.owner))
+    base = NOW - timedelta(hours=2)
+    runs: list[WorkflowRun] = []
+    for index in range(6):
+        created_at = base + timedelta(minutes=index * 5)
+        workflow = WorkflowRun(
+            project_id=project.id,
+            user_id=owner.id,
+            status=WorkflowStatus.completed,
+            current_node="completed",
+            state_json='{"prompt":"health-secret"}',
+            created_at=created_at,
+            started_at=created_at,
+            finished_at=created_at + timedelta(minutes=1),
+        )
+        db.add(workflow)
+        db.flush()
+        db.add(
+            LLMUsage(
+                user_id=owner.id,
+                project_id=project.id,
+                workflow_id=workflow.id,
+                operation="workflow",
+                provider="openai",
+                model="health-model",
+                input_tokens=50,
+                output_tokens=50,
+                total_tokens=100,
+                estimated_cost_micros=1000,
+                latency_ms=1000,
+                created_at=created_at + timedelta(seconds=30),
+            )
+        )
+        runs.append(workflow)
+
+    outlier_at = base + timedelta(minutes=40)
+    outlier = WorkflowRun(
+        project_id=project.id,
+        user_id=owner.id,
+        status=WorkflowStatus.completed,
+        current_node="completed",
+        state_json='{"artifact":"outlier-secret"}',
+        created_at=outlier_at,
+        started_at=outlier_at,
+        finished_at=outlier_at + timedelta(minutes=5),
+    )
+    db.add(outlier)
+    db.flush()
+    db.add(
+        LLMUsage(
+            user_id=owner.id,
+            project_id=project.id,
+            workflow_id=outlier.id,
+            operation="workflow",
+            provider="openai",
+            model="health-model",
+            input_tokens=300,
+            output_tokens=200,
+            total_tokens=500,
+            estimated_cost_micros=5000,
+            latency_ms=5000,
+            created_at=outlier_at + timedelta(minutes=4),
+        )
+    )
+    db.commit()
+    return project, outlier
+
+
 @pytest.fixture(autouse=True)
 def fixed_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(observability, "_utc_now", lambda: NOW)
@@ -413,6 +485,79 @@ def test_trace_filters_validate_project_access_and_status(db: Session) -> None:
             workflow_status=None,
         )
     assert inaccessible.value.status_code == 404
+
+
+def test_trace_health_reports_slo_breaches_error_budget_and_scope(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    monkeypatch.setattr(observability.settings, "observability_slo_min_runs", 2, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_success_rate", 80.0, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_p95_duration_ms", 600_000, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_average_cost_micros", 3000, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_anomaly_sensitivity", 3.0, raising=False)
+
+    health = get_trace_health(db, data["admin"], days=7, project_id=None)
+    metrics = {item.key: item for item in health.metrics}
+    assert health.summary.status == "BREACHED"
+    assert health.summary.sample_count == 2
+    assert health.summary.completed_count == 1
+    assert health.summary.failed_count == 1
+    assert health.summary.error_budget_allowed_failures == 0.4
+    assert health.summary.error_budget_consumed_failures == 1
+    assert health.summary.error_budget_remaining_percent == 0.0
+    assert metrics["success_rate"].actual == 50.0
+    assert metrics["success_rate"].compliant is False
+    assert metrics["p95_duration_ms"].actual == 780_000
+    assert metrics["p95_duration_ms"].compliant is False
+    assert metrics["average_cost_micros"].actual == 2050
+    assert metrics["average_cost_micros"].compliant is True
+    failed_anomaly = next(item for item in health.anomalies if item.workflow_id == data["failed"].id)
+    assert failed_anomaly.severity == "CRITICAL"
+    assert "运行失败" in failed_anomaly.signals
+
+    member_health = get_trace_health(db, data["alice"], days=7, project_id=None)
+    assert member_health.summary.status == "INSUFFICIENT_DATA"
+    assert member_health.summary.sample_count == 1
+    empty_user = User(
+        email="trace-empty@example.com",
+        name="Empty Trace User",
+        password_hash="hash",
+        role=UserRole.member,
+    )
+    db.add(empty_user)
+    db.commit()
+    empty_health = get_trace_health(db, empty_user, days=7, project_id=None)
+    assert empty_health.summary.status == "INSUFFICIENT_DATA"
+    assert empty_health.summary.sample_count == 0
+    assert empty_health.summary.error_budget_remaining_percent == 100.0
+    assert empty_health.anomalies == []
+    with pytest.raises(HTTPException) as inaccessible:
+        get_trace_health(db, data["alice"], days=7, project_id=data["beta"].id)
+    assert inaccessible.value.status_code == 404
+
+
+def test_trace_health_detects_history_outliers_without_exposing_run_content(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    project, outlier = _add_health_history(db, data["admin"])
+    monkeypatch.setattr(observability.settings, "observability_slo_min_runs", 5, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_success_rate", 95.0, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_p95_duration_ms", 600_000, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_slo_average_cost_micros", 10_000, raising=False)
+    monkeypatch.setattr(observability.settings, "observability_anomaly_sensitivity", 3.0, raising=False)
+
+    health = get_trace_health(db, data["admin"], days=7, project_id=project.id)
+    assert health.summary.status == "HEALTHY"
+    anomaly = next(item for item in health.anomalies if item.workflow_id == outlier.id)
+    assert anomaly.severity == "WARNING"
+    assert anomaly.signals == ["耗时偏离历史基线", "成本偏离历史基线"]
+    serialized = health.model_dump_json()
+    assert "health-secret" not in serialized
+    assert "outlier-secret" not in serialized
 
 
 def test_trace_detail_pairs_spans_assigns_usage_and_redacts_payloads(db: Session) -> None:
@@ -616,5 +761,6 @@ def test_trace_comparison_rejects_invalid_or_inaccessible_pairs(db: Session) -> 
 def test_trace_routes_are_published_in_openapi() -> None:
     paths = app.openapi()["paths"]
     assert "/api/v1/traces/overview" in paths
+    assert "/api/v1/traces/health" in paths
     assert "/api/v1/traces/compare" in paths
     assert "/api/v1/traces/{workflow_id}" in paths

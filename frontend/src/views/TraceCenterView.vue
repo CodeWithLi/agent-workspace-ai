@@ -39,10 +39,10 @@
           class="refresh-command"
           :icon="Refresh"
           circle
-          :loading="loading"
+          :loading="loading || healthLoading"
           aria-label="刷新运行追踪"
           title="刷新运行追踪"
-          @click="loadOverview"
+          @click="refreshAll"
         />
       </div>
     </header>
@@ -116,6 +116,16 @@
           </span>
         </div>
       </section>
+
+      <TraceHealthPanel
+        :health="health"
+        :loading="healthLoading"
+        :error="healthError"
+        :can-manage-settings="auth.user?.role === 'admin'"
+        @retry="loadHealth"
+        @open-run="openTrace"
+        @open-settings="router.push('/settings')"
+      />
 
       <section class="trace-section trend-section" aria-labelledby="trace-trend-title">
         <div class="section-head">
@@ -398,9 +408,11 @@ import { Close, DataAnalysis, Refresh, View } from '@element-plus/icons-vue'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, getApiErrorMessage } from '../api/client'
-import type { TraceComparison, TraceDetail, TraceOverview, TraceRun, TraceSpan, WorkflowTraceStatus } from '../api/types'
+import type { TraceComparison, TraceDetail, TraceHealth, TraceOverview, TraceRun, TraceSpan, WorkflowTraceStatus } from '../api/types'
 import TraceComparisonDialog from '../components/TraceComparisonDialog.vue'
+import TraceHealthPanel from '../components/TraceHealthPanel.vue'
 import { renderTraceTrendChart, type TraceTrendChart } from '../lib/traceChart'
+import { useAuthStore } from '../stores/auth'
 
 const dayOptions = [
   { label: '24 小时', value: 1 },
@@ -443,12 +455,16 @@ const eventLabels: Record<string, string> = {
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
 const days = ref(7)
 const projectId = ref<number | ''>('')
 const statusFilter = ref<WorkflowTraceStatus | ''>('')
 const loading = ref(false)
 const overviewError = ref('')
 const overview = ref<TraceOverview | null>(null)
+const health = ref<TraceHealth | null>(null)
+const healthLoading = ref(false)
+const healthError = ref('')
 const chartElement = ref<HTMLDivElement | null>(null)
 const detail = ref<TraceDetail | null>(null)
 const detailLoading = ref(false)
@@ -460,6 +476,7 @@ const comparison = ref<TraceComparison | null>(null)
 const comparisonLoading = ref(false)
 const comparisonError = ref('')
 let overviewRequest = 0
+let healthRequest = 0
 let detailRequest = 0
 let comparisonRequest = 0
 let chart: TraceTrendChart | null = null
@@ -532,6 +549,31 @@ async function loadOverview() {
   } finally {
     if (requestId === overviewRequest) loading.value = false
   }
+}
+
+async function loadHealth() {
+  const requestId = ++healthRequest
+  healthLoading.value = true
+  healthError.value = ''
+  try {
+    const { data } = await api.get<TraceHealth>('/traces/health', {
+      params: {
+        days: days.value,
+        project_id: projectId.value || undefined
+      },
+      suppressErrorToast: true
+    })
+    if (requestId === healthRequest) health.value = data
+  } catch (error) {
+    if (requestId === healthRequest) healthError.value = getApiErrorMessage(error)
+  } finally {
+    if (requestId === healthRequest) healthLoading.value = false
+  }
+}
+
+function refreshAll() {
+  void loadOverview()
+  void loadHealth()
 }
 
 function renderChart() {
@@ -700,7 +742,8 @@ function spanStyle(span: TraceSpan) {
   return { left: `${left}%`, width: `${width}%` }
 }
 
-watch([days, projectId, statusFilter], loadOverview, { immediate: true })
+watch([days, projectId], refreshAll, { immediate: true })
+watch(statusFilter, loadOverview)
 watch(selectedRunId, (workflowId) => {
   if (workflowId) void loadDetail(workflowId)
   else {
@@ -723,6 +766,7 @@ watch(compareBaselineId, (baselineId) => {
   if (baseline && candidate && baseline.project_id !== candidate.project_id) compareCandidateId.value = null
 })
 onBeforeUnmount(() => {
+  healthRequest += 1
   comparisonRequest += 1
   chartObserver?.disconnect()
   chart?.dispose()

@@ -5,12 +5,14 @@ import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import (
     Agent,
     LLMUsage,
@@ -24,6 +26,7 @@ from app.models import (
 )
 from app.schemas import (
     TraceAgentMetricOut,
+    TraceAnomalyOut,
     TraceBottleneckOut,
     TraceComparisonAgentOut,
     TraceComparisonMetricOut,
@@ -33,11 +36,15 @@ from app.schemas import (
     TraceDetailMetricsOut,
     TraceDetailOut,
     TraceEventDetailOut,
+    TraceHealthOut,
+    TraceHealthSummaryOut,
     TraceMetricSummaryOut,
     TraceModelCallOut,
     TraceOverviewOut,
     TraceProjectOptionOut,
     TraceRunOut,
+    TraceSLOMetricOut,
+    TraceSLOTargetsOut,
     TraceSpanOut,
     TraceTrendPointOut,
     TraceWindowOut,
@@ -48,6 +55,8 @@ RUN_ANALYSIS_LIMIT = 2_000
 USAGE_ANALYSIS_LIMIT = 50_000
 BOTTLENECK_RUN_LIMIT = 500
 RECENT_RUN_LIMIT = 100
+ANOMALY_LIMIT = 20
+settings = get_settings()
 
 ACTIVE_STATUSES = {
     WorkflowStatus.queued,
@@ -56,6 +65,7 @@ ACTIVE_STATUSES = {
     WorkflowStatus.compensating,
 }
 FAILED_STATUSES = {WorkflowStatus.failed, WorkflowStatus.compensation_failed}
+HEALTH_STATUSES = {WorkflowStatus.completed, *FAILED_STATUSES}
 
 NODE_LABELS = {
     "requirement": "需求分析",
@@ -532,6 +542,198 @@ def _bottlenecks(
         for kind, node, label in samples
     ]
     return sorted(rows, key=lambda item: (-item.p95_duration_ms, -item.average_duration_ms))[:10]
+
+
+def _upper_anomaly_threshold(values: list[int], sensitivity: float, *, floor: int) -> int:
+    center = float(median(values))
+    deviation = float(median(abs(value - center) for value in values))
+    scale = max(deviation * 1.4826, abs(center) * 0.05, float(floor))
+    return round(center + sensitivity * scale)
+
+
+def _trace_anomalies(
+    workflows: list[WorkflowRun],
+    *,
+    costs: dict[int, int],
+    projects: dict[int, Project],
+) -> list[TraceAnomalyOut]:
+    grouped: dict[int, list[WorkflowRun]] = defaultdict(list)
+    for workflow in workflows:
+        grouped[workflow.project_id].append(workflow)
+
+    rows: list[TraceAnomalyOut] = []
+    for project_id, project_runs in grouped.items():
+        project_runs.sort(key=lambda item: (_utc(item.created_at), item.id), reverse=True)
+        for index, workflow in enumerate(project_runs):
+            duration = _duration_ms(workflow.created_at, workflow.finished_at)
+            cost = costs.get(workflow.id, 0)
+            signals: list[str] = []
+            if workflow.status in FAILED_STATUSES:
+                signals.append("运行失败")
+            if duration > settings.observability_slo_p95_duration_ms:
+                signals.append("耗时超过 SLO")
+            if cost > settings.observability_slo_average_cost_micros:
+                signals.append("单次成本超过 SLO")
+
+            older_runs = project_runs[index + 1 :]
+            if len(older_runs) >= settings.observability_slo_min_runs:
+                duration_threshold = _upper_anomaly_threshold(
+                    [_duration_ms(item.created_at, item.finished_at) for item in older_runs],
+                    settings.observability_anomaly_sensitivity,
+                    floor=10_000,
+                )
+                cost_threshold = _upper_anomaly_threshold(
+                    [costs.get(item.id, 0) for item in older_runs],
+                    settings.observability_anomaly_sensitivity,
+                    floor=500,
+                )
+                if duration > duration_threshold:
+                    signals.append("耗时偏离历史基线")
+                if cost > cost_threshold:
+                    signals.append("成本偏离历史基线")
+            if not signals:
+                continue
+            rows.append(
+                TraceAnomalyOut(
+                    workflow_id=workflow.id,
+                    project_id=project_id,
+                    project_name=projects.get(project_id).name if projects.get(project_id) else f"Project #{project_id}",
+                    status=workflow.status,
+                    severity="CRITICAL" if workflow.status in FAILED_STATUSES else "WARNING",
+                    signals=list(dict.fromkeys(signals)),
+                    duration_ms=duration,
+                    total_cost_micros=cost,
+                    detected_at=workflow.finished_at or workflow.created_at,
+                )
+            )
+    return sorted(rows, key=lambda item: (_utc(item.detected_at), item.workflow_id), reverse=True)[:ANOMALY_LIMIT]
+
+
+def get_trace_health(
+    db: Session,
+    current_user: User,
+    *,
+    days: int,
+    project_id: int | None,
+) -> TraceHealthOut:
+    now = _utc_now()
+    start_at = now - timedelta(days=days)
+    _ensure_project_filter(project_id, current_user, db)
+    conditions = _scope_conditions(
+        current_user,
+        start_at,
+        project_id=project_id,
+        workflow_status=None,
+    )
+    workflows = list(
+        db.scalars(
+            select(WorkflowRun)
+            .where(
+                *conditions,
+                WorkflowRun.finished_at.is_not(None),
+                WorkflowRun.status.in_(HEALTH_STATUSES),
+            )
+            .order_by(WorkflowRun.created_at.desc(), WorkflowRun.id.desc())
+            .limit(RUN_ANALYSIS_LIMIT + 1)
+        )
+    )
+    analysis_truncated = len(workflows) > RUN_ANALYSIS_LIMIT
+    workflows = workflows[:RUN_ANALYSIS_LIMIT]
+    workflow_ids = [item.id for item in workflows]
+    costs = {
+        workflow_id: int(cost)
+        for workflow_id, cost in db.execute(
+            select(
+                LLMUsage.workflow_id,
+                func.coalesce(func.sum(LLMUsage.estimated_cost_micros), 0),
+            )
+            .where(LLMUsage.workflow_id.in_(workflow_ids))
+            .group_by(LLMUsage.workflow_id)
+        ).all()
+        if workflow_id is not None
+    } if workflow_ids else {}
+    project_ids = {item.project_id for item in workflows}
+    projects = {
+        item.id: item
+        for item in db.scalars(select(Project).where(Project.id.in_(project_ids)))
+    } if project_ids else {}
+
+    sample_count = len(workflows)
+    completed_count = sum(item.status == WorkflowStatus.completed for item in workflows)
+    failed_count = sample_count - completed_count
+    durations = [_duration_ms(item.created_at, item.finished_at) for item in workflows]
+    success_rate = round(completed_count / sample_count * 100, 1) if sample_count else 0.0
+    p95_duration = _percentile(durations)
+    average_cost = round(sum(costs.get(item.id, 0) for item in workflows) / sample_count) if sample_count else 0
+    metrics = [
+        TraceSLOMetricOut(
+            key="success_rate",
+            label="运行成功率",
+            unit="percent",
+            target=settings.observability_slo_success_rate,
+            actual=success_rate,
+            compliant=success_rate >= settings.observability_slo_success_rate,
+        ),
+        TraceSLOMetricOut(
+            key="p95_duration_ms",
+            label="P95 端到端耗时",
+            unit="duration",
+            target=settings.observability_slo_p95_duration_ms,
+            actual=p95_duration,
+            compliant=p95_duration <= settings.observability_slo_p95_duration_ms,
+        ),
+        TraceSLOMetricOut(
+            key="average_cost_micros",
+            label="单次平均成本",
+            unit="cost",
+            target=settings.observability_slo_average_cost_micros,
+            actual=average_cost,
+            compliant=average_cost <= settings.observability_slo_average_cost_micros,
+        ),
+    ]
+    breached_count = sum(not item.compliant for item in metrics)
+    if sample_count < settings.observability_slo_min_runs:
+        health_status = "INSUFFICIENT_DATA"
+    elif not metrics[0].compliant or breached_count >= 2:
+        health_status = "BREACHED"
+    elif breached_count:
+        health_status = "AT_RISK"
+    else:
+        health_status = "HEALTHY"
+
+    allowed_failures = round(sample_count * (100 - settings.observability_slo_success_rate) / 100, 2)
+    if allowed_failures > 0:
+        remaining_budget = round(max(0.0, (allowed_failures - failed_count) / allowed_failures * 100), 1)
+    else:
+        remaining_budget = 100.0 if failed_count == 0 else 0.0
+    return TraceHealthOut(
+        window=TraceWindowOut(
+            start_at=start_at,
+            end_at=now,
+            days=days,
+            analysis_truncated=analysis_truncated,
+        ),
+        targets=TraceSLOTargetsOut(
+            success_rate_percent=settings.observability_slo_success_rate,
+            p95_duration_ms=settings.observability_slo_p95_duration_ms,
+            average_cost_micros=settings.observability_slo_average_cost_micros,
+            minimum_sample_runs=settings.observability_slo_min_runs,
+            anomaly_sensitivity=settings.observability_anomaly_sensitivity,
+        ),
+        summary=TraceHealthSummaryOut(
+            status=health_status,
+            sample_count=sample_count,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            compliant_metric_count=len(metrics) - breached_count,
+            breached_metric_count=breached_count,
+            error_budget_allowed_failures=allowed_failures,
+            error_budget_consumed_failures=failed_count,
+            error_budget_remaining_percent=remaining_budget,
+        ),
+        metrics=metrics,
+        anomalies=_trace_anomalies(workflows, costs=costs, projects=projects),
+    )
 
 
 def get_trace_overview(

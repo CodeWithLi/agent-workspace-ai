@@ -586,6 +586,39 @@ async function mockApi(page: Page) {
       { key: 'queue:queue:-', kind: 'queue', node: 'queue', label: '队列等待', agent_role: '', change_type: 'MODIFIED', baseline_executions: 1, candidate_executions: 1, baseline_duration_ms: 45000, candidate_duration_ms: 30000, duration_delta_ms: -15000, duration_delta_percent: -33.3, duration_direction: 'IMPROVED', baseline_tokens: 0, candidate_tokens: 0, token_delta: 0, baseline_cost_micros: 0, candidate_cost_micros: 0, cost_delta_micros: 0 }
     ]
   }
+  const traceHealth = {
+    window: traceOverview.window,
+    targets: {
+      success_rate_percent: 90,
+      p95_duration_ms: 600000,
+      average_cost_micros: 15000,
+      minimum_sample_runs: 5,
+      anomaly_sensitivity: 3
+    },
+    summary: {
+      status: 'BREACHED', sample_count: 10, completed_count: 8, failed_count: 2,
+      compliant_metric_count: 1, breached_metric_count: 2,
+      error_budget_allowed_failures: 1, error_budget_consumed_failures: 2,
+      error_budget_remaining_percent: 0
+    },
+    metrics: [
+      { key: 'success_rate', label: '运行成功率', unit: 'percent', target: 90, actual: 80, compliant: false },
+      { key: 'p95_duration_ms', label: 'P95 端到端耗时', unit: 'duration', target: 600000, actual: 720000, compliant: false },
+      { key: 'average_cost_micros', label: '单次平均成本', unit: 'cost', target: 15000, actual: 10283, compliant: true }
+    ],
+    anomalies: [
+      {
+        workflow_id: 88, project_id: 1, project_name: '灰度发布工作台', status: 'COMPLETED', severity: 'WARNING',
+        signals: ['成本偏离历史基线'], duration_ms: 480000, total_cost_micros: 11800,
+        detected_at: '2026-07-18T08:08:00Z'
+      },
+      {
+        workflow_id: 86, project_id: 1, project_name: '灰度发布工作台', status: 'FAILED', severity: 'CRITICAL',
+        signals: ['运行失败', '耗时超过 SLO'], duration_ms: 840000, total_cost_micros: 9200,
+        detected_at: '2026-07-17T06:14:00Z'
+      }
+    ]
+  }
   type MockGenerationJob = {
     job_id: number
     operation: 'CREATE' | 'REGENERATE'
@@ -987,6 +1020,7 @@ async function mockApi(page: Page) {
       body = evaluationRuns.find((item) => item.id === id)
     }
     else if (method === 'GET' && path === '/traces/overview') body = traceOverview
+    else if (method === 'GET' && path === '/traces/health') body = traceHealth
     else if (method === 'GET' && path === '/traces/compare') body = traceComparison
     else if (method === 'GET' && path === '/traces/88') body = traceDetail
     else if (method === 'GET' && path === '/agents') body = discussionAgents
@@ -1158,7 +1192,7 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
   await page.goto('/traces')
 
   await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
-  await expect(page.getByText('80.0%', { exact: true })).toBeVisible()
+  await expect(page.getByRole('region', { name: '运行关键指标' }).getByText('80.0%', { exact: true })).toBeVisible()
   await expect(page.getByText('分析样本已截断', { exact: true })).toBeVisible()
   await expect(page.locator('strong:visible').filter({ hasText: /^AI架构师$/ }).first()).toBeVisible()
   const trend = page.getByRole('img', { name: /共 12 次运行.*消耗 24800 Token/ })
@@ -1196,6 +1230,34 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 
+  await page.getByRole('button', { name: '关闭运行追踪' }).click()
+  await expect(page).toHaveURL(/\/traces$/)
+})
+
+test('monitors SLO error budget and drills into anomalous runs', async ({ page }, testInfo) => {
+  await page.goto('/traces')
+
+  await expect(page.getByRole('heading', { name: 'SLO 与智能告警' })).toBeVisible()
+  await expect(page.getByText('SLO 违约', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('错误预算剩余', { exact: true })).toBeVisible()
+  await expect(page.getByText('0.0%', { exact: true })).toBeVisible()
+  await expect(page.getByText('运行成功率', { exact: true })).toBeVisible()
+  await expect(page.getByText('P95 端到端耗时', { exact: true }).last()).toBeVisible()
+  const anomalySurface = page.locator('.health-desktop-table:visible, .health-mobile-list:visible')
+  await expect(anomalySurface).toContainText('#88')
+  await expect(anomalySurface).toContainText('成本偏离历史基线')
+  await expect(anomalySurface).toContainText('运行失败')
+  const settingsButton = page.getByRole('button', { name: 'SLO 设置' })
+  await expect(settingsButton).toBeVisible()
+  if (testInfo.project.name === 'mobile-chromium') {
+    await expect(settingsButton).toHaveCSS('min-height', '44px')
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  const anomalyTrigger = page.locator('.health-desktop-table:visible .health-run-link, .health-mobile-list:visible .health-mobile-trigger').first()
+  await anomalyTrigger.click()
+  await expect(page).toHaveURL(/\/traces\?run=88$/)
+  await expect(page.getByRole('heading', { name: '#88 · 灰度发布工作台' })).toBeVisible()
   await page.getByRole('button', { name: '关闭运行追踪' }).click()
   await expect(page).toHaveURL(/\/traces$/)
 })
@@ -1251,6 +1313,8 @@ test('keeps runtime tracing usable at 375px, landscape and reduced motion', asyn
 
   await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
   await expect(page.getByRole('button', { name: '刷新运行追踪' })).toHaveCSS('width', '44px')
+  await expect(page.getByRole('heading', { name: 'SLO 与智能告警' })).toBeVisible()
+  await expect(page.locator('.health-mobile-list:visible .health-mobile-card')).toHaveCount(2)
   await expect(page.locator('.mobile-card-list:visible .run-card')).toHaveCount(2)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 

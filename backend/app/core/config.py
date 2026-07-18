@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     milvus_collection: str = "knowledge_chunks_v4"
     vector_fallback_enabled: bool = True
     metrics_enabled: bool = True
+    observability_slo_success_rate: float = Field(default=95.0, ge=0, le=100)
+    observability_slo_p95_duration_ms: int = Field(default=600_000, ge=1_000, le=86_400_000)
+    observability_slo_average_cost_micros: int = Field(default=50_000, ge=0, le=1_000_000_000)
+    observability_slo_min_runs: int = Field(default=5, ge=3, le=100)
+    observability_anomaly_sensitivity: float = Field(default=3.0, ge=1.5, le=6.0)
 
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"

@@ -132,6 +132,46 @@ CONFIG_DEFINITIONS = {
             minimum=1,
             maximum=10,
         ),
+        ConfigDefinition(
+            "observability_slo_success_rate",
+            "Workflow Success Rate SLO (%)",
+            "observability",
+            float,
+            minimum=0,
+            maximum=100,
+        ),
+        ConfigDefinition(
+            "observability_slo_p95_duration_ms",
+            "Workflow P95 Duration SLO (ms)",
+            "observability",
+            int,
+            minimum=1_000,
+            maximum=86_400_000,
+        ),
+        ConfigDefinition(
+            "observability_slo_average_cost_micros",
+            "Average Workflow Cost SLO (micros)",
+            "observability",
+            int,
+            minimum=0,
+            maximum=1_000_000_000,
+        ),
+        ConfigDefinition(
+            "observability_slo_min_runs",
+            "Minimum SLO Sample Runs",
+            "observability",
+            int,
+            minimum=3,
+            maximum=100,
+        ),
+        ConfigDefinition(
+            "observability_anomaly_sensitivity",
+            "Anomaly Sensitivity (MAD)",
+            "observability",
+            float,
+            minimum=1.5,
+            maximum=6,
+        ),
     )
 }
 BASE_VALUES = {key: getattr(settings, key) for key in CONFIG_DEFINITIONS}

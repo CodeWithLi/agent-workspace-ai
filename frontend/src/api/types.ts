@@ -591,6 +591,57 @@ export interface TraceOverview {
   recent_runs: TraceRun[]
 }
 
+export type TraceHealthStatus = 'HEALTHY' | 'AT_RISK' | 'BREACHED' | 'INSUFFICIENT_DATA'
+
+export interface TraceSLOTargets {
+  success_rate_percent: number
+  p95_duration_ms: number
+  average_cost_micros: number
+  minimum_sample_runs: number
+  anomaly_sensitivity: number
+}
+
+export interface TraceSLOMetric {
+  key: string
+  label: string
+  unit: 'percent' | 'duration' | 'cost'
+  target: number
+  actual: number
+  compliant: boolean
+}
+
+export interface TraceHealthSummary {
+  status: TraceHealthStatus
+  sample_count: number
+  completed_count: number
+  failed_count: number
+  compliant_metric_count: number
+  breached_metric_count: number
+  error_budget_allowed_failures: number
+  error_budget_consumed_failures: number
+  error_budget_remaining_percent: number
+}
+
+export interface TraceAnomaly {
+  workflow_id: number
+  project_id: number
+  project_name: string
+  status: WorkflowTraceStatus
+  severity: 'CRITICAL' | 'WARNING'
+  signals: string[]
+  duration_ms: number
+  total_cost_micros: number
+  detected_at: string
+}
+
+export interface TraceHealth {
+  window: TraceWindow
+  targets: TraceSLOTargets
+  summary: TraceHealthSummary
+  metrics: TraceSLOMetric[]
+  anomalies: TraceAnomaly[]
+}
+
 export interface TraceSpan {
   span_id: string
   kind: string

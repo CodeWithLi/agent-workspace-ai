@@ -594,6 +594,55 @@ class TraceOverviewOut(BaseModel):
     recent_runs: list[TraceRunOut]
 
 
+class TraceSLOTargetsOut(BaseModel):
+    success_rate_percent: float
+    p95_duration_ms: int
+    average_cost_micros: int
+    minimum_sample_runs: int
+    anomaly_sensitivity: float
+
+
+class TraceSLOMetricOut(BaseModel):
+    key: str
+    label: str
+    unit: str
+    target: float
+    actual: float
+    compliant: bool
+
+
+class TraceHealthSummaryOut(BaseModel):
+    status: str
+    sample_count: int
+    completed_count: int
+    failed_count: int
+    compliant_metric_count: int
+    breached_metric_count: int
+    error_budget_allowed_failures: float
+    error_budget_consumed_failures: int
+    error_budget_remaining_percent: float
+
+
+class TraceAnomalyOut(BaseModel):
+    workflow_id: int
+    project_id: int
+    project_name: str
+    status: WorkflowStatus
+    severity: str
+    signals: list[str]
+    duration_ms: int
+    total_cost_micros: int
+    detected_at: datetime
+
+
+class TraceHealthOut(BaseModel):
+    window: TraceWindowOut
+    targets: TraceSLOTargetsOut
+    summary: TraceHealthSummaryOut
+    metrics: list[TraceSLOMetricOut]
+    anomalies: list[TraceAnomalyOut]
+
+
 class TraceSpanOut(BaseModel):
     span_id: str
     kind: str

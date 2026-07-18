@@ -83,7 +83,8 @@ const categories = [
   { value: 'billing', label: 'Token 计费' },
   { value: 'registration', label: '注册策略' },
   { value: 'notification', label: '通知服务' },
-  { value: 'runtime', label: '运行控制' }
+  { value: 'runtime', label: '运行控制' },
+  { value: 'observability', label: '可观测性 SLO' }
 ]
 const connectionTargets = [
   { value: 'llm', label: 'LLM' },
