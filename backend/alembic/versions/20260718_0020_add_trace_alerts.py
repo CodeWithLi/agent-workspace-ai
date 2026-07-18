@@ -25,7 +25,12 @@ def upgrade() -> None:
         sa.Column("project_id", sa.Integer(), nullable=False),
         sa.Column("user_id", sa.Integer(), nullable=False),
         sa.Column("severity", sa.String(length=20), nullable=False),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="OPEN"),
+        sa.Column(
+            "status",
+            sa.Enum("OPEN", "ACKNOWLEDGED", "RESOLVED", name="tracealertstatus", native_enum=False),
+            nullable=False,
+            server_default="OPEN",
+        ),
         sa.Column("signals_json", sa.Text(), nullable=False, server_default="[]"),
         sa.Column("duration_ms", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("total_cost_micros", sa.Integer(), nullable=False, server_default="0"),
@@ -46,6 +51,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["resolved_by_user_id"], ["users.id"], ondelete="SET NULL"),
         sa.UniqueConstraint("workflow_id", name="uq_trace_alert_workflow"),
     )
+    op.create_index("ix_trace_alerts_id", "trace_alerts", ["id"])
     op.create_index("ix_trace_alerts_workflow_id", "trace_alerts", ["workflow_id"])
     op.create_index("ix_trace_alerts_project_id", "trace_alerts", ["project_id"])
     op.create_index("ix_trace_alerts_user_id", "trace_alerts", ["user_id"])
