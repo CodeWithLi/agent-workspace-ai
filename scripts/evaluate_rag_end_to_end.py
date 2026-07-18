@@ -32,6 +32,7 @@ from app.rag.service import (  # noqa: E402
     average_vectors,
     build_context,
     cosine_similarity,
+    ensure_evidence_qualifiers,
     ensure_valid_citations,
     rerank as lexical_rerank,
     rewrite_query,
@@ -335,7 +336,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             answer = await gateway.chat(system_prompt, answer_prompt)
             chat_input_tokens += estimate_tokens(system_prompt) + estimate_tokens(answer_prompt)
             chat_output_tokens += estimate_tokens(answer)
-            answer = ensure_valid_citations(answer, selected)
+            answer = ensure_evidence_qualifiers(ensure_valid_citations(answer, selected), selected)
         else:
             answer = "未检索到足够证据，无法回答。"
 

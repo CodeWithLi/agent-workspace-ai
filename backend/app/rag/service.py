@@ -36,6 +36,11 @@ from app.rag.vector_store import vector_store
 settings = get_settings()
 context_tokens = TokenCounter("cl100k_base")
 ALLOWED_SUFFIXES = {".pdf", ".docx", ".md", ".markdown", ".txt"}
+EVIDENCE_QUALIFIER_PATTERNS = (
+    re.compile(r"\bbefore\s+(?:the\s+)?first\b|首次[^。！？.!?\n]{0,24}前|第一次[^。！？.!?\n]{0,24}前", re.IGNORECASE),
+    re.compile(r"\bquarterly\b|每季度|每季", re.IGNORECASE),
+    re.compile(r"\bat\s+least\b|至少", re.IGNORECASE),
+)
 
 
 class DocumentValidationError(ValueError):
@@ -690,6 +695,27 @@ def ensure_valid_citations(answer: str, rows: list[dict]) -> str:
     return cleaned
 
 
+def ensure_evidence_qualifiers(answer: str, rows: list[dict]) -> str:
+    comparison = answer
+    supplements: list[str] = []
+    for row in rows:
+        content = str(row.get("parent_content") or row.get("content") or "")
+        for sentence in re.split(r"(?<=[。！？.!?])\s+|\n+", content):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if not any(
+                pattern.search(sentence) and not pattern.search(comparison)
+                for pattern in EVIDENCE_QUALIFIER_PATTERNS
+            ):
+                continue
+            supplements.append(f"{sentence} [{row['citation']}]")
+            comparison = f"{comparison}\n{sentence}"
+    if not supplements:
+        return answer
+    return f"{answer.rstrip()}\n\n补充依据：{' '.join(supplements)}".strip()
+
+
 async def search_knowledge(
     db: Session,
     user: User,
@@ -862,7 +888,7 @@ async def search_knowledge(
         "每个关键结论都要使用 [文件名#chunk-N] 引用。上下文不足时明确说明，不得补充外部知识。",
         f"问题：{query}\n\n上下文：{context}",
     )
-    answer = ensure_valid_citations(answer, results)
+    answer = ensure_evidence_qualifiers(ensure_valid_citations(answer, results), results)
     for row in results:
         for internal_key in ("vector_id", "parent_stable_id", "parent_content"):
             row.pop(internal_key, None)

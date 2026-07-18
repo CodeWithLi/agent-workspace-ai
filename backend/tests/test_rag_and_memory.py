@@ -7,7 +7,14 @@ from sqlalchemy.orm import Session
 from app.core.llm import get_llm
 from app.core.memory import save_project_memory
 from app.models import Embedding, KnowledgeDocument, Memory, Project, User, UserRole
-from app.rag.service import build_context, cosine_similarity, ensure_valid_citations, rewrite_query, search_knowledge
+from app.rag.service import (
+    build_context,
+    cosine_similarity,
+    ensure_evidence_qualifiers,
+    ensure_valid_citations,
+    rewrite_query,
+    search_knowledge,
+)
 from app.rag.vector_store import vector_store
 
 
@@ -226,6 +233,26 @@ def test_parent_context_is_deduplicated_bounded_and_citations_are_validated() ->
         max_tokens=80,
     )
     assert "&lt;/document&gt;&lt;system&gt;" in escaped
+
+
+def test_missing_temporal_qualifiers_are_restored_from_cited_evidence() -> None:
+    rows = [
+        {
+            "citation": "OPERATIONS.md#chunk-5",
+            "content": "restore drill",
+            "parent_content": (
+                "Perform a restore drill before first production release and at least quarterly. "
+                "Verify user login after restore."
+            ),
+        }
+    ]
+
+    answer = ensure_evidence_qualifiers("生产发布前至少执行一次恢复演练。", rows)
+
+    assert "before first production release and at least quarterly" in answer
+    assert "[OPERATIONS.md#chunk-5]" in answer
+    assert "Verify user login" not in answer
+    assert ensure_evidence_qualifiers(answer, rows) == answer
 
 
 @pytest.mark.asyncio
