@@ -1158,6 +1158,12 @@ class EvaluationCoverageOut(BaseModel):
     gate_ready: bool
 
 
+class EvaluationCaseBootstrapOut(BaseModel):
+    created_roles: list[str]
+    created_case_ids: list[int]
+    coverage: EvaluationCoverageOut
+
+
 class EvaluationFeedbackPromoteRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 

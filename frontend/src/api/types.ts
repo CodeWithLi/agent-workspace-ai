@@ -364,6 +364,12 @@ export interface EvaluationCoverage {
   gate_ready: boolean
 }
 
+export interface EvaluationCaseBootstrapResult {
+  created_roles: string[]
+  created_case_ids: number[]
+  coverage: EvaluationCoverage
+}
+
 export interface EvaluationFeedbackCandidate {
   feedback_id: number
   review_id?: number | null

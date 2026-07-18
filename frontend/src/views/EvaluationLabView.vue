@@ -89,7 +89,7 @@
         <strong>多 Agent 评测覆盖不完整</strong>
         <span>缺少 {{ coverage.missing_roles.map(roleLabel).join('、') }} 的启用用例，团队评测与 Challenger 发布已阻断。</span>
       </div>
-      <el-button :icon="Plus" @click="activeView = 'cases'">补齐评测用例</el-button>
+      <el-button :icon="Plus" :loading="bootstrappingCases" @click="bootstrapEvaluationCases">生成缺失基础用例</el-button>
     </section>
 
     <div class="metric-band" aria-label="最近评测摘要">
@@ -587,6 +587,7 @@ import type {
   AgentEvaluationRelease,
   AgentVersion,
   EvaluationCase,
+  EvaluationCaseBootstrapResult,
   EvaluationCoverage,
   EvaluationFeedbackCandidate,
   EvaluationRun,
@@ -628,6 +629,7 @@ const loadingVersions = ref(false)
 const publishingRelease = ref(false)
 const rollingBackRelease = ref(false)
 const savingCase = ref(false)
+const bootstrappingCases = ref(false)
 const promotingFeedback = ref(false)
 const activeView = ref('runs')
 const baselineRunId = ref<number | null>(null)
@@ -927,6 +929,38 @@ async function loadFeedback() {
 async function loadCoverage() {
   const { data } = await api.get<EvaluationCoverage>('/evaluations/coverage')
   coverage.value = data
+}
+
+async function bootstrapEvaluationCases() {
+  if (!coverage.value?.missing_roles.length) return
+  const missingNames = coverage.value.missing_roles.map(roleLabel).join('、')
+  try {
+    await ElMessageBox.confirm(
+      `将为 ${missingNames} 生成可编辑的角色基础用例。不会覆盖已有用例，生成后仍可在用例库调整关键词、Rubric、阈值和权重。`,
+      '生成基础评测套件',
+      {
+        type: 'info',
+        confirmButtonText: '确认生成',
+        cancelButtonText: '取消'
+      }
+    )
+  } catch {
+    return
+  }
+  bootstrappingCases.value = true
+  try {
+    const { data } = await api.post<EvaluationCaseBootstrapResult>('/evaluations/cases/bootstrap')
+    coverage.value = data.coverage
+    const casesResponse = await api.get<EvaluationCase[]>('/evaluations/cases')
+    cases.value = casesResponse.data
+    if (data.created_case_ids.length) {
+      ElMessage.success(`已生成 ${data.created_case_ids.length} 个基础评测用例`)
+    } else {
+      ElMessage.info('基础评测套件已是最新状态')
+    }
+  } finally {
+    bootstrappingCases.value = false
+  }
 }
 
 async function loadAll() {

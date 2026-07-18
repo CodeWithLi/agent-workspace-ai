@@ -1074,6 +1074,11 @@ async function mockApi(page: Page) {
       body = created
     } else if (method === 'GET' && path === '/evaluations/coverage') body = evaluationCoverage
     else if (method === 'GET' && path === '/evaluations/cases') body = evaluationCases
+    else if (method === 'POST' && path === '/evaluations/cases/bootstrap') body = {
+      created_roles: [],
+      created_case_ids: [],
+      coverage: evaluationCoverage
+    }
     else if (method === 'POST' && path === '/evaluations/cases') {
       const input = request.postDataJSON() as Omit<(typeof evaluationCases)[number], 'id' | 'created_at' | 'updated_at'>
       const created = {
@@ -1414,12 +1419,22 @@ test('manages versioned Agent evaluations and completes an async regression run'
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
-test('blocks evaluation runs when core Agent roles lack regression coverage', async ({ page }) => {
+test('bootstraps missing core Agent regression coverage', async ({ page }, testInfo) => {
+  let coverageReady = false
+  const readyCoverage = {
+    required_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
+    covered_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
+    missing_roles: [],
+    case_counts: { product_manager: 1, architect: 1, test_engineer: 1, operations_analyst: 1, project_manager: 1 },
+    total_enabled_cases: 5,
+    coverage_percent: 1,
+    gate_ready: true
+  }
   await page.route('**/api/v1/evaluations/coverage', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({
+      body: JSON.stringify(coverageReady ? readyCoverage : {
         required_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
         covered_roles: ['product_manager', 'architect'],
         missing_roles: ['test_engineer', 'operations_analyst', 'project_manager'],
@@ -1430,6 +1445,18 @@ test('blocks evaluation runs when core Agent roles lack regression coverage', as
       })
     })
   })
+  await page.route('**/api/v1/evaluations/cases/bootstrap', async (route) => {
+    coverageReady = true
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        created_roles: ['test_engineer', 'operations_analyst', 'project_manager'],
+        created_case_ids: [31, 32, 33],
+        coverage: readyCoverage
+      })
+    })
+  })
   await page.goto('/evaluations')
 
   const warning = page.getByRole('alert', { name: '多 Agent 评测覆盖不完整' })
@@ -1437,8 +1464,20 @@ test('blocks evaluation runs when core Agent roles lack regression coverage', as
   await expect(warning).toContainText('运营分析师')
   await expect(warning).toContainText('项目经理')
   await expect(page.getByRole('button', { name: '运行团队评测' })).toBeDisabled()
-  await warning.getByRole('button', { name: '补齐评测用例' }).click()
-  await expect(page.getByRole('tab', { name: '用例库' })).toHaveAttribute('aria-selected', 'true')
+  const bootstrapButton = warning.getByRole('button', { name: '生成缺失基础用例' })
+  if (testInfo.project.name === 'mobile-chromium') await expect(bootstrapButton).toHaveCSS('min-height', '44px')
+  await bootstrapButton.click()
+  const dialog = page.getByRole('dialog', { name: '生成基础评测套件' })
+  await expect(dialog).toContainText('不会覆盖已有用例')
+  const request = page.waitForRequest((value) => (
+    value.method() === 'POST' && new URL(value.url()).pathname.endsWith('/evaluations/cases/bootstrap')
+  ))
+  await dialog.getByRole('button', { name: '确认生成' }).click()
+  await request
+  await expect(page.getByText('已生成 3 个基础评测用例', { exact: true })).toBeVisible()
+  await expect(warning).toBeHidden()
+  await expect(page.getByText('5/5', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '运行团队评测' })).toBeEnabled()
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 

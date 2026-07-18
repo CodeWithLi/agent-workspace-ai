@@ -29,6 +29,7 @@ from app.models import (
 from app.schemas import (
     AgentEvaluationReleaseOut,
     EvaluationCaseCreate,
+    EvaluationCaseBootstrapOut,
     EvaluationCaseOut,
     EvaluationCaseUpdate,
     EvaluationCoverageOut,
@@ -54,6 +55,7 @@ from app.services.evaluation_feedback import (
     reviewed_feedback_candidate,
 )
 from app.services.evaluation_coverage import evaluation_suite_coverage
+from app.services.evaluation_case_bootstrap import bootstrap_missing_evaluation_cases
 
 
 router = APIRouter()
@@ -254,6 +256,33 @@ def get_evaluation_coverage(
     db: Session = Depends(get_db),
 ) -> EvaluationCoverageOut:
     return EvaluationCoverageOut(**evaluation_suite_coverage(db))
+
+
+@router.post("/cases/bootstrap", response_model=EvaluationCaseBootstrapOut)
+def bootstrap_evaluation_cases(
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationCaseBootstrapOut:
+    created, coverage = bootstrap_missing_evaluation_cases(db, user_id=current_admin.id)
+    if created:
+        record_audit(
+            db,
+            "evaluation.case_bootstrap",
+            current_admin.id,
+            resource_type="evaluation_case",
+            details={
+                "created_case_ids": [item.id for item in created],
+                "created_roles": [item.agent_role for item in created],
+            },
+            request=request,
+        )
+    db.commit()
+    return EvaluationCaseBootstrapOut(
+        created_roles=[item.agent_role for item in created],
+        created_case_ids=[item.id for item in created],
+        coverage=EvaluationCoverageOut(**coverage),
+    )
 
 
 @router.post("/cases", response_model=EvaluationCaseOut, status_code=status.HTTP_201_CREATED)
