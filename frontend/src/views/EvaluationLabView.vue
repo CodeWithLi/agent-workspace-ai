@@ -79,6 +79,20 @@
     </section>
 
     <section
+      v-if="missingCompatibleBaseline"
+      class="coverage-warning baseline-warning"
+      role="alert"
+      aria-label="缺少当前生产版本基线"
+    >
+      <WarningFilled class="coverage-warning-icon" aria-hidden="true" />
+      <div>
+        <strong>缺少当前生产版本基线</strong>
+        <span>{{ selectedCandidateAgent?.name }} v{{ selectedCandidateAgent?.current_version }} 尚无通过门禁的团队基线，不能与旧版本基线比较。</span>
+      </div>
+      <el-button :icon="VideoPlay" @click="switchToTeamBaseline">先运行团队基线</el-button>
+    </section>
+
+    <section
       v-if="coverage && !coverage.gate_ready"
       class="coverage-warning"
       role="alert"
@@ -593,7 +607,7 @@
                 </div>
                 <p v-if="result.judge_reason" class="judge-reason"><strong>Judge 依据</strong>{{ result.judge_reason }}</p>
                 <el-alert v-if="result.error || result.judge_error" type="warning" :closable="false" :title="result.error || result.judge_error" />
-                <div v-if="!result.passed || result.regressed || result.error" class="result-actions">
+                <div v-if="result.optimization_eligible" class="result-actions">
                   <el-button
                     type="primary"
                     plain
@@ -632,7 +646,7 @@
         </div>
 
         <ol class="optimization-pipeline" aria-label="Prompt 调优 Agent 流程">
-          <li :class="pipelineState('optimizing', optimizationDetail)"><span>1</span><div><strong>Optimizer Agent</strong><small>从冻结失败证据生成通用改进提案</small></div></li>
+          <li :class="pipelineState('optimizing', optimizationDetail)"><span>1</span><div><strong>Optimizer Agent</strong><small>根据失败证据和 Reviewer 意见生成或返修通用 Prompt</small></div></li>
           <li :class="pipelineState('reviewing', optimizationDetail)"><span>2</span><div><strong>Reviewer Agent</strong><small>独立检查角色、注入、工具和治理风险</small></div></li>
           <li :class="pipelineState('completed', optimizationDetail)"><span>3</span><div><strong>Draft Gate</strong><small>双门禁通过后仅创建草稿</small></div></li>
         </ol>
@@ -667,6 +681,20 @@
               <span>{{ check.label }}</span>
             </div>
           </div>
+        </section>
+
+        <section v-if="optimizationDetail.revision_history?.length" class="detail-section">
+          <div class="section-heading"><h2>Optimizer / Reviewer 返修记录</h2><span>{{ optimizationDetail.revision_round_count }} 轮</span></div>
+          <ol class="optimization-revision-list">
+            <li v-for="revision in optimizationDetail.revision_history" :key="revision.round">
+              <div>
+                <strong>第 {{ revision.round }} 轮</strong>
+                <el-tag :type="revision.safety_passed ? 'success' : 'warning'" size="small" effect="plain">{{ revision.safety_passed ? '双门禁通过' : '进入返修' }}</el-tag>
+              </div>
+              <p>{{ revision.change_summary }}</p>
+              <small>{{ revision.reviewer_reason }}</small>
+            </li>
+          </ol>
         </section>
 
         <div class="detail-actions optimization-detail-actions">
@@ -870,6 +898,15 @@ const availableBaselineRuns = computed(() => {
     snapshot.id === agent.id && snapshot.version === agent.current_version
   )))
 })
+const selectedCandidateAgent = computed(() => (
+  agents.value.find((agent) => agent.id === candidateAgentId.value) || null
+))
+const missingCompatibleBaseline = computed(() => Boolean(
+  !loading.value
+  && runMode.value === 'CHALLENGER'
+  && selectedCandidateAgent.value
+  && !availableBaselineRuns.value.length
+))
 const canCreateRun = computed(() => {
   if (!coverage.value?.gate_ready || !enabledCases.value.length || hasActiveRun.value) return false
   if (runMode.value === 'TEAM') return true
@@ -995,6 +1032,12 @@ function handleRunModeChange() {
     return
   }
   selectMatchingBaseline()
+}
+
+function switchToTeamBaseline() {
+  runMode.value = 'TEAM'
+  handleRunModeChange()
+  ElMessage.info('已切换到团队基线；完成运行后可返回评测当前草稿')
 }
 
 function isActive(run: EvaluationRun) {
@@ -1664,11 +1707,11 @@ onBeforeUnmount(() => {
 <style scoped>
 .evaluation-page { max-width: 1480px; }
 .evaluation-head { align-items: flex-end; margin-bottom: 14px; }
-.evaluation-launcher { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 18px; padding: 14px 16px; border-block: 1px solid var(--color-border); background: var(--color-surface); }
+.evaluation-launcher { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin-bottom: 18px; padding: 14px 16px; border-block: 1px solid var(--color-border); background: var(--color-surface); }
 .launch-field { display: grid; min-width: 180px; gap: 6px; }
 .launch-field :deep(.el-select) { width: 100%; }
-.mode-field { min-width: 220px; }
-.baseline-field { min-width: 270px; }
+.mode-field { min-width: 196px; }
+.baseline-field { min-width: 210px; }
 .launch-label { color: var(--color-secondary-text); font-size: 12px; font-weight: 650; }
 .launch-action { margin-left: auto; }
 .launch-action .el-button { min-height: 40px; margin: 0; }
@@ -1793,6 +1836,11 @@ onBeforeUnmount(() => {
 .optimization-evidence-list small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
 .optimization-evidence-list > div > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .optimization-summary-copy, .reviewer-reason { margin: 0 0 12px; color: var(--color-secondary-text); line-height: 1.6; }
+.optimization-revision-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.optimization-revision-list li { padding: 12px 14px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-background); }
+.optimization-revision-list li > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.optimization-revision-list p { margin: 8px 0 4px; color: var(--color-foreground); line-height: 1.55; }
+.optimization-revision-list small { display: block; color: var(--color-muted-text); line-height: 1.5; }
 .prompt-preview { max-height: 340px; margin: 0; overflow: auto; padding: 14px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-background); color: var(--color-foreground); font: inherit; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .safety-check-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
 .safety-check-grid > div { display: flex; align-items: center; gap: 5px; min-width: 0; min-height: 36px; padding: 7px 8px; border: 1px solid var(--color-border); border-radius: 6px; font-size: 12px; }

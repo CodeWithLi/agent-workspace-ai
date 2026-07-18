@@ -66,6 +66,7 @@ from app.services.agent_optimizations import (
     AgentOptimizationRequestConflict,
     cancel_agent_optimization_job,
     enqueue_agent_optimization_job,
+    is_agent_optimization_evidence,
     retry_agent_optimization_job,
 )
 
@@ -101,7 +102,7 @@ def feedback_candidate_out(data: dict) -> EvaluationFeedbackCandidateOut:
     return EvaluationFeedbackCandidateOut(**data)
 
 
-def result_out(item: EvaluationResult) -> EvaluationResultOut:
+def result_out(item: EvaluationResult, run: EvaluationRun) -> EvaluationResultOut:
     case = _json_loads(item.case_snapshot_json, {})
     agent = _json_loads(item.agent_snapshot_json, {})
     details = _json_loads(item.details_json, {})
@@ -128,6 +129,7 @@ def result_out(item: EvaluationResult) -> EvaluationResultOut:
         latency_ms=item.latency_ms,
         regressed=item.regressed,
         passed=item.passed,
+        optimization_eligible=is_agent_optimization_evidence(run, item),
         matched_keywords=list(details.get("matched") or []),
         missing_keywords=list(details.get("missing") or []),
         forbidden_hits=list(details.get("forbidden_hits") or []),
@@ -240,7 +242,10 @@ def detail_out(item: EvaluationRun, db: Session) -> EvaluationRunDetailOut:
             .order_by(EvaluationResult.case_id)
         )
     )
-    return EvaluationRunDetailOut(**summary.model_dump(), results=[result_out(result) for result in results])
+    return EvaluationRunDetailOut(
+        **summary.model_dump(),
+        results=[result_out(result, item) for result in results],
+    )
 
 
 def _get_run(run_id: int, db: Session) -> EvaluationRun:
@@ -288,6 +293,12 @@ def optimization_job_out(
     evidence = _optimization_evidence(item)
     optimizer = _json_loads(item.optimizer_output_json, {})
     reviewer = _json_loads(item.reviewer_output_json, {})
+    revision_history = reviewer.get("revision_history") or []
+    if not isinstance(revision_history, list):
+        revision_history = []
+    revision_history = [
+        value for value in revision_history if isinstance(value, dict)
+    ]
     common = {
         "id": item.id,
         "request_id": item.request_id,
@@ -308,6 +319,7 @@ def optimization_job_out(
         "change_summary": str(optimizer.get("change_summary") or ""),
         "reviewer_risk_level": str(reviewer.get("risk_level") or ""),
         "reviewer_approved": reviewer.get("approved") if "approved" in reviewer else None,
+        "revision_round_count": len(revision_history),
         "draft_version_id": item.draft_version_id,
         "draft_version": draft.version if draft else None,
         "draft_status": draft.status if draft else "",
@@ -315,7 +327,7 @@ def optimization_job_out(
         "error_message": item.error_message,
         "attempt_count": item.attempt_count,
         "max_attempts": item.max_attempts,
-        "retryable": item.status in {"FAILED", "CANCELLED"},
+        "retryable": item.status in {"FAILED", "CANCELLED", "REJECTED"},
         "cancellable": item.status in {"QUEUED", "RUNNING"},
         "created_by_user_id": item.created_by_user_id,
         "created_at": item.created_at,
@@ -329,6 +341,7 @@ def optimization_job_out(
         proposed_system_prompt=str(optimizer.get("proposed_system_prompt") or ""),
         reviewer_reason=str(reviewer.get("reason") or ""),
         reviewer_risks=list(reviewer.get("risks") or []),
+        revision_history=revision_history,
         safety_checks=_json_loads(item.safety_checks_json, {}),
         evidence=evidence,
     )

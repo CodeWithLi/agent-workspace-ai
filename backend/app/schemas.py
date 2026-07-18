@@ -1262,6 +1262,7 @@ class EvaluationResultOut(BaseModel):
     latency_ms: int
     regressed: bool
     passed: bool
+    optimization_eligible: bool
     matched_keywords: list[str]
     missing_keywords: list[str]
     forbidden_hits: list[str]
@@ -1347,6 +1348,7 @@ class AgentOptimizationJobOut(BaseModel):
     change_summary: str
     reviewer_risk_level: str
     reviewer_approved: bool | None
+    revision_round_count: int
     draft_version_id: int | None
     draft_version: int | None
     draft_status: str
@@ -1366,6 +1368,7 @@ class AgentOptimizationJobDetailOut(AgentOptimizationJobOut):
     proposed_system_prompt: str
     reviewer_reason: str
     reviewer_risks: list[Any]
+    revision_history: list[dict[str, Any]]
     safety_checks: dict[str, Any]
     evidence: list[AgentOptimizationEvidenceOut]
 

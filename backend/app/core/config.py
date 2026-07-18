@@ -151,6 +151,7 @@ class Settings(BaseSettings):
     agent_optimization_retry_base_seconds: int = Field(default=5, ge=1, le=300)
     agent_optimization_retry_max_seconds: int = Field(default=300, ge=5, le=3600)
     agent_optimization_shutdown_grace_seconds: int = Field(default=15, ge=1, le=300)
+    agent_optimization_max_review_rounds: int = Field(default=3, ge=1, le=5)
     agent_optimization_optimizer_model: str | None = None
     agent_optimization_reviewer_model: str | None = None
 

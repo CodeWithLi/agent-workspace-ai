@@ -73,6 +73,10 @@ EVALUATION_MAX_ATTEMPTS=2
 EVALUATION_RETRY_BASE_SECONDS=5
 EVALUATION_AVERAGE_REGRESSION_TOLERANCE=0.02
 EVALUATION_CASE_REGRESSION_TOLERANCE=0.10
+AGENT_OPTIMIZATION_WORKER_ENABLED=true
+AGENT_OPTIMIZATION_LEASE_SECONDS=300
+AGENT_OPTIMIZATION_MAX_ATTEMPTS=3
+AGENT_OPTIMIZATION_MAX_REVIEW_ROUNDS=3
 POSTGRES_PASSWORD=...
 DATABASE_URL=postgresql+psycopg://postgres:<url-encoded-password>@postgres:5432/agent_workspace_ai
 MINIO_ACCESS_KEY=...
@@ -89,7 +93,7 @@ AI 原型生成使用独立的持久化 dispatcher。API 只负责把任务写�
 
 Agent 评测同样使用 PostgreSQL 持久化 dispatcher，并通过 `FOR UPDATE SKIP LOCKED` 支持多副本认领。`EVALUATION_LEASE_SECONDS` 必须覆盖单次 Agent/Judge 调用；worker 会在每个案例落库后续租，异常重启从已完成案例继续。生产发布应监控 `agent_workspace_evaluation_queue`、`agent_workspace_evaluation_duration_seconds`、Judge 降级、发布门禁失败、`evaluation.release_publish`、`evaluation.release_rollback` 以及 `agent.direct_*_blocked` 审计事件。发布和回滚依赖数据库行锁与唯一索引，所有 API 副本必须连接同一主数据库。
 
-Prompt 调优使用独立 `agent-optimization-dispatcher`。`AGENT_OPTIMIZATION_LEASE_SECONDS` 由后台心跳续租，不需要覆盖完整的两次模型调用，但必须大于心跳间隔和短暂数据库抖动；关机宽限由 `AGENT_OPTIMIZATION_SHUTDOWN_GRACE_SECONDS` 控制。生产可分别配置 `AGENT_OPTIMIZATION_OPTIMIZER_MODEL` 与 `AGENT_OPTIMIZATION_REVIEWER_MODEL`，未配置时使用统一 LLM 默认模型。监控 `agent_workspace_agent_optimization_queue`、`agent_workspace_agent_optimization_duration_seconds`、`agent.optimization_failed`、`agent.optimization_rejected` 和重复租约恢复；`REJECTED` 是安全终态，不应自动重试。
+Prompt 调优使用独立 `agent-optimization-dispatcher`。`AGENT_OPTIMIZATION_LEASE_SECONDS` 由后台心跳续租，不需要覆盖完整的模型调用，但必须大于心跳间隔和短暂数据库抖动；关机宽限由 `AGENT_OPTIMIZATION_SHUTDOWN_GRACE_SECONDS` 控制。`AGENT_OPTIMIZATION_MAX_REVIEW_ROUNDS` 控制 Reviewer 拒绝后的有界返修总轮数（默认 3，包含首轮）；生产可分别配置 `AGENT_OPTIMIZATION_OPTIMIZER_MODEL` 与 `AGENT_OPTIMIZATION_REVIEWER_MODEL`，未配置时使用统一 LLM 默认模型。监控 `agent_workspace_agent_optimization_queue`、`agent_workspace_agent_optimization_duration_seconds`、`agent.optimization_failed`、`agent.optimization_rejected` 和重复租约恢复；`REJECTED` 是安全终态，不应自动重试，但管理员可在调整模型或策略后基于原冻结证据手动重试。
 
 管理员可在系统设置页覆盖模型、Embedding、RAG、计费、注册、通知与运行控制参数。数据库、Redis、MinIO、Milvus 地址及 `SECRET_KEY` 属于启动级配置，只能由部署环境提供。运行时密钥使用 `SECRET_KEY` 派生密钥加密保存，轮换 `SECRET_KEY` 前必须先清除或重新写入这些密钥。多副本每 15 秒刷新一次数据库覆盖值。
 

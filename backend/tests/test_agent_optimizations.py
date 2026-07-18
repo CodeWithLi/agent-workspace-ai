@@ -32,6 +32,7 @@ from app.services.agent_optimizations import (
     deterministic_prompt_safety_checks,
     process_agent_optimization_job,
     retry_agent_optimization_job,
+    settings as optimization_settings,
     utc_now,
 )
 from app.services.agent_versions import ensure_initial_agent_version
@@ -230,11 +231,44 @@ def test_enqueue_freezes_failed_evidence_and_is_idempotent(db: Session) -> None:
         )
 
 
-def test_enqueue_rejects_passing_or_mixed_agent_evidence(db: Session) -> None:
+def test_enqueue_accepts_gate_blocked_case_passing_below_release_threshold(
+    db: Session,
+) -> None:
     admin, agent, run, result = seed_failed_evaluation(db)
+    result.score = 0.7
+    result.dimension_scores_json = json.dumps({"safety": 1.0, "requirements": 0.0})
     result.passed = True
     result.regressed = False
     result.error = ""
+    run.passed_cases = 1
+    run.average_score = 0.7
+    run.gate_failures_json = json.dumps(["Average score 0.7000 is below 0.8000"])
+    db.commit()
+
+    job, created = enqueue_agent_optimization_job(
+        db,
+        request_id="gate-blocked-case-passing-job",
+        user_id=admin.id,
+        evaluation_run_id=run.id,
+        result_ids=[result.id],
+        agent_id=agent.id,
+    )
+
+    assert created is True
+    assert json.loads(job.result_ids_json) == [result.id]
+    evidence = json.loads(job.evidence_snapshot_json)
+    assert evidence["results"][0]["passed"] is True
+
+
+def test_enqueue_rejects_release_passing_or_mixed_agent_evidence(db: Session) -> None:
+    admin, agent, run, result = seed_failed_evaluation(db)
+    result.score = 1.0
+    result.dimension_scores_json = json.dumps({"safety": 1.0})
+    result.passed = True
+    result.regressed = False
+    result.error = ""
+    run.gate_passed = True
+    run.gate_failures_json = "[]"
     db.commit()
 
     with pytest.raises(ValueError, match="failed evaluation evidence"):
@@ -354,6 +388,70 @@ async def test_optimizer_and_independent_reviewer_create_draft_without_publishin
     assert result_answer_not_in_audit(db, "Use a shared credential")
 
 
+@pytest.mark.asyncio
+async def test_reviewer_feedback_drives_bounded_optimizer_revision(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, _, agent, _, _ = enqueue_seeded_job(db)
+    overfit_prompt = (
+        agent.system_prompt
+        + "\n\nAlways state tenant isolation and rollback evidence for every request."
+    )
+    revised_prompt = (
+        agent.system_prompt
+        + "\n\nFor each design, reason from applicable security boundaries, identify "
+        "verifiable operational assumptions, define recovery validation and approval "
+        "checkpoints, and explain material tradeoffs without relying on a fixed answer format."
+    )
+    gateway = FakeOptimizationGateway(
+        [
+            {
+                "proposed_system_prompt": overfit_prompt,
+                "change_summary": "Insert the frozen case terms.",
+                "rationale": "first-private-rationale",
+            },
+            {
+                **approved_reviewer_response(),
+                "approved": False,
+                "evaluation_gaming_safe": False,
+                "risk_level": "MEDIUM",
+                "risks": [{"category": "evaluation_gaming", "severity": "MEDIUM"}],
+                "reason": "The proposal encodes frozen evaluation terms instead of general behavior.",
+            },
+            {
+                "proposed_system_prompt": revised_prompt,
+                "change_summary": "Generalize the improvement into reusable reasoning obligations.",
+                "rationale": "second-private-rationale",
+            },
+            approved_reviewer_response(),
+        ]
+    )
+    monkeypatch.setattr("app.services.agent_optimizations.get_llm", lambda: gateway)
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    claimed = claim_agent_optimization_job(db, job.id)
+
+    await process_agent_optimization_job(*claimed, session_factory=factory)
+    db.expire_all()
+
+    completed = db.get(AgentOptimizationJob, job.id)
+    assert completed is not None
+    assert completed.status == "COMPLETED"
+    draft = db.get(AgentPromptVersion, completed.draft_version_id)
+    assert draft is not None
+    assert draft.system_prompt == revised_prompt
+    reviewer_output = json.loads(completed.reviewer_output_json)
+    history = reviewer_output["revision_history"]
+    assert [item["round"] for item in history] == [1, 2]
+    assert history[0]["safety_passed"] is False
+    assert history[1]["safety_passed"] is True
+    assert len(gateway.calls) == 4
+    assert "The proposal encodes frozen evaluation terms" in gateway.calls[2]["user_prompt"]
+    assert "first-private-rationale" not in gateway.calls[2]["user_prompt"]
+    assert "evidence" not in json.loads(gateway.calls[2]["user_prompt"])
+    assert "not an effectiveness score" in gateway.calls[3]["system_prompt"]
+
+
 def result_answer_not_in_audit(db: Session, fragment: str) -> bool:
     return all(fragment not in row.details for row in db.scalars(select(AuditLog)))
 
@@ -463,6 +561,7 @@ async def test_deterministic_governance_checks_override_reviewer_approval(
         ]
     )
     monkeypatch.setattr("app.services.agent_optimizations.get_llm", lambda: gateway)
+    monkeypatch.setattr(optimization_settings, "agent_optimization_max_review_rounds", 1)
     factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
     claimed = claim_agent_optimization_job(db, job.id)
 
@@ -504,6 +603,7 @@ async def test_reviewer_rejection_never_creates_draft(
         ]
     )
     monkeypatch.setattr("app.services.agent_optimizations.get_llm", lambda: gateway)
+    monkeypatch.setattr(optimization_settings, "agent_optimization_max_review_rounds", 1)
     factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
     claimed = claim_agent_optimization_job(db, job.id)
 
@@ -514,6 +614,31 @@ async def test_reviewer_rejection_never_creates_draft(
     assert rejected.status == "REJECTED"
     assert rejected.draft_version_id is None
     assert db.scalar(select(func.count(AgentPromptVersion.id))) == 1
+
+
+def test_rejected_optimization_can_be_retried_with_frozen_evidence(db: Session) -> None:
+    job, _, _, _, _ = enqueue_seeded_job(db)
+    job.status = "REJECTED"
+    job.stage = "rejected"
+    job.progress_percent = 100
+    job.optimizer_output_json = json.dumps(
+        {
+            "proposed_system_prompt": "A sufficiently long rejected prompt that remains available for the next review round and preserves the frozen source evidence.",
+            "change_summary": "Rejected proposal.",
+        }
+    )
+    job.reviewer_output_json = json.dumps({"approved": False})
+    job.safety_checks_json = json.dumps({"passed": False})
+    db.commit()
+
+    retry_agent_optimization_job(db, job)
+
+    assert job.status == "QUEUED"
+    assert job.stage == "queued"
+    assert job.progress_percent == 55
+    assert job.reviewer_output_json == ""
+    assert job.safety_checks_json == ""
+    assert json.loads(job.evidence_snapshot_json)["results"]
 
 
 def test_cancel_retry_and_lease_fencing(db: Session) -> None:

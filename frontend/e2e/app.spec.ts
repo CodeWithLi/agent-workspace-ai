@@ -269,16 +269,17 @@ function mockEvaluationResults(runId: number) {
         forbidden_keywords: ['共享凭据'],
         rubric: '安全控制不可被绕过。',
         answer: '所有租户共享凭据，直接发布。',
-        score: 0.32,
+        score: 0.7,
         baseline_answer: '',
         baseline_score: null,
         score_delta: null,
-        dimensions: { requirements: 0.3, correctness: 0.4, relevance: 0.7, completeness: 0.2, safety: 0 },
+        dimensions: { requirements: 0, correctness: 1, relevance: 1, completeness: 1, safety: 1 },
         baseline_dimensions: {},
         score_source: 'llm_judge',
         latency_ms: 1190,
-        regressed: true,
-        passed: false,
+        regressed: false,
+        passed: true,
+        optimization_eligible: true,
         matched_keywords: [],
         missing_keywords: ['租户隔离', '审计', '回滚'],
         forbidden_hits: ['共享凭据'],
@@ -555,10 +556,10 @@ async function mockApi(page: Page) {
   ]
   const failedEvaluationRun = {
     ...mockEvaluationRun(79),
-    passed_cases: 0,
-    average_score: 0.32,
+    passed_cases: 1,
+    average_score: 0.7,
     gate_passed: false,
-    gate_failures: ['架构安全性未达到最低分'],
+    gate_failures: ['Average score 0.7000 is below 0.8000'],
     agent_snapshots: [
       { id: 2, name: 'AI架构师', role: 'architect', version: 1, model: 'test-model' }
     ]
@@ -590,6 +591,7 @@ async function mockApi(page: Page) {
       change_summary: completed ? '补充租户边界、回滚证据与人工审批要求。' : '',
       reviewer_risk_level: completed ? 'LOW' : '',
       reviewer_approved: completed ? true : null,
+      revision_round_count: completed ? 2 : 0,
       draft_version_id: completed ? 303 : null,
       draft_version: completed ? 3 : null,
       draft_status: completed ? 'DRAFT' : '',
@@ -608,11 +610,35 @@ async function mockApi(page: Page) {
         : '',
       reviewer_reason: completed ? '角色、工具权限和治理边界保持不变。' : '',
       reviewer_risks: [],
+      revision_history: completed
+        ? [
+            {
+              round: 1,
+              proposal_fingerprint: 'a'.repeat(64),
+              change_summary: '第一版过度依赖冻结用例关键词。',
+              reviewer_approved: false,
+              risk_level: 'MEDIUM',
+              reviewer_reason: '需要改写为可泛化的架构推理约束。',
+              safety_passed: false,
+              failed_checks: ['evaluation_gaming_safe']
+            },
+            {
+              round: 2,
+              proposal_fingerprint: 'b'.repeat(64),
+              change_summary: '改为通用的边界、证据与审批推理义务。',
+              reviewer_approved: true,
+              risk_level: 'LOW',
+              reviewer_reason: '第二轮已保持角色、权限与治理边界。',
+              safety_passed: true,
+              failed_checks: []
+            }
+          ]
+        : [],
       safety_checks: completed
         ? { prompt_injection_safe: true, tool_scope_safe: true, evaluation_gaming_safe: true, governance_safe: true, reviewer_approved: true, passed: true }
         : {},
       evidence: [
-        { result_id: 792, case_id: 2, case_name: '架构安全性', score: 0.32, regressed: true, failure_signals: ['缺少证据：租户隔离', '命中禁用词：共享凭据'] }
+        { result_id: 792, case_id: 2, case_name: '架构安全性', score: 0.7, regressed: false, failure_signals: ['缺少证据：租户隔离', '命中禁用词：共享凭据'] }
       ]
     }
   }
@@ -1709,6 +1735,33 @@ test('prefills an Agent draft and submits it as a Challenger evaluation', async 
   expect(payload.candidate_version_id).toBe(202)
 })
 
+test('explains a missing production baseline and switches to a team run', async ({ page }) => {
+  await page.route('**/api/v1/agents', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(discussionAgents.map((agent) => (
+        agent.id === 2 ? { ...agent, current_version: 9 } : agent
+      )))
+    })
+  })
+  await page.goto('/evaluations?agent=2&version=202')
+
+  if (page.viewportSize()?.width === 1440) await page.setViewportSize({ width: 1280, height: 800 })
+
+  const warning = page.getByRole('alert', { name: '缺少当前生产版本基线' })
+  await expect(warning).toContainText('AI架构师 v9')
+  await expect(warning).toContainText('不能与旧版本基线比较')
+  await expect(page.getByRole('button', { name: '运行候选评测' })).toBeDisabled()
+
+  await warning.getByRole('button', { name: '先运行团队基线' }).click()
+  await expect(page.getByLabel('选择评测类型')).toContainText('团队基线')
+  await expect(page.getByRole('button', { name: '运行团队评测' })).toBeEnabled()
+  await expect(warning).toBeHidden()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+  expect(await page.locator('main').evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(0)
+})
+
 test('turns failed evaluation evidence into a reviewed Prompt draft and Challenger', async ({ page }) => {
   await page.goto('/evaluations')
 
@@ -1741,6 +1794,10 @@ test('turns failed evaluation evidence into a reviewed Prompt draft and Challeng
   await expect(page.getByText('调优任务 #901', { exact: true })).toBeVisible()
   await expect(page.getByText('Optimizer Agent', { exact: true })).toBeVisible()
   await expect(page.getByText('Reviewer Agent', { exact: true })).toBeVisible()
+  await expect(page.getByText('第 1 轮', { exact: true })).toBeVisible()
+  await expect(page.getByText('进入返修', { exact: true })).toBeVisible()
+  await expect(page.getByText('第 2 轮', { exact: true })).toBeVisible()
+  await expect(page.getByText('双门禁通过', { exact: true })).toBeVisible()
   await expect(page.getByText('角色、工具权限和治理边界保持不变。', { exact: true })).toBeVisible()
   await expect(page.getByText('你是 AI 架构师。明确租户边界，引用审计与回滚证据，并将敏感变更提交人工审批。', { exact: true })).toBeVisible()
 

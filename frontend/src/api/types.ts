@@ -472,6 +472,7 @@ export interface EvaluationResult {
   latency_ms: number
   regressed: boolean
   passed: boolean
+  optimization_eligible: boolean
   matched_keywords: string[]
   missing_keywords: string[]
   forbidden_hits: string[]
@@ -494,6 +495,17 @@ export interface AgentOptimizationEvidence {
   failure_signals: string[]
 }
 
+export interface AgentOptimizationRevision {
+  round: number
+  proposal_fingerprint: string
+  change_summary: string
+  reviewer_approved: boolean
+  risk_level: string
+  reviewer_reason: string
+  safety_passed: boolean
+  failed_checks: string[]
+}
+
 export interface AgentOptimizationJob {
   id: number
   request_id: string
@@ -514,6 +526,7 @@ export interface AgentOptimizationJob {
   change_summary: string
   reviewer_risk_level: string
   reviewer_approved?: boolean | null
+  revision_round_count: number
   draft_version_id?: number | null
   draft_version?: number | null
   draft_status: string
@@ -533,6 +546,7 @@ export interface AgentOptimizationJobDetail extends AgentOptimizationJob {
   proposed_system_prompt: string
   reviewer_reason: string
   reviewer_risks: unknown[]
+  revision_history: AgentOptimizationRevision[]
   safety_checks: Record<string, unknown>
   evidence: AgentOptimizationEvidence[]
 }
