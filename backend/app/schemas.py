@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -402,12 +402,14 @@ class WorkflowRequest(BaseModel):
     project_id: int
     user_input: str = Field(min_length=1, max_length=20000)
     pause_before_report: bool = True
+    require_plan_approval: bool = False
     request_id: str = Field(min_length=8, max_length=64)
 
 
 class WorkflowContinueRequest(BaseModel):
     workflow_id: int
     human_feedback: str = Field(default="", max_length=4000)
+    decision: Literal["APPROVE", "REVISE"] | None = None
 
 
 class WorkflowPauseRequest(BaseModel):

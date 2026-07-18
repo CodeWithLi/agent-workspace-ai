@@ -2379,6 +2379,126 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
+test('reviews, replans and approves an execution plan before specialist dispatch', async ({ page }) => {
+  let workflowStarted = false
+  let runPayload: Record<string, unknown> = {}
+  const decisions: Array<Record<string, unknown>> = []
+  let planWorkflow = {
+    workflow_id: 140,
+    project_id: 2,
+    parent_workflow_id: null,
+    retry_from_node: '',
+    retry_sequence: 0,
+    pause_requested_at: null,
+    pause_requested_by_user_id: null,
+    pause_reason: '',
+    intervention_count: 0,
+    status: 'PAUSED',
+    current_node: 'plan_review',
+    state: {
+      execution_plan: {
+        objective: '先验证可恢复交付，再启动专业 Agent',
+        rationale: '测试与运营需要独立审查，且所有结论必须可追溯。',
+        assignments: [
+          { role: 'test_engineer', objective: '验证边界场景与验收证据', deliverable: '可复现验收清单' },
+          { role: 'operations_analyst', objective: '验证灰度发布与故障恢复', deliverable: '发布与回滚手册' }
+        ],
+        success_criteria: ['核心路径具备可复现证据', '失败场景具备负责人和回滚条件']
+      },
+      require_plan_approval: true,
+      plan_approved: false,
+      plan_revision_count: 0,
+      plan_revision_feedback: '',
+      specialist_handoffs: [],
+      quality_gate: {},
+      documents: [],
+      messages: []
+    },
+    attempt_count: 1,
+    max_attempts: 2,
+    error: '',
+    created_at: '2026-07-19T08:00:00Z',
+    updated_at: '2026-07-19T08:01:00Z',
+    started_at: '2026-07-19T08:00:01Z',
+    finished_at: null
+  }
+
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: workflowStarted ? [planWorkflow] : [] }))
+  await page.route(/\/api\/v1\/workflow\/run$/, async (route) => {
+    runPayload = route.request().postDataJSON() as Record<string, unknown>
+    workflowStarted = true
+    await route.fulfill({
+      json: {
+        ...planWorkflow,
+        status: 'QUEUED',
+        current_node: 'requirement',
+        state: { documents: [], messages: [] }
+      }
+    })
+  })
+  await page.route(/\/api\/v1\/workflow\/140$/, (route) => route.fulfill({ json: planWorkflow }))
+  await page.route(/\/api\/v1\/workflow\/140\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/140\/events\/history(?:\?.*)?$/, (route) => route.fulfill({
+    json: [
+      { id: 1, workflow_id: 140, node: 'planning', event_type: 'PLAN_CREATED', message: 'Plan created', payload: { approval_required: true }, created_at: '2026-07-19T08:00:30Z' },
+      { id: 2, workflow_id: 140, node: 'plan_review', event_type: 'PAUSED', message: 'Waiting for approval', payload: { approval_gate: 'plan_review' }, created_at: '2026-07-19T08:01:00Z' }
+    ]
+  }))
+  await page.route(/\/api\/v1\/workflow\/140\/events$/, (route) => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: 'retry: 10000\n\n'
+  }))
+  await page.route(/\/api\/v1\/workflow\/continue$/, async (route) => {
+    const payload = route.request().postDataJSON() as Record<string, unknown>
+    decisions.push(payload)
+    if (payload.decision === 'REVISE') {
+      planWorkflow = {
+        ...planWorkflow,
+        state: {
+          ...planWorkflow.state,
+          execution_plan: {
+            ...planWorkflow.state.execution_plan,
+            objective: '补齐安全边界后的可恢复交付计划',
+            rationale: '已根据人工计划意见补充安全验收和负责人。'
+          },
+          plan_revision_count: 1,
+          plan_revision_feedback: String(payload.human_feedback)
+        }
+      }
+    } else {
+      planWorkflow = {
+        ...planWorkflow,
+        status: 'QUEUED',
+        current_node: 'specialists',
+        state: { ...planWorkflow.state, plan_approved: true }
+      }
+    }
+    await route.fulfill({ json: planWorkflow })
+  })
+
+  await page.goto('/projects/2')
+  await page.getByRole('button', { name: '运行多 Agent 工作流', exact: true }).click()
+  await expect.poll(() => runPayload.require_plan_approval).toBe(true)
+  await page.reload()
+
+  await expect(page.getByText('执行计划等待批准', { exact: true })).toBeVisible()
+  await expect(page.getByText('测试与运营需要独立审查，且所有结论必须可追溯。', { exact: true })).toBeVisible()
+  await expect(page.getByText('核心路径具备可复现证据', { exact: true })).toBeVisible()
+  await expect(page.getByText('失败场景具备负责人和回滚条件', { exact: true })).toBeVisible()
+  const reviseButton = page.getByRole('button', { name: '要求重新规划', exact: true })
+  await expect(reviseButton).toBeDisabled()
+  await page.getByLabel('工作流人工反馈').fill('补充数据安全边界，并为回滚验收指定负责人')
+  await reviseButton.click()
+  await expect(page.getByText('补齐安全边界后的可恢复交付计划', { exact: true })).toBeVisible()
+  expect(decisions[0]).toMatchObject({ decision: 'REVISE', human_feedback: '补充数据安全边界，并为回滚验收指定负责人' })
+
+  await page.getByRole('button', { name: '批准并启动 2 个分支', exact: true }).click()
+  await expect(page.getByText('已批准', { exact: true })).toBeVisible()
+  expect(decisions[1]).toMatchObject({ decision: 'APPROVE', human_feedback: '' })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
 test('uses the five-screen interactive prototype on desktop and mobile preview', async ({ page }) => {
   await page.goto('/prototypes?prototype=41')
 

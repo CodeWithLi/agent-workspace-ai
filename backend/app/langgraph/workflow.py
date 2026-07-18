@@ -52,6 +52,10 @@ class ProjectState(TypedDict, total=False):
     report: str
     agent_snapshot: dict[str, dict[str, Any]]
     execution_plan: dict[str, Any]
+    require_plan_approval: bool
+    plan_approved: bool
+    plan_revision_count: int
+    plan_revision_feedback: str
     specialist_handoffs: list[dict[str, Any]]
     quality_gate: dict[str, Any]
     revision_round: int
@@ -87,6 +91,7 @@ def initial_state(
     project: Project,
     user_input: str,
     agent_snapshot: dict[str, dict[str, Any]] | None = None,
+    require_plan_approval: bool = False,
 ) -> ProjectState:
     return {
         "user_input": user_input,
@@ -100,6 +105,10 @@ def initial_state(
         "report": "",
         "agent_snapshot": agent_snapshot or {},
         "execution_plan": {},
+        "require_plan_approval": require_plan_approval,
+        "plan_approved": not require_plan_approval,
+        "plan_revision_count": 0,
+        "plan_revision_feedback": "",
         "specialist_handoffs": [],
         "quality_gate": {},
         "revision_round": 0,
@@ -314,6 +323,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
 
     async def planning_node(state: WorkspaceGraphState) -> dict[str, Any]:
         begin_node(db, workflow, "planning", expected_lease_token)
+        revision_feedback = state.get("plan_revision_feedback", "").strip()
         planner_output = await invoke_agent(
             AgentRole.project_manager,
             (
@@ -321,6 +331,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
                 "role、objective、deliverable。role 仅允许 test_engineer、operations_analyst、"
                 "knowledge_admin、notification_secretary。"
+                "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
             ),
             json.dumps(
                 agent_context(state, {
@@ -329,11 +340,17 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "architecture": state["architecture"],
                     "product_prd": document_content(state, "PRD"),
                     "system_design": document_content(state, "SYSTEM_DESIGN"),
+                    "prior_execution_plan": state.get("execution_plan") or None,
+                    "plan_revision": {
+                        "round": int(state.get("plan_revision_count", 0)),
+                        "human_feedback": revision_feedback,
+                    } if revision_feedback else None,
                 }),
                 ensure_ascii=False,
             ),
         )
         plan = parse_execution_plan(planner_output, state["user_input"])
+        approval_required = bool(state.get("require_plan_approval", False))
         record_workflow_event(
             db,
             workflow,
@@ -343,6 +360,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             payload={
                 "roles": [assignment.role for assignment in plan.assignments],
                 "success_criteria_count": len(plan.success_criteria),
+                "revision_count": int(state.get("plan_revision_count", 0)),
+                "approval_required": approval_required,
             },
         )
         return complete_node(db, workflow, "planning", state, {
@@ -352,10 +371,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "planning_agent",
                 plan.model_dump_json(),
             ),
-            "current_node": "specialists",
+            "plan_approved": not approval_required,
+            "current_node": "plan_review" if approval_required else "specialists",
         }, expected_lease_token)
 
     async def specialists_node(state: WorkspaceGraphState) -> dict[str, Any]:
+        if state.get("require_plan_approval") and not state.get("plan_approved"):
+            raise RuntimeError("Execution plan must be approved before specialist branches start")
         begin_node(db, workflow, "specialists", expected_lease_token)
         plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
         previous_handoffs = {
@@ -620,6 +642,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     def after_tester(state: WorkspaceGraphState) -> Literal["pause", "report"]:
         return "pause" if state.get("pause_before_report", True) else "report"
 
+    def after_planning(state: WorkspaceGraphState) -> Literal["continue", "pause"]:
+        return "continue" if state.get("current_node") == "specialists" else "pause"
+
     def after_quality_gate(state: WorkspaceGraphState) -> Literal["revise", "continue", "pause"]:
         current_node = state.get("current_node")
         if current_node == "specialists":
@@ -648,6 +673,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "product": "product",
             "architect": "architect",
             "planning": "planning",
+            "plan_review": END,
             "specialists": "specialists",
             "quality_gate": "quality_gate",
             "project_manager": "project_manager",
@@ -659,7 +685,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     builder.add_edge("requirement", "product")
     builder.add_edge("product", "architect")
     builder.add_edge("architect", "planning")
-    builder.add_edge("planning", "specialists")
+    builder.add_conditional_edges(
+        "planning",
+        after_planning,
+        {"continue": "specialists", "pause": END},
+    )
     builder.add_edge("specialists", "quality_gate")
     builder.add_conditional_edges(
         "quality_gate",
@@ -678,6 +708,7 @@ async def run_workspace_graph(
     user_id: int,
     user_input: str,
     pause_before_report: bool = True,
+    require_plan_approval: bool = False,
     request_id: str | None = None,
 ) -> WorkflowRun:
     workflow = WorkflowRun(
@@ -685,7 +716,15 @@ async def run_workspace_graph(
         user_id=user_id,
         status=WorkflowStatus.running,
         current_node="requirement",
-        state_json=json.dumps(initial_state(project, user_input, snapshot_agent_configs(db)), ensure_ascii=False),
+        state_json=json.dumps(
+            initial_state(
+                project,
+                user_input,
+                snapshot_agent_configs(db),
+                require_plan_approval=require_plan_approval,
+            ),
+            ensure_ascii=False,
+        ),
         request_id=request_id,
         pause_before_report=pause_before_report,
         attempt_count=1,
@@ -700,19 +739,68 @@ async def run_workspace_graph(
     return await execute_workspace_graph(db, workflow, pause_before_report)
 
 
-async def continue_workspace_graph(db: Session, workflow: WorkflowRun, human_feedback: str = "") -> WorkflowRun:
-    if workflow.status != WorkflowStatus.paused or workflow.current_node not in {"quality_review", "report"}:
+async def continue_workspace_graph(
+    db: Session,
+    workflow: WorkflowRun,
+    human_feedback: str = "",
+    decision: Literal["APPROVE", "REVISE"] | None = None,
+) -> WorkflowRun:
+    if workflow.status != WorkflowStatus.paused or workflow.current_node not in {
+        "plan_review",
+        "quality_review",
+        "report",
+    }:
         raise ValueError("Workflow is not waiting for human confirmation")
     gate = workflow.current_node
-    pause_before_report = False
-    if gate == "quality_review":
-        persisted = json.loads(workflow.state_json or "{}")
+    persisted = json.loads(workflow.state_json or "{}")
+    pause_before_report = workflow.pause_before_report
+    if gate == "plan_review":
+        if decision == "APPROVE":
+            persisted["plan_approved"] = True
+            workflow.current_node = "specialists"
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_APPROVED",
+                "Execution plan approved for specialist dispatch",
+                node="plan_review",
+                payload={
+                    "branch_count": len(persisted.get("execution_plan", {}).get("assignments", [])),
+                    "revision_count": int(persisted.get("plan_revision_count", 0)),
+                },
+            )
+        elif decision == "REVISE":
+            feedback = human_feedback.strip()
+            if not feedback:
+                raise ValueError("Revision instruction is required for plan review")
+            persisted["plan_approved"] = False
+            persisted["plan_revision_feedback"] = feedback
+            persisted["plan_revision_count"] = int(persisted.get("plan_revision_count", 0)) + 1
+            workflow.current_node = "planning"
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_REVISION_REQUESTED",
+                "Execution plan revision requested",
+                node="plan_review",
+                payload={
+                    "instruction_chars": len(feedback),
+                    "revision_count": persisted["plan_revision_count"],
+                },
+            )
+        else:
+            raise ValueError("Plan review decision must be APPROVE or REVISE")
+        workflow.state_json = json.dumps(persisted, ensure_ascii=False)
+    elif gate == "quality_review":
         persisted["revision_feedback"] = human_feedback.strip() or "请根据质量门禁问题补充证据并修订专业交接。"
         persisted["manual_revision_count"] = int(persisted.get("manual_revision_count", 0)) + 1
         workflow.state_json = json.dumps(persisted, ensure_ascii=False)
         workflow.current_node = "specialists"
         pause_before_report = True
-    workflow.human_feedback = human_feedback
+    else:
+        pause_before_report = False
+    if gate != "plan_review":
+        workflow.human_feedback = human_feedback
     workflow.status = WorkflowStatus.running
     workflow.lease_token = str(uuid4())
     workflow.pause_before_report = pause_before_report
@@ -760,6 +848,20 @@ async def execute_workspace_graph(db: Session, workflow: WorkflowRun, pause_befo
         workflow.status = WorkflowStatus.completed
         workflow.finished_at = datetime.now(timezone.utc)
         record_workflow_event(db, workflow, "COMPLETED", "Workflow completed")
+    elif workflow.current_node == "plan_review":
+        workflow.status = WorkflowStatus.paused
+        plan = result.get("execution_plan", {})
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow is waiting for execution plan approval",
+            payload={
+                "approval_gate": "plan_review",
+                "branch_count": len(plan.get("assignments", [])),
+                "revision_count": int(result.get("plan_revision_count", 0)),
+            },
+        )
     elif workflow.current_node == "quality_review":
         workflow.status = WorkflowStatus.paused
         record_workflow_event(

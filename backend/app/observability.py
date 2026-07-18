@@ -82,6 +82,7 @@ NODE_LABELS = {
     "product": "产品方案",
     "architect": "架构设计",
     "planning": "动态规划",
+    "plan_review": "计划审批",
     "specialists": "专业分支",
     "quality_gate": "质量门禁",
     "quality_review": "人工修订",
@@ -114,11 +115,15 @@ ROLE_LABELS = {
 }
 
 PUBLIC_EVENT_PAYLOAD_FIELDS = {
+    "approval_required",
     "approval_gate",
+    "branch_count",
+    "decision",
     "next_node",
     "output_chars",
     "revision_roles",
     "revision_round",
+    "revision_count",
     "role",
     "roles",
     "score",

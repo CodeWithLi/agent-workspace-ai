@@ -17,7 +17,7 @@ from app.api.routes.workflow import cancel_workflow, continue_workflow, pause_wo
 from app.core.database import get_db
 from app.core.llm import get_llm
 from app.core.security import hash_password
-from app.models import Agent, AgentRole, AgentRun, Project, RechargeOrder, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.models import Agent, AgentRole, AgentRun, AuditLog, Project, RechargeOrder, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.schemas import ChatRequest, RechargeRequest, WorkflowContinueRequest, WorkflowPauseRequest, WorkflowRequest, WorkflowRetryRequest
 from app.services.agent_runs import fail_agent_run
 from app.services import agent_run_reaper as reaper_module
@@ -752,6 +752,126 @@ async def test_running_workflow_pauses_at_safe_boundary_and_quality_review_can_r
     assert resumed.current_node == "specialists"
     assert resumed_state["revision_feedback"] == "补充失败恢复证据和明确负责人"
     assert resumed_state["manual_revision_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_plan_review_validates_decisions_and_records_governance(db: Session) -> None:
+    user = User(
+        email="plan-governance@example.com",
+        name="Plan Governance",
+        password_hash="hash",
+        permissions="projects:write",
+    )
+    db.add(user)
+    db.flush()
+    project = Project(name="Plan Governance", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    plan = {
+        "objective": "交付受治理的多 Agent 方案",
+        "rationale": "并行分支需要先核对范围",
+        "assignments": [
+            {
+                "role": "test_engineer",
+                "objective": "验证核心路径",
+                "deliverable": "验收清单",
+            },
+            {
+                "role": "operations_analyst",
+                "objective": "验证发布恢复",
+                "deliverable": "运行手册",
+            },
+        ],
+        "success_criteria": ["核心路径可验收", "失败过程可回滚"],
+    }
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.paused,
+        current_node="plan_review",
+        state_json=json.dumps(
+            {
+                "execution_plan": plan,
+                "require_plan_approval": True,
+                "plan_approved": False,
+                "plan_revision_count": 0,
+                "plan_revision_feedback": "",
+            },
+            ensure_ascii=False,
+        ),
+        pause_before_report=True,
+    )
+    db.add(workflow)
+    db.commit()
+
+    with pytest.raises(HTTPException) as missing_decision:
+        await continue_workflow(
+            WorkflowContinueRequest(workflow_id=workflow.id),
+            http_request("/api/v1/workflow/continue"),
+            user,
+            db,
+        )
+    assert missing_decision.value.status_code == 422
+
+    with pytest.raises(HTTPException) as missing_feedback:
+        await continue_workflow(
+            WorkflowContinueRequest(workflow_id=workflow.id, decision="REVISE"),
+            http_request("/api/v1/workflow/continue"),
+            user,
+            db,
+        )
+    assert missing_feedback.value.status_code == 422
+
+    revision = await continue_workflow(
+        WorkflowContinueRequest(
+            workflow_id=workflow.id,
+            decision="REVISE",
+            human_feedback="增加安全评审角色并量化回滚验收标准",
+        ),
+        http_request("/api/v1/workflow/continue"),
+        user,
+        db,
+    )
+    assert revision.status == WorkflowStatus.queued
+    assert revision.current_node == "planning"
+    assert revision.state["plan_revision_count"] == 1
+    assert revision.state["plan_approved"] is False
+    assert revision.state["plan_revision_feedback"] == "增加安全评审角色并量化回滚验收标准"
+
+    workflow = db.get(WorkflowRun, workflow.id)
+    workflow.status = WorkflowStatus.paused
+    workflow.current_node = "plan_review"
+    db.commit()
+    approval = await continue_workflow(
+        WorkflowContinueRequest(workflow_id=workflow.id, decision="APPROVE"),
+        http_request("/api/v1/workflow/continue"),
+        user,
+        db,
+    )
+    assert approval.status == WorkflowStatus.queued
+    assert approval.current_node == "specialists"
+    assert approval.state["plan_approved"] is True
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "PLAN_REVISION_REQUESTED",
+        )
+    ) == 1
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "PLAN_APPROVED",
+        )
+    ) == 1
+    actions = set(
+        db.scalars(
+            select(AuditLog.action).where(
+                AuditLog.resource_type == "workflow",
+                AuditLog.resource_id == str(workflow.id),
+            )
+        )
+    )
+    assert {"workflow.plan_revision_requested", "workflow.plan_approved"} <= actions
 
 
 @pytest.mark.asyncio

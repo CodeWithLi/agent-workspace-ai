@@ -38,13 +38,14 @@ WORKFLOW_NODE_ORDER = {
     "product": 1,
     "architect": 2,
     "planning": 3,
-    "specialists": 4,
-    "quality_gate": 5,
-    "quality_review": 6,
-    "project_manager": 7,
-    "tester": 8,
-    "report": 9,
-    "completed": 10,
+    "plan_review": 4,
+    "specialists": 5,
+    "quality_gate": 6,
+    "quality_review": 7,
+    "project_manager": 8,
+    "tester": 9,
+    "report": 10,
+    "completed": 11,
 }
 RETRY_CHECKPOINT_OUTPUTS = {
     "project_manager": {
@@ -216,7 +217,12 @@ async def run_workflow(
         status=WorkflowStatus.queued,
         current_node="requirement",
         state_json=json.dumps(
-            initial_state(project, payload.user_input, snapshot_agent_configs(db)),
+            initial_state(
+                project,
+                payload.user_input,
+                snapshot_agent_configs(db),
+                require_plan_approval=payload.require_plan_approval,
+            ),
             ensure_ascii=False,
         ),
         request_id=payload.request_id,
@@ -234,7 +240,10 @@ async def run_workflow(
         project.id,
         "workflow",
         workflow.id,
-        {"request_id": payload.request_id},
+        {
+            "request_id": payload.request_id,
+            "require_plan_approval": payload.require_plan_approval,
+        },
         request,
     )
     db.commit()
@@ -487,6 +496,22 @@ async def continue_workflow(
             state["manual_revision_count"] = int(state.get("manual_revision_count", 0)) + 1
             workflow.current_node = "specialists"
             workflow.pause_before_report = True
+        elif workflow.current_node == "plan_review":
+            state["plan_approved"] = False
+            state["plan_revision_feedback"] = feedback
+            state["plan_revision_count"] = int(state.get("plan_revision_count", 0)) + 1
+            workflow.current_node = "planning"
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_REVISION_REQUESTED",
+                "Operator instruction requested execution plan revision",
+                node="plan_review",
+                payload={
+                    "instruction_chars": len(feedback),
+                    "revision_count": state["plan_revision_count"],
+                },
+            )
         elif workflow.current_node == "report":
             workflow.pause_before_report = False
         workflow.state_json = json.dumps(state, ensure_ascii=False)
@@ -504,6 +529,49 @@ async def continue_workflow(
                 "intervention_count": workflow.intervention_count,
             },
         )
+    elif workflow.current_node == "plan_review":
+        if payload.decision is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Plan review decision must be APPROVE or REVISE",
+            )
+        state = workflow_state(workflow)
+        if payload.decision == "REVISE":
+            if not feedback:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Revision instruction is required for plan review",
+                )
+            state["plan_approved"] = False
+            state["plan_revision_feedback"] = feedback
+            state["plan_revision_count"] = int(state.get("plan_revision_count", 0)) + 1
+            workflow.current_node = "planning"
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_REVISION_REQUESTED",
+                "Execution plan revision requested",
+                node="plan_review",
+                payload={
+                    "instruction_chars": len(feedback),
+                    "revision_count": state["plan_revision_count"],
+                },
+            )
+        else:
+            state["plan_approved"] = True
+            workflow.current_node = "specialists"
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_APPROVED",
+                "Execution plan approved for specialist dispatch",
+                node="plan_review",
+                payload={
+                    "branch_count": len(state.get("execution_plan", {}).get("assignments", [])),
+                    "revision_count": int(state.get("plan_revision_count", 0)),
+                },
+            )
+        workflow.state_json = json.dumps(state, ensure_ascii=False)
     elif workflow.current_node == "quality_review":
         if not feedback:
             raise HTTPException(
@@ -521,7 +589,7 @@ async def continue_workflow(
     else:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow is not waiting for human confirmation")
 
-    if not operator_pause:
+    if not operator_pause and gate != "plan_review":
         workflow.human_feedback = feedback
     workflow.status = WorkflowStatus.queued
     workflow.error = ""
@@ -531,16 +599,25 @@ async def continue_workflow(
         workflow,
         "QUEUED",
         "Workflow continued after human review",
-        payload={"approval_gate": gate},
+        payload={"approval_gate": gate, "decision": payload.decision},
     )
+    audit_action = "workflow.continue"
+    if gate == "plan_review" and payload.decision == "APPROVE":
+        audit_action = "workflow.plan_approved"
+    elif gate == "plan_review" and payload.decision == "REVISE":
+        audit_action = "workflow.plan_revision_requested"
     record_audit(
         db,
-        "workflow.continue",
+        audit_action,
         current_user.id,
         workflow.project_id,
         "workflow",
         workflow.id,
-        {"approval_gate": gate, "instruction_chars": len(feedback)},
+        {
+            "approval_gate": gate,
+            "decision": payload.decision,
+            "instruction_chars": len(feedback),
+        },
         request,
     )
     db.commit()

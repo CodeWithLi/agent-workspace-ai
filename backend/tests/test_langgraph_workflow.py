@@ -113,6 +113,123 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_execution_plan_requires_approval_and_supports_replanning(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="plan-review@example.com", name="Plan Review", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Governed Plan", description="Approve before dispatch", owner_id=user.id)
+    db.add(project)
+    db.commit()
+    planner_prompts: list[str] = []
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "动态编排器" in system_prompt:
+            planner_prompts.append(user_prompt)
+            revision = len(planner_prompts) > 1
+            return json.dumps(
+                {
+                    "objective": "修订后的可审计交付计划" if revision else "首版交付计划",
+                    "rationale": "根据人工意见强化安全验收" if revision else "质量和运营需要独立评审",
+                    "assignments": [
+                        {
+                            "role": "test_engineer",
+                            "objective": "验证核心路径、安全边界和验收证据",
+                            "deliverable": "可复现验收清单",
+                        },
+                        {
+                            "role": "operations_analyst",
+                            "objective": "验证灰度、监控和故障回滚",
+                            "deliverable": "发布与回滚手册",
+                        },
+                    ],
+                    "success_criteria": [
+                        "每个核心路径都有可复现证据",
+                        "每个失败场景都有负责人和回滚条件",
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "专业交接 Agent" in system_prompt:
+            return (
+                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
+                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限，并逐项关联成功标准。"
+                "同时记录测试数据、预期结果、实际结果、告警阈值、演练时间和审批责任人，确保审计可追溯。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 96,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "专业交接达到发布门禁。",
+                },
+                ensure_ascii=False,
+            )
+        if "报告生成器" in system_prompt:
+            return "# 最终报告\n\n执行计划已经人工批准。"
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    workflow = await run_workspace_graph(
+        db,
+        project,
+        user.id,
+        "构建需要人工计划治理的多 Agent 项目",
+        pause_before_report=True,
+        require_plan_approval=True,
+    )
+    first_state = json.loads(workflow.state_json)
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "plan_review"
+    assert first_state["plan_approved"] is False
+    assert first_state["plan_revision_count"] == 0
+    assert first_state["specialist_handoffs"] == []
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
+
+    with pytest.raises(ValueError, match="APPROVE or REVISE"):
+        await continue_workspace_graph(db, workflow)
+
+    workflow = await continue_workspace_graph(
+        db,
+        workflow,
+        "补充安全边界，并为失败场景指定负责人",
+        decision="REVISE",
+    )
+    revised_state = json.loads(workflow.state_json)
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "plan_review"
+    assert revised_state["execution_plan"]["objective"] == "修订后的可审计交付计划"
+    assert revised_state["plan_revision_count"] == 1
+    assert revised_state["plan_approved"] is False
+    assert "补充安全边界" in planner_prompts[-1]
+    assert "首版交付计划" in planner_prompts[-1]
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
+
+    workflow = await continue_workspace_graph(db, workflow, decision="APPROVE")
+    approved_state = json.loads(workflow.state_json)
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "report"
+    assert approved_state["plan_approved"] is True
+    assert len(approved_state["specialist_handoffs"]) == 2
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 4
+    event_types = list(
+        db.scalars(
+            select(WorkflowEvent.event_type)
+            .where(WorkflowEvent.workflow_id == workflow.id)
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert event_types.count("PLAN_REVISION_REQUESTED") == 1
+    assert event_types.count("PLAN_APPROVED") == 1
+    assert event_types.count("PLAN_CREATED") == 2
+
+
+@pytest.mark.asyncio
 async def test_quality_gate_bounds_automatic_revision_then_accepts_human_direction(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,

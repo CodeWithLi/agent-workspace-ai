@@ -458,7 +458,7 @@ const statusLabels: Record<string, string> = {
 }
 const nodeLabels: Record<string, string> = {
   queue: '排队', requirement: '需求分析', product: '产品方案', architect: '架构设计',
-  planning: '动态规划', specialists: '专业分支', quality_gate: '质量门禁',
+  planning: '动态规划', plan_review: '计划审批', specialists: '专业分支', quality_gate: '质量门禁',
   quality_review: '人工修订', project_manager: '项目计划', tester: '测试方案',
   report: '项目报告', completed: '完成'
 }
@@ -473,7 +473,8 @@ const eventLabels: Record<string, string> = {
   NODE_COMPLETED: '节点完成', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
   RETRY_CREATED: '已创建重试运行', RETRY_QUEUED: '检查点重试入队',
   PAUSE_REQUESTED: '请求安全暂停', PAUSE_SKIPPED: '暂停未生效', INTERVENTION_APPLIED: '应用恢复指令',
-  PLAN_CREATED: '计划已生成', QUALITY_GATE_PASSED: '质量门禁通过',
+  PLAN_CREATED: '计划已生成', PLAN_APPROVED: '计划已批准', PLAN_REVISION_REQUESTED: '要求重新规划',
+  QUALITY_GATE_PASSED: '质量门禁通过',
   QUALITY_GATE_FAILED: '质量门禁未通过', REVISION_REQUESTED: '请求修订', PAUSED: '等待人工确认',
   CANCEL_REQUESTED: '请求取消', CANCELLED: '已取消', COMPLETED: '运行完成', FAILED: '运行失败'
 }

@@ -127,8 +127,19 @@
       </div>
       <section v-if="executionPlan" class="workflow-orchestration" aria-label="多 Agent 执行计划">
         <div class="orchestration-heading">
-          <div><h4>动态执行计划</h4><p>{{ executionPlan.objective }}</p></div>
-          <el-tag type="primary">{{ executionPlan.assignments.length }} 个并行分支</el-tag>
+          <div class="orchestration-copy">
+            <h4>动态执行计划</h4>
+            <p>{{ executionPlan.objective }}</p>
+            <small>{{ executionPlan.rationale }}</small>
+          </div>
+          <div class="orchestration-tags">
+            <el-tag v-if="executionPlanApprovalLabel" :type="executionPlanApprovalType">{{ executionPlanApprovalLabel }}</el-tag>
+            <el-tag type="primary">{{ executionPlan.assignments.length }} 个并行分支</el-tag>
+          </div>
+        </div>
+        <div class="plan-success-criteria">
+          <strong>本轮成功标准</strong>
+          <ul><li v-for="criterion in executionPlan.success_criteria" :key="criterion">{{ criterion }}</li></ul>
         </div>
         <div class="orchestration-branches">
           <div v-for="assignment in executionPlan.assignments" :key="assignment.role" class="orchestration-branch-row">
@@ -155,7 +166,7 @@
           <time>{{ new Date(event.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</time>
         </div>
       </div>
-      <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate">
+      <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate" :class="{ 'plan-review': workflowPlanReview }">
         <div>
           <strong>{{ workflowApprovalTitle }}</strong>
           <p>{{ workflowApprovalDescription }}</p>
@@ -169,11 +180,26 @@
           aria-label="工作流人工反馈"
         />
         <el-button
+          v-if="!workflowPlanReview"
           type="warning"
           :loading="workflowActionBusy"
           :disabled="workflowFeedbackRequired && !workflowFeedback.trim()"
-          @click="continueWorkflow"
+          @click="continueWorkflow()"
         >{{ workflowContinueLabel }}</el-button>
+        <div v-else class="workflow-approval-actions">
+          <el-button
+            :icon="RefreshRight"
+            :loading="workflowActionBusy"
+            :disabled="!workflowFeedback.trim()"
+            @click="continueWorkflow('REVISE')"
+          >要求重新规划</el-button>
+          <el-button
+            type="primary"
+            :icon="Connection"
+            :loading="workflowActionBusy"
+            @click="continueWorkflow('APPROVE')"
+          >批准并启动 {{ executionPlan?.assignments.length || 0 }} 个分支</el-button>
+        </div>
       </section>
       <el-table v-if="workflowSagaSteps.length" :data="workflowSagaSteps" class="data-table">
         <el-table-column label="写操作" min-width="150">
@@ -345,7 +371,7 @@ const workflowPauseFormReason = ref('')
 const workflowPauseRequestId = ref(crypto.randomUUID())
 const projectForm = reactive({ name: '', description: '', status: 'ACTIVE' })
 const activeWorkflowDocument = ref('PRD')
-const workflowStages = ['需求分析', '产品方案', '架构设计', '动态规划', '专业分支', '质量门禁', '项目计划', '测试方案', '项目报告']
+const workflowStages = ['需求分析', '产品方案', '架构设计', '动态规划', '计划审批', '专业分支', '质量门禁', '项目计划', '测试方案', '项目报告']
 const workflowConnectionDetail = ref('')
 const {
   connectionState: workflowConnectionState,
@@ -366,19 +392,27 @@ const {
 const workflowStreamActive = computed(() => ['QUEUED', 'RUNNING', 'CANCELLING', 'COMPENSATING'].includes(workflowStatus.value))
 const workflowPausePending = computed(() => workflowStatus.value === 'RUNNING' && Boolean(workflowPauseRequestedAt.value))
 const workflowOperatorPaused = computed(() => workflowStatus.value === 'PAUSED' && Boolean(workflowPauseRequestedAt.value))
+const workflowPlanReview = computed(() => (
+  workflowStatus.value === 'PAUSED'
+  && workflowCurrentNode.value === 'plan_review'
+  && !workflowOperatorPaused.value
+))
 const workflowFeedbackRequired = computed(() => workflowOperatorPaused.value || workflowCurrentNode.value === 'quality_review')
 const workflowApprovalTitle = computed(() => {
   if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
+  if (workflowPlanReview.value) return '执行计划等待批准'
   return workflowCurrentNode.value === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认'
 })
 const workflowApprovalDescription = computed(() => {
   if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
+  if (workflowPlanReview.value) return '核对角色、交付物和成功标准。批准后才会并行启动专业 Agent；需要调整时请填写具体意见。'
   return workflowCurrentNode.value === 'quality_review'
     ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。'
     : '确认当前需求、架构、任务和测试产物后继续生成最终报告。'
 })
 const workflowFeedbackPlaceholder = computed(() => {
   if (workflowOperatorPaused.value) return '输入恢复指令，后续 Agent 将基于该约束继续执行'
+  if (workflowPlanReview.value) return '需要重新规划时，说明缺失角色、目标、交付物或成功标准'
   return workflowCurrentNode.value === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'
 })
 const workflowContinueLabel = computed(() => {
@@ -410,6 +444,16 @@ const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
   const plan = workflowState.value?.execution_plan
   return plan && Array.isArray(plan.assignments) ? plan as WorkflowExecutionPlan : null
 })
+const executionPlanApprovalLabel = computed(() => {
+  if (!workflowState.value?.require_plan_approval) return ''
+  if (workflowState.value?.plan_approved) return '已批准'
+  if (workflowCurrentNode.value === 'planning' && ['QUEUED', 'RUNNING'].includes(workflowStatus.value)) return '重新规划中'
+  return '待审批'
+})
+const executionPlanApprovalType = computed<'success' | 'warning' | 'info'>(() => {
+  if (workflowState.value?.plan_approved) return 'success'
+  return workflowCurrentNode.value === 'planning' ? 'info' : 'warning'
+})
 const specialistHandoffs = computed<WorkflowHandoff[]>(() => {
   const handoffs = workflowState.value?.specialist_handoffs
   return Array.isArray(handoffs) ? handoffs as WorkflowHandoff[] : []
@@ -440,7 +484,10 @@ const workflowCompletedStages = computed(() => {
     'project_manager_agent',
     'tester_agent'
   ].filter((role) => completedRoles.has(role)).length
-  if (executionPlan.value) completed += 1
+  if (executionPlan.value) {
+    completed += 1
+    if (!workflowState.value?.require_plan_approval || workflowState.value?.plan_approved) completed += 1
+  }
   if (specialistHandoffs.value.length) completed += 1
   if (qualityGate.value?.passed) completed += 1
   return completed
@@ -449,6 +496,7 @@ const workflowStatusLabel = computed(() => {
   if (workflowPausePending.value) return '等待安全暂停'
   if (workflowStatus.value === 'PAUSED') {
     if (workflowOperatorPaused.value) return '人工干预中'
+    if (workflowCurrentNode.value === 'plan_review') return '等待计划审批'
     return workflowCurrentNode.value === 'quality_review' ? '等待质量修订' : '等待报告确认'
   }
   return ({
@@ -491,6 +539,7 @@ function workflowStageLabel(node: string) {
     product: '产品方案',
     architect: '架构设计',
     planning: '动态规划',
+    plan_review: '计划审批',
     specialists: '专业分支',
     quality_gate: '质量门禁',
     quality_review: '人工修订',
@@ -509,6 +558,8 @@ function workflowEventLabel(eventType: string) {
     NODE_STARTED: '开始节点',
     NODE_COMPLETED: '完成节点',
     PLAN_CREATED: '计划已生成',
+    PLAN_APPROVED: '计划已批准',
+    PLAN_REVISION_REQUESTED: '要求重新规划',
     BRANCH_STARTED: '分支已启动',
     BRANCH_COMPLETED: '分支已交接',
     QUALITY_GATE_PASSED: '质量门禁通过',
@@ -588,6 +639,8 @@ function activityLabel(action: string) {
     'workflow.artifact_publish': '工作流产物已发布',
     'workflow.queued': '工作流已入队',
     'workflow.continue': '工作流已继续',
+    'workflow.plan_approved': '执行计划已批准',
+    'workflow.plan_revision_requested': '执行计划要求重做',
     'workflow.pause_requested': '工作流已请求安全暂停',
     'workflow.operator_paused': '工作流已在安全节点暂停',
     'workflow.retry': '工作流已重试',
@@ -747,6 +800,7 @@ async function runWorkflow() {
       project_id: projectId,
       user_input: `${project.value?.name}: ${project.value?.description}`,
       pause_before_report: true,
+      require_plan_approval: true,
       request_id: workflowRequestId.value
     }, { suppressErrorToast: true })
     workflowEvents.value = []
@@ -788,21 +842,28 @@ async function submitWorkflowPause() {
   }
 }
 
-async function continueWorkflow() {
+async function continueWorkflow(decision?: 'APPROVE' | 'REVISE') {
   if (!workflowId.value) return
   const operatorResume = workflowOperatorPaused.value
+  if (workflowPlanReview.value && !decision) return
+  if (decision === 'REVISE' && !workflowFeedback.value.trim()) return
   workflowActionBusy.value = true
   try {
-    const feedback = workflowFeedback.value.trim() || '人工确认通过，请生成最终项目报告。'
+    const feedback = workflowFeedback.value.trim()
+      || (decision === 'APPROVE' ? '' : '人工确认通过，请生成最终项目报告。')
     const { data } = await api.post<WorkflowRun>('/workflow/continue', {
       workflow_id: workflowId.value,
-      human_feedback: feedback
+      human_feedback: feedback,
+      decision
     })
     workflowFeedback.value = ''
     applyWorkflow(data)
     const cursor = await loadWorkflowEventHistory(data.workflow_id)
     watchWorkflowEvents(cursor)
-    ElMessage.success(operatorResume ? '恢复指令已应用' : '工作流已继续')
+    if (operatorResume) ElMessage.success('恢复指令已应用')
+    else if (decision === 'APPROVE') ElMessage.success('执行计划已批准，专业分支开始执行')
+    else if (decision === 'REVISE') ElMessage.success('重新规划要求已提交')
+    else ElMessage.success('工作流已继续')
   } finally {
     workflowActionBusy.value = false
   }
@@ -1058,7 +1119,7 @@ onBeforeUnmount(disposeWorkflowEventStream)
   margin-bottom: 12px;
 }
 
-.orchestration-heading > div {
+.orchestration-copy {
   min-width: 0;
 }
 
@@ -1072,6 +1133,47 @@ onBeforeUnmount(disposeWorkflowEventStream)
   margin: 0;
   color: var(--color-secondary-text);
   font-size: 13px;
+  line-height: 1.55;
+}
+
+.orchestration-copy small {
+  display: block;
+  max-width: 900px;
+  margin-top: 5px;
+  color: var(--color-muted-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.orchestration-tags {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.plan-success-criteria {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 12px;
+  padding: 11px 12px;
+  border-top: 1px solid var(--color-border);
+  background: #f6f8fa;
+}
+
+.plan-success-criteria strong {
+  font-size: 12px;
+}
+
+.plan-success-criteria ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--color-secondary-text);
+  font-size: 12px;
   line-height: 1.55;
 }
 
@@ -1205,6 +1307,22 @@ onBeforeUnmount(disposeWorkflowEventStream)
   line-height: 1.5;
 }
 
+.workflow-approval-gate.plan-review {
+  grid-template-columns: minmax(240px, 0.9fr) minmax(320px, 1.3fr) minmax(250px, auto);
+}
+
+.workflow-approval-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.workflow-approval-actions .el-button {
+  min-height: 40px;
+  margin-left: 0;
+}
+
 @media (max-width: 900px) {
   .workflow-approval-gate {
     grid-template-columns: 1fr;
@@ -1213,6 +1331,11 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .workflow-approval-gate .el-button {
     width: 100%;
     min-height: 44px;
+  }
+
+  .workflow-approval-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 
@@ -1248,6 +1371,14 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .orchestration-heading {
     flex-direction: column;
+  }
+
+  .orchestration-tags {
+    justify-content: flex-start;
+  }
+
+  .plan-success-criteria {
+    grid-template-columns: 1fr;
   }
 
   .orchestration-branch-row {
