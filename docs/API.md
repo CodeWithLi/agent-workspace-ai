@@ -84,8 +84,8 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 - `POST /workflow/run`
 - `GET /workflow?project_id=...`
 - `GET /workflow/{workflow_id}`
-- `GET /workflow/{workflow_id}/events/history`：按时间顺序读取最近 1-200 条持久化事件，用于页面刷新恢复。
-- `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限。
+- `GET /workflow/{workflow_id}/events/history`：按时间顺序读取最近 1-200 条持久化事件，用于页面刷新恢复；payload 只返回允许列表中的运行元数据。
+- `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限，错误、Prompt、Handoff 与人工反馈正文不会进入流。
 - `GET /workflow/{workflow_id}/saga-steps`：查看写工具执行快照、状态、补偿次数和人工介入原因。
 - `POST /workflow/{workflow_id}/pause`：使用唯一 `request_id` 和暂停原因请求安全暂停。排队运行立即进入 `PAUSED`；专业分支运行在当前拓扑波次检查点提交后暂停，其他节点在节点提交后暂停，相同请求幂等返回。
 - `POST /workflow/continue`：恢复计划审批、质量门禁、报告确认或操作员暂停。`plan_review` 必须提交 `decision=APPROVE|REVISE`，可用 `plan_version` 指定服务端保存的历史计划；`REVISE` 还必须附带 `human_feedback`，并以所选版本为基线从 Planner 重新执行。客户端不能提交或覆盖计划快照。操作员暂停必须提供恢复指令，该指令会持久化到结构化运行上下文并传递给后续 Agent。
@@ -99,7 +99,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 - `GET /traces/alerts?days=30&project_id=...&status=OPEN&severity=CRITICAL`：读取持久化告警、状态汇总和安全的异常信号元数据。
 - `POST /traces/alerts/bulk`：批量执行 `ACKNOWLEDGE` 或 `RESOLVE`；解决操作必须提供最长 500 字的 `resolution_note`。
 - `GET /traces/compare?baseline_id=...&candidate_id=...`：比较同一项目的两次已结束运行，返回运行结果、耗时、Token、成本、模型调用、Agent 和节点/分支聚合变化。
-- `GET /traces/{workflow_id}`：返回排队、节点、并行分支和人工等待 Span，以及模型调用、安全事件元数据和 `parent_workflow_id/retry_from_node/retry_sequence` 重试谱系。
+- `GET /traces/{workflow_id}`：返回排队、节点、并行分支和人工等待 Span，以及模型调用、安全事件元数据和 `parent_workflow_id/retry_from_node/retry_sequence` 重试谱系。节点和分支事件按 `workflow_attempt` 隔离 worker 尝试，失败尝试独立闭合，不会与后续成功重试误配。
 - `GET /knowledge/documents`
 - `POST /knowledge/upload`
 - `POST /knowledge/search`

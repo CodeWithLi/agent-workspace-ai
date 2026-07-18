@@ -684,6 +684,7 @@ function workflowEventLabel(eventType: string) {
     RECOVERED: '已恢复',
     NODE_STARTED: '开始节点',
     NODE_COMPLETED: '完成节点',
+    NODE_FAILED: '节点执行失败',
     PLAN_CREATED: '计划已生成',
     PLAN_APPROVED: '计划已批准',
     PLAN_REVISION_REQUESTED: '要求重新规划',

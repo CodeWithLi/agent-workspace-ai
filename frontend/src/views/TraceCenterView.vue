@@ -470,7 +470,10 @@ const roleLabels: Record<string, string> = {
 }
 const eventLabels: Record<string, string> = {
   QUEUED: '进入队列', STARTED: '开始运行', CONTINUED: '继续运行', NODE_STARTED: '节点开始',
-  NODE_COMPLETED: '节点完成', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
+  NODE_COMPLETED: '节点完成', NODE_FAILED: '节点失败',
+  WAVE_STARTED: '波次开始', WAVE_COMPLETED: '波次完成', WAVE_CHECKPOINTED: '波次已保存',
+  WAVE_RESTORED: '波次已恢复', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
+  BRANCH_FAILED: '分支失败', RETRY_SCHEDULED: '计划自动重试',
   RETRY_CREATED: '已创建重试运行', RETRY_QUEUED: '检查点重试入队',
   PAUSE_REQUESTED: '请求安全暂停', PAUSE_SKIPPED: '暂停未生效', INTERVENTION_APPLIED: '应用恢复指令',
   PLAN_CREATED: '计划已生成', PLAN_APPROVED: '计划已批准', PLAN_REVISION_REQUESTED: '要求重新规划',

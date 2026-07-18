@@ -306,6 +306,17 @@ async def process_workflow(db: Session, workflow_id: int, *, claimed: bool = Fal
         workflow = db.get(WorkflowRun, workflow_id)
         workflow.locked_at = None
         workflow.error = str(exc)[:2000]
+        record_workflow_event(
+            db,
+            workflow,
+            "NODE_FAILED",
+            f"Failed {workflow.current_node}",
+            node=workflow.current_node,
+            payload={
+                "workflow_attempt": workflow.attempt_count,
+                "error": workflow.error,
+            },
+        )
         if workflow.attempt_count < workflow.max_attempts:
             workflow.status = WorkflowStatus.queued
             workflow.lease_token = None
@@ -314,7 +325,10 @@ async def process_workflow(db: Session, workflow_id: int, *, claimed: bool = Fal
                 workflow,
                 "RETRY_SCHEDULED",
                 f"Workflow attempt {workflow.attempt_count} failed; retry scheduled",
-                payload={"error": workflow.error},
+                payload={
+                    "workflow_attempt": workflow.attempt_count,
+                    "error": workflow.error,
+                },
             )
         else:
             db.commit()

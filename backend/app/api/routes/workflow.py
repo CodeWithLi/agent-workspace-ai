@@ -20,6 +20,7 @@ from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, Workflow
 from app.services.billing import InsufficientTokensError, apply_token_change
 from app.services.workflows import finish_workflow_compensation, refund_workflow_charge
 from app.rag.service import DuplicateDocumentError, queue_document
+from app.workflow_events import public_workflow_event_payload
 
 
 router = APIRouter()
@@ -162,7 +163,7 @@ def to_event_response(event: WorkflowEvent) -> WorkflowEventResponse:
         node=event.node,
         event_type=event.event_type,
         message=event.message,
-        payload=payload if isinstance(payload, dict) else {},
+        payload=public_workflow_event_payload(payload) if isinstance(payload, dict) else {},
         created_at=event.created_at,
     )
 

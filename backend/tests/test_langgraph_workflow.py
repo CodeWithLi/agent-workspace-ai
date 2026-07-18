@@ -573,6 +573,24 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
     assert event_types.count("WAVE_RESTORED") == 1
     assert event_types.count("WAVE_CHECKPOINTED") == 1
     assert event_types.count("BRANCH_FAILED") == 1
+    node_events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(
+                WorkflowEvent.workflow_id == workflow.id,
+                WorkflowEvent.node == "specialists",
+                WorkflowEvent.event_type.in_({"NODE_STARTED", "NODE_COMPLETED", "NODE_FAILED"}),
+            )
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert [event.event_type for event in node_events] == [
+        "NODE_STARTED",
+        "NODE_FAILED",
+        "NODE_STARTED",
+        "NODE_COMPLETED",
+    ]
+    assert [json.loads(event.payload_json)["workflow_attempt"] for event in node_events] == [1, 1, 2, 2]
 
 
 @pytest.mark.asyncio

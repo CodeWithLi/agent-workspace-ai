@@ -50,11 +50,11 @@
 
 专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每波结束原子持久化当前执行轮次内的成功 Handoff 和消息；即使同波另一分支失败，成功结果仍会成为耐久检查点，worker 重试按角色和执行轮次恢复并只补跑缺失分支。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
 
-除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、质量分数和人工修订状态。计划和波次事件 payload 只保留版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、修订轮次、worker 尝试和反馈字符数，Handoff、错误与反馈正文不会进入追踪或审计详情。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
+除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、质量分数和人工修订状态。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、修订轮次、worker 尝试等运行元数据；Handoff、错误、Prompt、质量问题与人工反馈正文只保留在受控持久化边界，不会进入 SSE 或追踪响应。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
 
 ## 运行追踪与成本归属
 
-`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、`NODE_STARTED/NODE_COMPLETED` 节点、以角色、修订轮次和 `workflow_attempt` 配对的 `BRANCH_STARTED/BRANCH_COMPLETED|BRANCH_FAILED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。失败分支独立闭合为 `FAILED`，未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
+`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、按节点与 `workflow_attempt` 配对的 `NODE_STARTED/NODE_COMPLETED|NODE_FAILED` 节点、以角色、修订轮次和 `workflow_attempt` 配对的 `BRANCH_STARTED/BRANCH_COMPLETED|BRANCH_FAILED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。失败尝试独立闭合为 `FAILED`，不会吞掉后续成功重试；跨版本运行的旧开始事件可与带尝试号的完成事件回退配对。未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
 
 模型调用先按 `workflow_id` 关联，再使用 Agent 角色和调用完成时间归属到最具体的并行分支；无法匹配分支时才归属外层节点，因此同一调用不会在分支与父节点重复累计。运行详情分别展示总耗时、排队、Agent 计算、人工等待和剩余协调开销。汇总中的运行数、状态、Token、成本和趋势是数据库聚合；P95、Agent 性能与节点瓶颈为显式标记截断的最近样本分析。
 

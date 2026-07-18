@@ -57,6 +57,7 @@ from app.schemas import (
     TraceTrendPointOut,
     TraceWindowOut,
 )
+from app.workflow_events import public_workflow_event_payload
 
 
 RUN_ANALYSIS_LIMIT = 2_000
@@ -114,32 +115,6 @@ ROLE_LABELS = {
     "operations_analyst": "AI运营分析师",
 }
 
-PUBLIC_EVENT_PAYLOAD_FIELDS = {
-    "approval_required",
-    "approval_gate",
-    "branch_count",
-    "completed_count",
-    "decision",
-    "dependency_count",
-    "depends_on",
-    "failed_count",
-    "next_node",
-    "output_chars",
-    "plan_version",
-    "revision_roles",
-    "revision_round",
-    "revision_count",
-    "role",
-    "roles",
-    "score",
-    "success_criteria_count",
-    "source_plan_version",
-    "wave",
-    "wave_count",
-    "workflow_attempt",
-}
-
-
 @dataclass
 class _SpanDraft:
     span_id: str
@@ -188,11 +163,7 @@ def _payload(event: WorkflowEvent) -> dict[str, Any]:
 
 
 def _public_payload(event: WorkflowEvent) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in _payload(event).items()
-        if key in PUBLIC_EVENT_PAYLOAD_FIELDS
-    }
+    return public_workflow_event_payload(_payload(event))
 
 
 def _status_value(value: WorkflowStatus | str) -> str:
@@ -272,7 +243,7 @@ def _pair_event_spans(
 ) -> list[_SpanDraft]:
     spans: list[_SpanDraft] = []
     node_attempts: dict[str, int] = defaultdict(int)
-    open_nodes: dict[str, deque[tuple[WorkflowEvent, int]]] = defaultdict(deque)
+    open_nodes: dict[tuple[str, int], deque[tuple[WorkflowEvent, int]]] = defaultdict(deque)
     open_branches: dict[tuple[str, int, int], deque[WorkflowEvent]] = defaultdict(deque)
     open_pause: WorkflowEvent | None = None
 
@@ -300,24 +271,32 @@ def _pair_event_spans(
         payload = _payload(event)
         if event.event_type == "NODE_STARTED":
             node_attempts[event.node] += 1
-            open_nodes[event.node].append((event, node_attempts[event.node]))
-        elif event.event_type == "NODE_COMPLETED" and open_nodes[event.node]:
-            started, attempt = open_nodes[event.node].popleft()
-            spans.append(
-                _SpanDraft(
-                    span_id=f"node-{started.id}",
-                    kind="node",
-                    node=event.node,
-                    label=NODE_LABELS.get(event.node, event.node or "工作流节点"),
-                    agent_role=NODE_AGENT_ROLES.get(event.node, ""),
-                    status="COMPLETED",
-                    attempt=attempt,
-                    started_at=started.created_at,
-                    finished_at=event.created_at,
-                    duration_ms=_duration_ms(started.created_at, event.created_at),
-                    payload=_public_payload(event),
+            workflow_attempt = int(payload.get("workflow_attempt") or 0)
+            open_nodes[(event.node, workflow_attempt)].append((event, node_attempts[event.node]))
+        elif event.event_type in {"NODE_COMPLETED", "NODE_FAILED"}:
+            workflow_attempt = int(payload.get("workflow_attempt") or 0)
+            key = (event.node, workflow_attempt)
+            if workflow_attempt and not open_nodes.get(key):
+                legacy_key = (event.node, 0)
+                if open_nodes.get(legacy_key):
+                    key = legacy_key
+            if open_nodes.get(key):
+                started, attempt = open_nodes[key].popleft()
+                spans.append(
+                    _SpanDraft(
+                        span_id=f"node-{started.id}",
+                        kind="node",
+                        node=event.node,
+                        label=NODE_LABELS.get(event.node, event.node or "工作流节点"),
+                        agent_role=NODE_AGENT_ROLES.get(event.node, ""),
+                        status="FAILED" if event.event_type == "NODE_FAILED" else "COMPLETED",
+                        attempt=attempt,
+                        started_at=started.created_at,
+                        finished_at=event.created_at,
+                        duration_ms=_duration_ms(started.created_at, event.created_at),
+                        payload=_public_payload(event),
+                    )
                 )
-            )
         elif event.event_type == "BRANCH_STARTED":
             role = str(payload.get("role") or "specialist")
             revision_round = int(payload.get("revision_round") or 0)
@@ -374,7 +353,7 @@ def _pair_event_spans(
 
     open_end = workflow.finished_at or now
     open_status = _span_terminal_status(workflow)
-    for node, started_events in open_nodes.items():
+    for (node, _workflow_attempt), started_events in open_nodes.items():
         while started_events:
             started, attempt = started_events.popleft()
             spans.append(

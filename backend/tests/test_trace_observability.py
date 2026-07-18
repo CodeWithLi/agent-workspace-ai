@@ -823,6 +823,66 @@ def test_trace_detail_closes_failed_branch_attempts_independently(db: Session) -
     assert "secret provider failure" not in detail.model_dump_json()
 
 
+def test_trace_detail_pairs_node_retries_and_legacy_starts_by_workflow_attempt(db: Session) -> None:
+    data = _seed_trace_data(db)
+    workflow = data["completed"]
+    base = workflow.started_at + timedelta(minutes=2)
+    db.add_all(
+        [
+            _event(
+                workflow,
+                "NODE_STARTED",
+                base,
+                node="quality_gate",
+                payload={"workflow_attempt": 1},
+            ),
+            _event(
+                workflow,
+                "NODE_FAILED",
+                base + timedelta(seconds=10),
+                node="quality_gate",
+                payload={"workflow_attempt": 1, "error": "secret quality failure"},
+            ),
+            _event(
+                workflow,
+                "NODE_STARTED",
+                base + timedelta(seconds=30),
+                node="quality_gate",
+                payload={"workflow_attempt": 2},
+            ),
+            _event(
+                workflow,
+                "NODE_COMPLETED",
+                base + timedelta(seconds=50),
+                node="quality_gate",
+                payload={"workflow_attempt": 2, "next_node": "project_manager"},
+            ),
+            _event(workflow, "NODE_STARTED", base + timedelta(minutes=1), node="tester"),
+            _event(
+                workflow,
+                "NODE_COMPLETED",
+                base + timedelta(minutes=1, seconds=15),
+                node="tester",
+                payload={"workflow_attempt": 3, "next_node": "report"},
+            ),
+        ]
+    )
+    db.commit()
+
+    detail = get_trace_detail(db, data["alice"], workflow.id)
+    quality_spans = [span for span in detail.spans if span.node == "quality_gate"]
+    assert [(span.status, span.duration_ms) for span in quality_spans] == [
+        ("FAILED", 10_000),
+        ("COMPLETED", 20_000),
+    ]
+    assert [span.payload["workflow_attempt"] for span in quality_spans] == [1, 2]
+    tester_span = next(span for span in detail.spans if span.node == "tester")
+    assert tester_span.status == "COMPLETED"
+    assert tester_span.duration_ms == 15_000
+    assert tester_span.payload["workflow_attempt"] == 3
+    assert "secret quality failure" not in detail.model_dump_json()
+
+
 def test_trace_detail_is_tenant_scoped_while_admin_can_inspect_all(db: Session) -> None:
     data = _seed_trace_data(db)
 

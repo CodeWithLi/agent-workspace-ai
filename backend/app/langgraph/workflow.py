@@ -226,7 +226,14 @@ def begin_node(
         raise WorkflowPauseRequested("Workflow pause requested")
     locked.current_node = node
     locked.locked_at = datetime.now(timezone.utc)
-    record_workflow_event(db, locked, "NODE_STARTED", f"Started {node}", node=node)
+    record_workflow_event(
+        db,
+        locked,
+        "NODE_STARTED",
+        f"Started {node}",
+        node=node,
+        payload={"workflow_attempt": locked.attempt_count},
+    )
     db.commit()
 
 
@@ -251,7 +258,10 @@ def complete_node(
         "NODE_COMPLETED",
         f"Completed {node}",
         node=node,
-        payload={"next_node": workflow.current_node},
+        payload={
+            "next_node": locked.current_node,
+            "workflow_attempt": locked.attempt_count,
+        },
     )
     db.commit()
     if locked.pause_requested_at is not None and locked.current_node != "completed":
