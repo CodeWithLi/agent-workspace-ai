@@ -269,7 +269,7 @@
         <template v-else>
           <el-table :data="overview.recent_runs" class="trace-table desktop-table" table-layout="fixed" row-key="workflow_id">
             <el-table-column label="运行" width="100">
-              <template #default="{ row }"><button class="trace-link" @click="openTrace(row.workflow_id)">#{{ row.workflow_id }}</button></template>
+              <template #default="{ row }"><div class="run-id-cell"><button class="trace-link" @click="openTrace(row.workflow_id)">#{{ row.workflow_id }}</button><small v-if="row.retry_sequence">重试 #{{ row.retry_sequence }}</small></div></template>
             </el-table-column>
             <el-table-column label="项目 / 发起人" min-width="190">
               <template #default="{ row }"><div class="node-cell"><strong>{{ row.project_name }}</strong><small>{{ row.owner_name }}</small></div></template>
@@ -296,7 +296,7 @@
           <div class="mobile-card-list" aria-label="最近运行列表">
             <article v-for="run in overview.recent_runs" :key="run.workflow_id" class="mobile-data-card run-card">
               <button class="run-card-button" @click="openTrace(run.workflow_id)">
-                <span><strong :title="`#${run.workflow_id} · ${run.project_name}`">#{{ run.workflow_id }} · {{ run.project_name }}</strong><small>{{ run.owner_name }} · {{ formatDateTime(run.created_at) }}</small></span>
+                <span><strong :title="`#${run.workflow_id} · ${run.project_name}`">#{{ run.workflow_id }} · {{ run.project_name }}</strong><small>{{ run.owner_name }} · {{ formatDateTime(run.created_at) }}<template v-if="run.retry_sequence"> · 重试 #{{ run.retry_sequence }}</template></small></span>
                 <el-tag :type="statusTagType(run.status)" effect="plain">{{ statusLabel(run.status) }}</el-tag>
               </button>
               <dl>
@@ -332,6 +332,22 @@
         <el-button @click="selectedRunId && loadDetail(selectedRunId)">重试</el-button>
       </div>
       <div v-else-if="detail" class="trace-detail">
+        <div v-if="detail.run.retry_sequence" class="trace-retry-lineage" role="status">
+          <el-icon aria-hidden="true"><Refresh /></el-icon>
+          <div>
+            <strong>检查点重试 #{{ detail.run.retry_sequence }}</strong>
+            <span v-if="detail.run.parent_workflow_id">来源运行 #{{ detail.run.parent_workflow_id }} · {{ nodeLabel(detail.run.retry_from_node) }}检查点</span>
+            <span v-else>来源运行已删除 · {{ nodeLabel(detail.run.retry_from_node) }}检查点</span>
+          </div>
+          <el-button
+            v-if="detail.run.parent_workflow_id"
+            link
+            type="primary"
+            :icon="View"
+            :aria-label="`查看来源运行 #${detail.run.parent_workflow_id}`"
+            @click="openTrace(detail.run.parent_workflow_id)"
+          >查看来源运行</el-button>
+        </div>
         <div class="detail-metrics" aria-label="运行耗时分解">
           <div><span>总耗时</span><strong>{{ formatDuration(detail.metrics.total_duration_ms) }}</strong></div>
           <div><span>排队</span><strong>{{ formatDuration(detail.metrics.queue_ms) }}</strong></div>
@@ -455,6 +471,7 @@ const roleLabels: Record<string, string> = {
 const eventLabels: Record<string, string> = {
   QUEUED: '进入队列', STARTED: '开始运行', CONTINUED: '继续运行', NODE_STARTED: '节点开始',
   NODE_COMPLETED: '节点完成', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
+  RETRY_CREATED: '已创建重试运行', RETRY_QUEUED: '检查点重试入队',
   PLAN_CREATED: '计划已生成', QUALITY_GATE_PASSED: '质量门禁通过',
   QUALITY_GATE_FAILED: '质量门禁未通过', REVISION_REQUESTED: '请求修订', PAUSED: '等待人工确认',
   CANCEL_REQUESTED: '请求取消', CANCELLED: '已取消', COMPLETED: '运行完成', FAILED: '运行失败'
@@ -895,10 +912,16 @@ onBeforeUnmount(() => {
 .number-cell, .date-cell { font-variant-numeric: tabular-nums; }.date-cell { color: var(--color-secondary-text); font-size: 12px; }
 .share-cell { display: grid; grid-template-columns: minmax(70px, 1fr) 46px; align-items: center; gap: 10px; }.share-cell strong { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
 .trace-link { min-width: 44px; min-height: 40px; padding: 0; border: 0; background: transparent; color: var(--color-primary); font: inherit; font-weight: 750; text-align: left; cursor: pointer; }.trace-link:hover { text-decoration: underline; }
+.run-id-cell { display: grid; justify-items: start; gap: 1px; }.run-id-cell small { color: var(--color-muted-text); font-size: 11px; line-height: 1.3; }
 .mobile-card-list { display: none; }
 .drawer-head { position: sticky; z-index: 2; top: 0; display: flex; min-height: 76px; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 20px; border-bottom: 1px solid var(--color-border); background: rgba(255, 255, 255, .98); }
 .drawer-head > div, .drawer-head > div > div { min-width: 0; }.drawer-head > div { flex: 1 1 auto; }.drawer-head > div > span { color: var(--color-muted-text); font-size: 11px; }.drawer-head > div > div { display: flex; align-items: center; gap: 10px; }.drawer-head h2 { min-width: 0; max-width: 650px; flex: 1 1 auto; margin: 4px 0 0; overflow: hidden; font-size: 19px; text-overflow: ellipsis; white-space: nowrap; }.drawer-head .el-tag { flex: 0 0 auto; }
 .drawer-head > .el-button { width: 40px; min-width: 40px; height: 40px; flex: 0 0 40px; }.drawer-loading, .trace-detail { padding: 20px; }
+.trace-retry-lineage { display: flex; min-height: 44px; align-items: center; gap: 10px; margin-bottom: 20px; padding: 10px 12px; border-left: 3px solid var(--color-primary); background: var(--color-primary-soft); color: var(--color-secondary-text); }
+.trace-retry-lineage > .el-icon { flex: 0 0 auto; color: var(--color-primary); font-size: 18px; }
+.trace-retry-lineage > div { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.trace-retry-lineage strong { color: var(--color-foreground); font-size: 13px; }
+.trace-retry-lineage span { overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }
 .detail-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-border); gap: 1px; }
 .detail-metrics > div { min-width: 0; padding: 12px; background: var(--color-surface); }.detail-metrics span, .detail-metrics strong { display: block; }.detail-metrics span { color: var(--color-muted-text); font-size: 11px; }.detail-metrics strong { margin-top: 4px; overflow: hidden; font-size: 15px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .detail-section { min-width: 0; margin-top: 28px; }.span-list { border-top: 1px solid var(--color-border); }
@@ -918,6 +941,8 @@ onBeforeUnmount(() => {
   .trace-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto 44px; }.window-switch { grid-column: 1 / -1; }.trace-toolbar > .el-select { width: 100%; }.trace-toolbar > .el-button { width: 44px; height: 44px; }.trace-toolbar > .compare-command { width: auto; min-width: 112px; }.metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.metric-card:last-child { grid-column: 1 / -1; }.section-head { align-items: flex-start; }.desktop-table { display: none; }.mobile-card-list { display: grid; gap: 10px; }.mobile-data-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }.mobile-card-head { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 12px; }.mobile-card-head > strong { flex: 0 0 auto; font-variant-numeric: tabular-nums; }.mobile-data-card > p { overflow: hidden; margin: 9px 0; color: var(--color-muted-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.mobile-data-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--color-border); }.mobile-data-card dt { color: var(--color-muted-text); font-size: 10px; }.mobile-data-card dd { margin: 3px 0 0; overflow: hidden; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }.run-card-button { display: flex; width: 100%; min-height: 44px; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }.run-card-button > span { min-width: 0; }.run-card-button strong, .run-card-button small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.run-card-button small { margin-top: 3px; color: var(--color-muted-text); font-size: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) minmax(120px, .7fr); padding: 10px 0; }.span-track { grid-column: 1 / -1; grid-row: 2; }.detail-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 520px) {
+  .trace-retry-lineage { align-items: flex-start; flex-wrap: wrap; }
+  .trace-retry-lineage .el-button { width: 100%; min-height: 44px; }
   .trace-head { margin-bottom: 18px; }.trace-head h1 { font-size: 24px; }.trace-toolbar { grid-template-columns: minmax(0, 1fr) 44px; }.window-switch { display: flex; width: 100%; }.window-switch :deep(.el-radio-button) { flex: 1; }.window-switch :deep(.el-radio-button__inner) { width: 100%; min-height: 44px; padding: 12px 8px; }.trace-toolbar > .project-filter { grid-column: 1; grid-row: 2; }.trace-toolbar > .status-filter { grid-column: 1 / -1; grid-row: 3; }.trace-toolbar > .refresh-command { grid-column: 2; grid-row: 2; }.trace-toolbar > .compare-command { grid-column: 1 / -1; grid-row: 4; width: 100%; min-height: 44px; }.metric-grid { gap: 8px; }.metric-card { min-height: 104px; padding: 13px; }.metric-card strong { overflow: visible; font-size: 21px; white-space: normal; }.metric-card small { white-space: normal; }.status-strip { gap: 8px 14px; }.trace-section { padding: 20px 0; }.section-head { flex-direction: column; }.chart-legend { justify-content: flex-start; }.trend-chart { height: 250px; }.drawer-head { min-height: 70px; padding: 12px 14px; }.drawer-head h2 { max-width: none; font-size: 16px; }.drawer-head > .el-button { width: 44px; min-width: 44px; height: 44px; flex-basis: 44px; }.drawer-loading, .trace-detail { padding: 14px; }.detail-metrics > div { padding: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) 110px; gap: 9px; }.span-copy { grid-template-columns: 46px minmax(0, 1fr); }.span-kind { font-size: 9px; }.span-numbers small { display: none; }.event-list li { grid-template-columns: 58px 12px minmax(0, 1fr); gap: 7px; }
 }
 @media (prefers-reduced-motion: reduce) { .span-bar { transition: none; } }

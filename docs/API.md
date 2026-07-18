@@ -71,7 +71,7 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限。
 - `GET /workflow/{workflow_id}/saga-steps`：查看写工具执行快照、状态、补偿次数和人工介入原因。
 - `POST /workflow/{workflow_id}/cancel`
-- `POST /workflow/{workflow_id}/retry`：终态失败后重新扣费并入队。
+- `POST /workflow/{workflow_id}/retry`：仅接受 `FAILED` 源运行和唯一 `request_id`；源运行保持只读，接口独立扣费并从失败检查点创建新的 `QUEUED` 子运行。相同源运行与 `request_id` 返回同一子运行，项目存在其他活动运行时返回 `409`。
 - `POST /workflow/{workflow_id}/retry-compensation`：仅用于 `COMPENSATION_FAILED`，人工核对业务数据后重试确定性补偿。
 - `POST /workflow/{workflow_id}/publish`：将指定工作流产物发布为报告或项目知识文档。
 - `GET /traces/overview?days=7&project_id=...&status=...`：汇总运行状态、端到端时延、Token、预估成本、每日趋势、Agent 性能、节点瓶颈和最近运行；`days` 为 1-90。
@@ -80,7 +80,7 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `GET /traces/alerts?days=30&project_id=...&status=OPEN&severity=CRITICAL`：读取持久化告警、状态汇总和安全的异常信号元数据。
 - `POST /traces/alerts/bulk`：批量执行 `ACKNOWLEDGE` 或 `RESOLVE`；解决操作必须提供最长 500 字的 `resolution_note`。
 - `GET /traces/compare?baseline_id=...&candidate_id=...`：比较同一项目的两次已结束运行，返回运行结果、耗时、Token、成本、模型调用、Agent 和节点/分支聚合变化。
-- `GET /traces/{workflow_id}`：返回排队、节点、并行分支和人工等待 Span，以及模型调用和安全事件元数据。
+- `GET /traces/{workflow_id}`：返回排队、节点、并行分支和人工等待 Span，以及模型调用、安全事件元数据和 `parent_workflow_id/retry_from_node/retry_sequence` 重试谱系。
 - `GET /knowledge/documents`
 - `POST /knowledge/upload`
 - `POST /knowledge/search`

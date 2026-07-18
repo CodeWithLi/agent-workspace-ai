@@ -74,6 +74,21 @@
       </div>
       <el-tag :type="workflowTagType">{{ workflowStatusLabel }}</el-tag>
       <p v-if="workflowError" class="workflow-error">{{ workflowError }}</p>
+      <div v-if="workflowRetrySequence > 0" class="workflow-retry-lineage" role="status">
+        <el-icon aria-hidden="true"><RefreshRight /></el-icon>
+        <div>
+          <strong>检查点重试 #{{ workflowRetrySequence }}</strong>
+          <span v-if="workflowParentId">从运行 #{{ workflowParentId }} 的“{{ workflowStageLabel(workflowRetryFromNode) }}”检查点继续，源运行保持只读。</span>
+          <span v-else>从“{{ workflowStageLabel(workflowRetryFromNode) }}”检查点继续，来源运行已不再保留。</span>
+        </div>
+        <el-button
+          v-if="workflowParentId"
+          link
+          type="primary"
+          :icon="View"
+          @click="openSourceWorkflow"
+        >查看源运行</el-button>
+      </div>
       <div
         v-if="workflowConnectionNotice"
         class="workflow-connection-notice"
@@ -212,13 +227,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight } from '@element-plus/icons-vue'
+import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight, View } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
 import { useAuthStore } from '../stores/auth'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
+import 'element-plus/es/components/message-box/style/css.mjs'
 import axios from 'axios'
 import { confirmDestructiveAction } from '../utils/confirm'
 import { useWorkflowEventStream } from '../composables/useWorkflowEventStream'
@@ -258,6 +275,9 @@ const tasks = ref<Task[]>([])
 const agents = ref<Agent[]>([])
 const workflowState = ref<Record<string, any> | null>(null)
 const workflowId = ref<number | null>(null)
+const workflowParentId = ref<number | null>(null)
+const workflowRetryFromNode = ref('')
+const workflowRetrySequence = ref(0)
 const workflowStatus = ref('')
 const workflowCurrentNode = ref('')
 const workflowError = ref('')
@@ -422,6 +442,8 @@ function workflowEventLabel(eventType: string) {
     QUALITY_GATE_FAILED: '质量门禁未通过',
     REVISION_REQUESTED: '请求自动修订',
     RETRY_SCHEDULED: '自动重试',
+    RETRY_CREATED: '已创建重试运行',
+    RETRY_QUEUED: '检查点重试入队',
     SAGA_STEP_COMPLETED: '写操作已提交',
     COMPENSATION_STARTED: '开始事务回滚',
     SAGA_STEP_COMPENSATED: '写操作已回滚',
@@ -501,11 +523,19 @@ function applyWorkflow(workflow: WorkflowRun) {
     && workflowStatus.value !== workflow.status
   if (workflowCurrentNode.value !== workflow.current_node) workflowFeedback.value = ''
   workflowId.value = workflow.workflow_id
+  workflowParentId.value = workflow.parent_workflow_id
+  workflowRetryFromNode.value = workflow.retry_from_node
+  workflowRetrySequence.value = workflow.retry_sequence
   workflowStatus.value = workflow.status
   workflowCurrentNode.value = workflow.current_node
   workflowState.value = workflow.state
   workflowError.value = workflow.error
   if (enteredTerminalState) workflowRequestId.value = crypto.randomUUID()
+}
+
+function openSourceWorkflow() {
+  if (!workflowParentId.value) return
+  void router.push({ path: '/traces', query: { run: String(workflowParentId.value) } })
 }
 
 async function refreshWorkflow() {
@@ -688,15 +718,32 @@ async function cancelWorkflow() {
 
 async function retryWorkflow() {
   if (!workflowId.value) return
+  const sourceWorkflowId = workflowId.value
+  try {
+    await ElMessageBox.confirm(
+      `失败运行 #${sourceWorkflowId} 将保持只读，并从“${workflowStageLabel(workflowCurrentNode.value)}”检查点创建一条新运行。`,
+      '创建检查点重试',
+      {
+        type: 'warning',
+        confirmButtonText: '创建重试运行',
+        cancelButtonText: '取消'
+      }
+    )
+  } catch {
+    return
+  }
   workflowActionBusy.value = true
   try {
-    const { data } = await api.post<WorkflowRun>(`/workflow/${workflowId.value}/retry`, {
+    const { data } = await api.post<WorkflowRun>(`/workflow/${sourceWorkflowId}/retry`, {
       request_id: crypto.randomUUID()
     })
     applyWorkflow(data)
+    workflowSagaSteps.value = []
+    await refreshWorkflowSagaSteps()
     const cursor = await loadWorkflowEventHistory(data.workflow_id)
     watchWorkflowEvents(cursor)
     await auth.fetchMe()
+    ElMessage.success(`已创建检查点重试运行 #${data.workflow_id}`)
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.status === 402) await router.push('/wallet')
     else throw error
@@ -797,6 +844,42 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
 .workflow-connection-notice .el-button {
   margin-left: auto;
+}
+
+.workflow-retry-lineage {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-primary-soft);
+  color: var(--color-secondary-text);
+}
+
+.workflow-retry-lineage > .el-icon {
+  flex: 0 0 auto;
+  color: var(--color-primary);
+  font-size: 18px;
+}
+
+.workflow-retry-lineage > div {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+
+.workflow-retry-lineage strong {
+  color: var(--color-foreground);
+  font-size: 13px;
+}
+
+.workflow-retry-lineage span {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .workflow-orchestration {
@@ -972,6 +1055,16 @@ onBeforeUnmount(disposeWorkflowEventStream)
 }
 
 @media (max-width: 640px) {
+  .workflow-retry-lineage {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .workflow-retry-lineage .el-button {
+    width: 100%;
+    min-height: 44px;
+  }
+
   .workflow-connection-notice {
     align-items: flex-start;
     flex-wrap: wrap;

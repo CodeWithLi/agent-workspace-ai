@@ -417,6 +417,9 @@ class WorkflowRetryRequest(BaseModel):
 class WorkflowResponse(BaseModel):
     workflow_id: int
     project_id: int
+    parent_workflow_id: int | None
+    retry_from_node: str
+    retry_sequence: int
     status: WorkflowStatus
     current_node: str
     state: dict[str, Any]
@@ -565,6 +568,9 @@ class TraceBottleneckOut(BaseModel):
 class TraceRunOut(BaseModel):
     workflow_id: int
     project_id: int
+    parent_workflow_id: int | None
+    retry_from_node: str
+    retry_sequence: int
     project_name: str
     owner_id: int
     owner_name: str

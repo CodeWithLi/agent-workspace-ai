@@ -68,6 +68,9 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
         statements.append("ALTER TABLE workflow_runs ADD COLUMN request_id VARCHAR(64)")
         statements.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_workflow_runs_request_id ON workflow_runs(request_id)")
     workflow_additions = {
+        "parent_workflow_id": "INTEGER REFERENCES workflow_runs(id) ON DELETE SET NULL",
+        "retry_from_node": "VARCHAR(100) DEFAULT ''",
+        "retry_sequence": "INTEGER DEFAULT 0",
         "billing_transaction_id": "INTEGER REFERENCES token_transactions(id) ON DELETE SET NULL",
         "pause_before_report": "BOOLEAN DEFAULT true",
         "attempt_count": "INTEGER DEFAULT 0",
@@ -81,6 +84,11 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     for name, definition in workflow_additions.items():
         if "workflow_runs" in tables and name not in workflow_columns:
             statements.append(f"ALTER TABLE workflow_runs ADD COLUMN {name} {definition}")
+    if "workflow_runs" in tables and "parent_workflow_id" not in workflow_columns:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_runs_parent_workflow_id "
+            "ON workflow_runs(parent_workflow_id)"
+        )
 
     notification_columns = columns("notifications")
     notification_additions = {

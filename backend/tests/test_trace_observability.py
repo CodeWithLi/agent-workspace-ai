@@ -771,6 +771,32 @@ def test_trace_detail_is_tenant_scoped_while_admin_can_inspect_all(db: Session) 
     assert get_trace_detail(db, data["admin"], data["failed"].id).run.owner_name == "Bob"
 
 
+def test_trace_detail_exposes_immutable_retry_lineage(db: Session) -> None:
+    data = _seed_trace_data(db)
+    child = WorkflowRun(
+        project_id=data["completed"].project_id,
+        user_id=data["alice"].id,
+        parent_workflow_id=data["completed"].id,
+        retry_from_node="architect",
+        retry_sequence=2,
+        status=WorkflowStatus.failed,
+        current_node="architect",
+        state_json="{}",
+        error="retry failed",
+        created_at=NOW - timedelta(minutes=3),
+        finished_at=NOW - timedelta(minutes=1),
+    )
+    db.add(child)
+    db.commit()
+
+    detail = get_trace_detail(db, data["alice"], child.id)
+
+    assert detail.run.parent_workflow_id == data["completed"].id
+    assert detail.run.retry_from_node == "architect"
+    assert detail.run.retry_sequence == 2
+    assert f'"parent_workflow_id":{data["completed"].id}' in detail.model_dump_json()
+
+
 def test_trace_detail_revalidates_project_membership(db: Session) -> None:
     data = _seed_trace_data(db)
     member = User(

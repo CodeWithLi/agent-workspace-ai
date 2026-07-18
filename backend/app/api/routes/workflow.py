@@ -15,7 +15,7 @@ from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import SessionLocal, get_db
 from app.langgraph.workflow import initial_state, record_workflow_event, snapshot_agent_configs
-from app.models import Project, Report, TokenTransaction, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
+from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
 from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
 from app.services.billing import InsufficientTokensError, apply_token_change
 from app.services.workflows import finish_workflow_compensation, refund_workflow_charge
@@ -33,6 +33,36 @@ ACTIVE_STATUSES = {
     WorkflowStatus.compensation_failed,
     WorkflowStatus.paused,
 }
+WORKFLOW_NODE_ORDER = {
+    "requirement": 0,
+    "product": 1,
+    "architect": 2,
+    "planning": 3,
+    "specialists": 4,
+    "quality_gate": 5,
+    "quality_review": 6,
+    "project_manager": 7,
+    "tester": 8,
+    "report": 9,
+    "completed": 10,
+}
+RETRY_CHECKPOINT_OUTPUTS = {
+    "project_manager": {
+        "state_defaults": {"tasks": [], "tests": {}, "report": ""},
+        "document_types": {"PROJECT_PLAN", "TEST_PLAN", "FINAL_REPORT"},
+        "message_roles": {"project_manager_agent", "tester_agent", "report_generator"},
+    },
+    "tester": {
+        "state_defaults": {"tests": {}, "report": ""},
+        "document_types": {"TEST_PLAN", "FINAL_REPORT"},
+        "message_roles": {"tester_agent", "report_generator"},
+    },
+    "report": {
+        "state_defaults": {"report": ""},
+        "document_types": {"FINAL_REPORT"},
+        "message_roles": {"report_generator"},
+    },
+}
 
 
 def utc_now() -> datetime:
@@ -45,6 +75,9 @@ def to_response(workflow: WorkflowRun) -> WorkflowResponse:
     return WorkflowResponse(
         workflow_id=workflow.id,
         project_id=workflow.project_id,
+        parent_workflow_id=workflow.parent_workflow_id,
+        retry_from_node=workflow.retry_from_node,
+        retry_sequence=workflow.retry_sequence,
         status=workflow.status,
         current_node=workflow.current_node,
         state=state,
@@ -56,6 +89,50 @@ def to_response(workflow: WorkflowRun) -> WorkflowResponse:
         started_at=workflow.started_at,
         finished_at=workflow.finished_at,
     )
+
+
+def retry_checkpoint_state(db: Session, workflow: WorkflowRun) -> dict:
+    try:
+        state = json.loads(workflow.state_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+
+    latest_started_node = db.scalar(
+        select(WorkflowEvent.node)
+        .where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "NODE_STARTED",
+        )
+        .order_by(WorkflowEvent.id.desc())
+        .limit(1)
+    )
+    retry_index = WORKFLOW_NODE_ORDER.get(workflow.current_node)
+    started_index = WORKFLOW_NODE_ORDER.get(latest_started_node or "")
+    if retry_index is None or started_index is None or started_index <= retry_index:
+        return state
+
+    cleanup = RETRY_CHECKPOINT_OUTPUTS.get(workflow.current_node)
+    if not cleanup:
+        return state
+    for key, default in cleanup["state_defaults"].items():
+        state[key] = default
+    documents = state.get("documents")
+    if isinstance(documents, list):
+        state["documents"] = [
+            item
+            for item in documents
+            if not isinstance(item, dict) or item.get("type") not in cleanup["document_types"]
+        ]
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        state["messages"] = [
+            item
+            for item in messages
+            if not isinstance(item, dict) or item.get("role") not in cleanup["message_roles"]
+        ]
+    return state
 
 
 def get_owned_workflow(workflow_id: int, current_user: User, db: Session, *, write: bool = False) -> WorkflowRun:
@@ -421,16 +498,37 @@ def retry_workflow(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> WorkflowResponse:
-    workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.id == workflow_id).with_for_update())
-    if not workflow or workflow.user_id != current_user.id:
+    source = db.get(WorkflowRun, workflow_id)
+    if not source or source.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
-    get_project_for_user(workflow.project_id, current_user, db, write=True)
-    idempotency_key = f"workflow-retry:{current_user.id}:{workflow.id}:{payload.request_id}"
-    current_charge = db.get(TokenTransaction, workflow.billing_transaction_id) if workflow.billing_transaction_id else None
-    if workflow.status == WorkflowStatus.queued and current_charge and current_charge.idempotency_key == idempotency_key:
-        return to_response(workflow)
-    if workflow.status != WorkflowStatus.failed:
+    get_project_for_user(source.project_id, current_user, db, write=True)
+    db.scalar(select(Project).where(Project.id == source.project_id).with_for_update())
+
+    existing = db.scalar(select(WorkflowRun).where(WorkflowRun.request_id == payload.request_id))
+    if existing:
+        if existing.user_id == current_user.id and existing.parent_workflow_id == source.id:
+            return to_response(existing)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Workflow retry request ID is already in use",
+        )
+
+    source = db.scalar(select(WorkflowRun).where(WorkflowRun.id == workflow_id).with_for_update())
+    if not source or source.status != WorkflowStatus.failed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only failed workflows can be retried")
+    active = db.scalar(
+        select(WorkflowRun).where(
+            WorkflowRun.project_id == source.project_id,
+            WorkflowRun.status.in_(ACTIVE_STATUSES),
+        )
+    )
+    if active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Project already has an active workflow: {active.id}",
+        )
+
+    idempotency_key = f"workflow-retry:{current_user.id}:{source.id}:{payload.request_id}"
     try:
         billing = apply_token_change(
             db,
@@ -439,32 +537,72 @@ def retry_workflow(
             "CONSUME",
             idempotency_key=idempotency_key,
             reference_type="workflow",
-            reference_id=workflow.request_id or str(workflow.id),
+            reference_id=payload.request_id,
             description="重试多 Agent 项目工作流",
         )
     except InsufficientTokensError as exc:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc)) from exc
-    workflow.billing_transaction_id = billing.id
-    workflow.status = WorkflowStatus.queued
-    workflow.attempt_count = 0
-    workflow.error = ""
-    workflow.finished_at = None
-    workflow.cancel_requested_at = None
-    record_workflow_event(db, workflow, "QUEUED", "Failed workflow queued for retry")
+
+    child = WorkflowRun(
+        project_id=source.project_id,
+        user_id=source.user_id,
+        parent_workflow_id=source.id,
+        retry_from_node=source.current_node,
+        retry_sequence=source.retry_sequence + 1,
+        status=WorkflowStatus.queued,
+        current_node=source.current_node,
+        state_json=json.dumps(retry_checkpoint_state(db, source), ensure_ascii=False),
+        human_feedback=source.human_feedback,
+        request_id=payload.request_id,
+        billing_transaction_id=billing.id,
+        pause_before_report=source.pause_before_report,
+        attempt_count=0,
+        max_attempts=source.max_attempts,
+    )
+    db.add(child)
+    db.flush()
+    record_workflow_event(
+        db,
+        source,
+        "RETRY_CREATED",
+        "Checkpoint retry created as a new workflow run",
+        payload={
+            "retry_workflow_id": child.id,
+            "retry_from_node": child.retry_from_node,
+            "retry_sequence": child.retry_sequence,
+        },
+    )
+    record_workflow_event(
+        db,
+        child,
+        "RETRY_QUEUED",
+        "Workflow queued from an immutable failed run",
+        payload={
+            "parent_workflow_id": source.id,
+            "retry_from_node": child.retry_from_node,
+            "retry_sequence": child.retry_sequence,
+        },
+    )
+    record_workflow_event(db, child, "QUEUED", "Checkpoint retry queued")
     record_audit(
         db,
         "workflow.retry",
         current_user.id,
-        workflow.project_id,
+        child.project_id,
         "workflow",
-        workflow.id,
-        {"request_id": payload.request_id},
+        child.id,
+        {
+            "request_id": payload.request_id,
+            "parent_workflow_id": source.id,
+            "retry_from_node": child.retry_from_node,
+            "retry_sequence": child.retry_sequence,
+        },
         request,
     )
     db.commit()
-    db.refresh(workflow)
-    return to_response(workflow)
+    db.refresh(child)
+    return to_response(child)
 
 
 @router.post("/{workflow_id}/publish", response_model=WorkflowPublicationOut)

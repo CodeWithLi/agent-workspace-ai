@@ -484,6 +484,9 @@ def _run_out(
     return TraceRunOut(
         workflow_id=workflow.id,
         project_id=workflow.project_id,
+        parent_workflow_id=workflow.parent_workflow_id,
+        retry_from_node=workflow.retry_from_node,
+        retry_sequence=workflow.retry_sequence,
         project_name=project.name if project else f"Project #{workflow.project_id}",
         owner_id=workflow.user_id,
         owner_name=owner.name if owner else f"User #{workflow.user_id}",

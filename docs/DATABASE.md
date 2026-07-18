@@ -17,7 +17,7 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 - `embeddings`：按索引版本保存 child/parent 块、稳定 ID、标题/页码元数据、Milvus ID，以及 child/parent PostgreSQL 降级向量。
 - `meetings`、`reports`、`notifications`：协作产物；通知记录接收者、调度时间、投递锁、重试和错误。
 - `memory`：项目/Agent 长期记忆和单条滚动摘要。
-- `workflow_runs`、`workflow_events`：LangGraph 队列、节点快照、租约、取消/重试状态和 SSE 事件源。
+- `workflow_runs`、`workflow_events`：LangGraph 队列、节点快照、租约、取消状态、不可变父子重试谱系和 SSE 事件源；`parent_workflow_id/retry_from_node/retry_sequence` 将每次人工重试分成独立运行。
 - `workflow_saga_steps`：写工具的输入快照、幂等键、执行结果、补偿动作、合法状态历史、执行/补偿次数和错误；`(workflow_id, idempotency_key)` 唯一。
 - `workflow_artifact_publications`：工作流产物到报告或知识文档的幂等发布记录。
 - `product_prototypes`、`product_prototype_versions`：原型元数据、活动版本和不可变 DSL/Agent 轨迹/质量证据。
@@ -33,7 +33,7 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 
 ## 迁移
 
-当前迁移头为 `20260717_0016`；版本化 RAG 索引位于 `20260717_0012`，原型评审与交付位于 `20260717_0015`，父向量持久化位于 `20260717_0016`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
+当前迁移头为 `20260718_0021`；不可变工作流重试谱系位于 `20260718_0021`，持久化追踪告警位于 `20260718_0020`，Agent 评测实验室位于 `20260718_0018`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
 
 ```bash
 cd backend

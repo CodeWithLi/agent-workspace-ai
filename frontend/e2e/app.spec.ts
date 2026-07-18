@@ -502,12 +502,14 @@ async function mockApi(page: Page) {
     recent_runs: [
       {
         workflow_id: 88, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
+        parent_workflow_id: 87, retry_from_node: 'architect', retry_sequence: 1,
         status: 'COMPLETED', current_node: 'completed', duration_ms: 480000, queue_ms: 30000,
         total_tokens: 2350, total_cost_micros: 11800, llm_call_count: 2, agent_count: 2, event_count: 8,
         error: '', created_at: '2026-07-18T08:00:00Z', started_at: '2026-07-18T08:00:30Z', finished_at: '2026-07-18T08:08:00Z'
       },
       {
         workflow_id: 87, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
+        parent_workflow_id: null, retry_from_node: '', retry_sequence: 0,
         status: 'COMPLETED', current_node: 'completed', duration_ms: 600000, queue_ms: 45000,
         total_tokens: 1850, total_cost_micros: 8000, llm_call_count: 3, agent_count: 2, event_count: 9,
         error: '', created_at: '2026-07-18T07:00:00Z', started_at: '2026-07-18T07:00:45Z', finished_at: '2026-07-18T07:10:00Z'
@@ -1075,6 +1077,7 @@ async function mockApi(page: Page) {
     }
     else if (method === 'GET' && path === '/traces/compare') body = traceComparison
     else if (method === 'GET' && path === '/traces/88') body = traceDetail
+    else if (method === 'GET' && path === '/traces/87') body = { ...traceDetail, run: traceOverview.recent_runs[1] }
     else if (method === 'GET' && path === '/agents') body = discussionAgents
     else if (method === 'GET' && path === '/agents/conversations') body = []
     else if (method === 'POST' && path === '/agents/discussion/stream') {
@@ -1261,6 +1264,8 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
   await runTrigger.click()
   await expect(page).toHaveURL(/\/traces\?run=88$/)
   await expect(page.getByRole('heading', { name: '#88 · 灰度发布工作台' })).toBeVisible()
+  await expect(page.getByText('检查点重试 #1', { exact: true })).toBeVisible()
+  await expect(page.getByText('来源运行 #87 · 架构设计检查点', { exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: '执行时间线' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '模型调用' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '事件日志' })).toBeVisible()
@@ -1279,8 +1284,13 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
     })
     expect(closeTarget.width).toBeGreaterThanOrEqual(44)
     expect(closeTarget.height).toBeGreaterThanOrEqual(44)
+    await expect(page.getByRole('button', { name: '查看来源运行 #87' })).toHaveCSS('min-height', '44px')
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.getByRole('button', { name: '查看来源运行 #87' }).click()
+  await expect(page).toHaveURL(/\/traces\?run=87$/)
+  await expect(page.getByRole('heading', { name: '#87 · 灰度发布工作台' })).toBeVisible()
 
   await page.getByRole('button', { name: '关闭运行追踪' }).click()
   await expect(page).toHaveURL(/\/traces$/)
@@ -1440,6 +1450,81 @@ test('shows Saga compensation failure and completes manual recovery', async ({ p
   await expect(page.getByText('已回滚', { exact: true })).toBeVisible()
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('creates an immutable checkpoint retry and links back to the failed run', async ({ page }, testInfo) => {
+  const sourceWorkflow = {
+    workflow_id: 120,
+    project_id: 2,
+    parent_workflow_id: null,
+    retry_from_node: '',
+    retry_sequence: 0,
+    status: 'FAILED',
+    current_node: 'architect',
+    state: { messages: [], documents: [{ type: 'PRD', content: '# 已冻结的产品需求' }] },
+    attempt_count: 2,
+    max_attempts: 2,
+    error: '架构模型服务暂时不可用',
+    created_at: '2026-07-18T08:00:00Z',
+    updated_at: '2026-07-18T08:05:00Z',
+    started_at: '2026-07-18T08:00:01Z',
+    finished_at: '2026-07-18T08:05:00Z'
+  }
+  const childWorkflow = {
+    ...sourceWorkflow,
+    workflow_id: 121,
+    parent_workflow_id: 120,
+    retry_from_node: 'architect',
+    retry_sequence: 1,
+    status: 'QUEUED',
+    attempt_count: 0,
+    error: '',
+    created_at: '2026-07-18T08:10:00Z',
+    updated_at: '2026-07-18T08:10:00Z',
+    started_at: null,
+    finished_at: null
+  }
+  let retryRequestId = ''
+
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: [sourceWorkflow] }))
+  await page.route(/\/api\/v1\/workflow\/120\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/120\/events\/history(?:\?.*)?$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/120\/retry$/, async (route) => {
+    retryRequestId = (route.request().postDataJSON() as { request_id: string }).request_id
+    await route.fulfill({ json: childWorkflow })
+  })
+  await page.route(/\/api\/v1\/workflow\/121\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/121\/events\/history(?:\?.*)?$/, (route) => route.fulfill({
+    json: [
+      { id: 10, workflow_id: 121, node: 'architect', event_type: 'RETRY_QUEUED', message: 'Workflow queued from an immutable failed run', payload: { parent_workflow_id: 120 }, created_at: '2026-07-18T08:10:00Z' },
+      { id: 11, workflow_id: 121, node: 'architect', event_type: 'QUEUED', message: 'Checkpoint retry queued', payload: {}, created_at: '2026-07-18T08:10:00Z' }
+    ]
+  }))
+  await page.route(/\/api\/v1\/workflow\/121\/events$/, (route) => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: 'retry: 10000\n\n'
+  }))
+
+  await page.goto('/projects/2')
+  await expect(page.getByText('架构模型服务暂时不可用', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '重试失败节点' }).click()
+
+  const dialog = page.getByRole('dialog', { name: '创建检查点重试' })
+  await expect(dialog).toContainText('失败运行 #120 将保持只读')
+  await expect(dialog).toContainText('“架构设计”检查点')
+  await dialog.getByRole('button', { name: '创建重试运行' }).click()
+
+  await expect(page.getByText('检查点重试 #1', { exact: true })).toBeVisible()
+  await expect(page.getByText('从运行 #120 的“架构设计”检查点继续，源运行保持只读。', { exact: true })).toBeVisible()
+  await expect(page.locator('.workflow-events').getByText('检查点重试入队', { exact: true })).toBeVisible()
+  expect(retryRequestId.length).toBeGreaterThanOrEqual(8)
+  const sourceLink = page.getByRole('button', { name: '查看源运行' })
+  if (testInfo.project.name === 'mobile-chromium') await expect(sourceLink).toHaveCSS('min-height', '44px')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await sourceLink.click()
+  await expect(page).toHaveURL(/\/traces\?run=120$/)
 })
 
 test('restores workflow history and reconnects live progress without duplicate events', async ({ page }) => {

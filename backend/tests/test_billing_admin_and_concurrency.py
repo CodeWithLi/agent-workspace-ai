@@ -387,6 +387,10 @@ async def test_failed_workflow_refunds_once_and_can_be_retried(
             TokenTransaction.reference_id == "workflow-refund-request",
         )
     ) == 1
+    source = db.get(WorkflowRun, workflow.id)
+    source_finished_at = source.finished_at
+    source_billing_transaction_id = source.billing_transaction_id
+    source_error = source.error
 
     retried = retry_workflow(
         workflow.id,
@@ -396,7 +400,175 @@ async def test_failed_workflow_refunds_once_and_can_be_retried(
         db,
     )
     assert retried.status == WorkflowStatus.queued
+    assert retried.workflow_id != source.id
+    assert retried.parent_workflow_id == source.id
+    assert retried.retry_from_node == source.current_node
+    assert retried.retry_sequence == 1
     assert db.get(User, user.id).ai_token_balance == 900
+
+    db.expire_all()
+    persisted_source = db.get(WorkflowRun, source.id)
+    child = db.get(WorkflowRun, retried.workflow_id)
+    assert persisted_source.status == WorkflowStatus.failed
+    assert persisted_source.finished_at == source_finished_at
+    assert persisted_source.billing_transaction_id == source_billing_transaction_id
+    assert persisted_source.error == source_error
+    assert child.billing_transaction_id != source_billing_transaction_id
+
+    repeated = retry_workflow(
+        source.id,
+        WorkflowRetryRequest(request_id="workflow-retry-request"),
+        http_request(f"/api/v1/workflow/{source.id}/retry"),
+        user,
+        db,
+    )
+    assert repeated.workflow_id == child.id
+    assert db.get(User, user.id).ai_token_balance == 900
+    assert db.scalar(select(func.count(WorkflowRun.id))) == 2
+
+    source_events = list(
+        db.scalars(select(WorkflowEvent).where(WorkflowEvent.workflow_id == source.id))
+    )
+    child_events = list(
+        db.scalars(select(WorkflowEvent).where(WorkflowEvent.workflow_id == child.id))
+    )
+    assert [event.event_type for event in source_events].count("RETRY_CREATED") == 1
+    assert [event.event_type for event in child_events] == ["RETRY_QUEUED", "QUEUED"]
+
+    with pytest.raises(HTTPException) as active_child:
+        retry_workflow(
+            source.id,
+            WorkflowRetryRequest(request_id="workflow-retry-request-02"),
+            http_request(f"/api/v1/workflow/{source.id}/retry"),
+            user,
+            db,
+        )
+    assert active_child.value.status_code == 409
+    assert db.get(User, user.id).ai_token_balance == 900
+
+    await process_workflow(db, child.id)
+    db.expire_all()
+    assert db.get(WorkflowRun, source.id).status == WorkflowStatus.failed
+    assert db.get(WorkflowRun, child.id).status == WorkflowStatus.failed
+    assert db.get(User, user.id).ai_token_balance == 1000
+    assert db.scalar(
+        select(func.count(TokenTransaction.id)).where(
+            TokenTransaction.transaction_type == "REFUND",
+            TokenTransaction.reference_id == "workflow-refund-request",
+        )
+    ) == 1
+    assert db.scalar(
+        select(func.count(TokenTransaction.id)).where(
+            TokenTransaction.transaction_type == "REFUND",
+            TokenTransaction.reference_id == "workflow-retry-request",
+        )
+    ) == 1
+
+
+def test_workflow_retry_cleans_compensated_checkpoint_and_supports_descendants(db: Session) -> None:
+    user = User(
+        email="workflow-lineage@example.com",
+        name="Workflow Lineage",
+        password_hash="hash",
+        permissions="projects:write",
+        ai_token_balance=1000,
+    )
+    db.add(user)
+    db.flush()
+    project = Project(name="Lineage Project", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    source_state = {
+        "requirements": {"summary": "preserved"},
+        "architecture": {"style": "preserved"},
+        "execution_plan": {"objective": "preserved"},
+        "specialist_handoffs": [{"role": "test_engineer", "content": "preserved"}],
+        "quality_gate": {"passed": True},
+        "agent_snapshot": {"architect": {"model": "frozen-model"}},
+        "tasks": [{"title": "stale task"}],
+        "tests": {"analysis": "stale test plan"},
+        "report": "stale final report",
+        "documents": [
+            {"type": "PRD", "content": "preserved PRD"},
+            {"type": "SYSTEM_DESIGN", "content": "preserved design"},
+            {"type": "PROJECT_PLAN", "content": "stale project plan"},
+            {"type": "TEST_PLAN", "content": "stale test plan"},
+            {"type": "FINAL_REPORT", "content": "stale report"},
+        ],
+        "messages": [
+            {"role": "architect_agent", "content": "preserved"},
+            {"role": "project_manager_agent", "content": "stale"},
+            {"role": "tester_agent", "content": "stale"},
+            {"role": "report_generator", "content": "stale"},
+        ],
+    }
+    source = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.failed,
+        current_node="project_manager",
+        state_json=json.dumps(source_state),
+        human_feedback="preserve this feedback",
+        request_id="lineage-source-request",
+        retry_sequence=2,
+        error="report failed after task compensation",
+    )
+    db.add(source)
+    db.flush()
+    db.add(
+        WorkflowEvent(
+            workflow_id=source.id,
+            node="report",
+            event_type="NODE_STARTED",
+            message="Started report",
+            payload_json="{}",
+        )
+    )
+    db.commit()
+
+    response = retry_workflow(
+        source.id,
+        WorkflowRetryRequest(request_id="lineage-child-request"),
+        http_request(f"/api/v1/workflow/{source.id}/retry"),
+        user,
+        db,
+    )
+    child = db.get(WorkflowRun, response.workflow_id)
+    child_state = json.loads(child.state_json)
+
+    assert child.parent_workflow_id == source.id
+    assert child.retry_from_node == "project_manager"
+    assert child.retry_sequence == 3
+    assert child.human_feedback == source.human_feedback
+    assert child.attempt_count == 0
+    assert child_state["requirements"] == source_state["requirements"]
+    assert child_state["architecture"] == source_state["architecture"]
+    assert child_state["execution_plan"] == source_state["execution_plan"]
+    assert child_state["specialist_handoffs"] == source_state["specialist_handoffs"]
+    assert child_state["quality_gate"] == source_state["quality_gate"]
+    assert child_state["agent_snapshot"] == source_state["agent_snapshot"]
+    assert child_state["tasks"] == []
+    assert child_state["tests"] == {}
+    assert child_state["report"] == ""
+    assert [item["type"] for item in child_state["documents"]] == ["PRD", "SYSTEM_DESIGN"]
+    assert [item["role"] for item in child_state["messages"]] == ["architect_agent"]
+    assert json.loads(db.get(WorkflowRun, source.id).state_json) == source_state
+
+    child.status = WorkflowStatus.failed
+    child.error = "child failed"
+    db.commit()
+    grandchild_response = retry_workflow(
+        child.id,
+        WorkflowRetryRequest(request_id="lineage-grandchild-request"),
+        http_request(f"/api/v1/workflow/{child.id}/retry"),
+        user,
+        db,
+    )
+    grandchild = db.get(WorkflowRun, grandchild_response.workflow_id)
+    assert grandchild.parent_workflow_id == child.id
+    assert grandchild.retry_from_node == child.current_node
+    assert grandchild.retry_sequence == 4
+    assert db.get(WorkflowRun, child.id).status == WorkflowStatus.failed
 
 
 @pytest.mark.asyncio

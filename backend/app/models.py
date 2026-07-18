@@ -773,6 +773,9 @@ class Memory(Base):
 
 class WorkflowRun(Base):
     __tablename__ = "workflow_runs"
+    __table_args__ = (
+        CheckConstraint("retry_sequence >= 0", name="ck_workflow_runs_retry_sequence"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
@@ -785,6 +788,11 @@ class WorkflowRun(Base):
     state_json: Mapped[str] = mapped_column(Text, default="{}")
     human_feedback: Mapped[str] = mapped_column(Text, default="")
     request_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    parent_workflow_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"), index=True
+    )
+    retry_from_node: Mapped[str] = mapped_column(String(100), default="")
+    retry_sequence: Mapped[int] = mapped_column(Integer, default=0)
     billing_transaction_id: Mapped[int | None] = mapped_column(ForeignKey("token_transactions.id", ondelete="SET NULL"))
     pause_before_report: Mapped[bool] = mapped_column(Boolean, default=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)

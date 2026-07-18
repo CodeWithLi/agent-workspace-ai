@@ -40,7 +40,7 @@
 
 规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，无效模型输出使用确定性默认计划。专业分支通过 `asyncio.gather` 并行执行；质量门禁检查角色覆盖、交付内容、成功标准和并行广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，人工反馈只重跑指定分支。
 
-除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。
+除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`。
 
 ## 运行追踪与成本归属
 
@@ -77,7 +77,11 @@ SLO 健康度只使用已结束的成功或失败运行，按当前追踪权限�
 
 继续操作只允许对 `PAUSED` 运行执行一次；任务创建按标题幂等，重复继续返回 `409`，不会重复落任务或报告。
 
-创建工作流时锁定项目记录，并检查是否已有 `QUEUED/RUNNING/CANCELLING/PAUSED` 工作流。同一 `request_id` 重试返回已有结果，其他并发工作流返回 `409`。自动重试不重复扣费，达到最大尝试次数或取消后按当前消费流水幂等退款；终态失败的人工重试创建新的幂等消费流水。
+创建工作流时锁定项目记录，并检查是否已有 `QUEUED/RUNNING/CANCELLING/PAUSED` 工作流。同一 `request_id` 重试返回已有结果，其他并发工作流返回 `409`。自动重试不重复扣费，达到最大尝试次数或取消后按当前消费流水幂等退款。
+
+终态失败的人工重试不会修改原 `workflow_runs` 行。平台创建带 `parent_workflow_id`、`retry_from_node` 和递增 `retry_sequence` 的新运行，复制冻结的 Agent 配置、人工反馈和最后已提交状态，并创建独立消费流水；子运行失败只退还自己的账单，也可继续创建孙运行。源运行的 `FAILED` 状态、结束时间、错误、事件、模型用量和账单保持不变，追踪中心因此可以分别比较每次尝试。
+
+Saga 补偿可能把 `current_node` 回退到更早的写节点。重试前会比较最近一次 `NODE_STARTED` 与回退节点；确认发生回退时，只移除该检查点及后续的任务、测试、报告文档和对应消息，保留更早的需求、PRD、架构、执行计划、专业 Handoff 与质量门禁证据。
 
 dispatcher 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 支持多副本。`locked_at` 超过租约的运行会被重新认领；取消在节点边界生效，避免提交半个节点的状态。
 

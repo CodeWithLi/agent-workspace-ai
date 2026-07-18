@@ -439,6 +439,9 @@ export interface RechargeOrder {
 export interface WorkflowRun {
   workflow_id: number
   project_id: number
+  parent_workflow_id: number | null
+  retry_from_node: string
+  retry_sequence: number
   status: string
   current_node: string
   state: Record<string, unknown>
@@ -562,6 +565,9 @@ export interface TraceBottleneck {
 export interface TraceRun {
   workflow_id: number
   project_id: number
+  parent_workflow_id: number | null
+  retry_from_node: string
+  retry_sequence: number
   project_name: string
   owner_id: number
   owner_name: string
