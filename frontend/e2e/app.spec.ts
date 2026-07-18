@@ -2358,6 +2358,79 @@ test('lists index versions and rolls knowledge search back on desktop and mobile
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
+test('restores live specialist retry states and opens completed handoffs', async ({ page }) => {
+  const liveWorkflow = {
+    workflow_id: 150,
+    project_id: 2,
+    parent_workflow_id: null,
+    retry_from_node: '',
+    retry_sequence: 0,
+    pause_requested_at: null,
+    pause_requested_by_user_id: null,
+    pause_reason: '',
+    intervention_count: 0,
+    status: 'RUNNING',
+    current_node: 'specialists',
+    state: {
+      execution_plan: {
+        objective: '恢复可观察的专业 Agent 执行现场',
+        rationale: '运营与测试并行，瞬时失败只重试测试 Agent。',
+        assignments: [
+          { role: 'operations_analyst', objective: '定义发布和回滚边界', deliverable: '发布运行手册', depends_on: [] },
+          { role: 'test_engineer', objective: '验证边界与验收证据', deliverable: '测试与验收清单', depends_on: [] }
+        ],
+        success_criteria: ['成功分支不重复', '失败分支有界重试']
+      },
+      specialist_handoffs: [
+        {
+          role: 'operations_analyst',
+          objective: '定义发布和回滚边界',
+          deliverable: '发布运行手册',
+          content: '已完成发布窗口、监控阈值、失败信号和回滚负责人定义。',
+          revision_round: 0
+        }
+      ],
+      quality_gate: {},
+      revision_round: 0,
+      documents: [],
+      messages: []
+    },
+    attempt_count: 1,
+    max_attempts: 2,
+    error: '',
+    created_at: '2026-07-19T10:00:00Z',
+    updated_at: '2026-07-19T10:00:08Z',
+    started_at: '2026-07-19T10:00:01Z',
+    finished_at: null
+  }
+  const events = [
+    { id: 1, workflow_id: 150, node: 'specialists', event_type: 'WAVE_STARTED', message: 'wave started', payload: { wave: 1, roles: ['operations_analyst', 'test_engineer'] }, created_at: '2026-07-19T10:00:02Z' },
+    { id: 2, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'operations started', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
+    { id: 3, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'test started', payload: { role: 'test_engineer', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
+    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:07Z' },
+    { id: 5, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_FAILED', message: 'test failed', payload: { role: 'test_engineer', branch_attempt: 1, retryable: true, will_retry: true }, created_at: '2026-07-19T10:00:07Z' },
+    { id: 6, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_RETRY_SCHEDULED', message: 'test retry scheduled', payload: { role: 'test_engineer', branch_attempt: 1, next_branch_attempt: 2, retry_delay_seconds: 1 }, created_at: '2026-07-19T10:00:08Z' }
+  ]
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: [liveWorkflow] }))
+  await page.route(/\/api\/v1\/workflow\/150$/, (route) => route.fulfill({ json: liveWorkflow }))
+  await page.route(/\/api\/v1\/workflow\/150\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/150\/events\/history(?:\?.*)?$/, (route) => route.fulfill({ json: events }))
+  await page.route(/\/api\/v1\/workflow\/150\/events$/, (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
+
+  await page.goto('/projects/2')
+
+  await expect(page.getByText('1/2 已交接 · 1 待重试', { exact: true })).toBeVisible()
+  const operationsBranch = page.locator('.orchestration-branch-row').filter({ hasText: '运营分析师' })
+  const testBranch = page.locator('.orchestration-branch-row').filter({ hasText: '测试工程师' })
+  await expect(operationsBranch.getByRole('status')).toContainText('已交接')
+  await expect(operationsBranch.getByRole('status')).toContainText('A1 · R0')
+  await expect(testBranch.getByRole('status')).toContainText('等待重试')
+  await expect(testBranch.getByRole('status')).toContainText('A1 · 1s')
+  await operationsBranch.getByRole('button', { name: '查看运营分析师交接' }).click()
+  await expect(page.getByText('已完成发布窗口、监控阈值、失败信号和回滚负责人定义。')).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
 test('shows dynamic specialist handoffs and submits quality revision feedback', async ({ page }) => {
   await page.goto('/projects/2')
 

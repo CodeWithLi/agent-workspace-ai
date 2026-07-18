@@ -142,6 +142,7 @@
             <el-tag type="info">v{{ displayedPlanVersion }}</el-tag>
             <el-tag v-if="executionPlanApprovalLabel" :type="executionPlanApprovalType">{{ executionPlanApprovalLabel }}</el-tag>
             <el-tag type="primary">{{ executionPlanTopologyLabel }}</el-tag>
+            <el-tag v-if="executionPlanRuntimeSummary" :type="executionPlanRuntimeType">{{ executionPlanRuntimeSummary }}</el-tag>
           </div>
         </div>
         <div v-if="workflowPlanReview && selectedPlanRevision" class="plan-version-diff">
@@ -158,7 +159,7 @@
           <section v-for="wave in executionPlanWaves" :key="wave.number" class="orchestration-wave" :aria-label="`执行计划第 ${wave.number} 波`">
             <div class="orchestration-wave-heading">
               <strong>第 {{ wave.number }} 波</strong>
-              <span>{{ wave.assignments.length > 1 ? `${wave.assignments.length} 个 Agent 并行` : '单 Agent 执行' }}</span>
+              <span>{{ waveRuntimeSummary(wave.assignments) }}</span>
             </div>
             <div class="orchestration-branches">
               <div v-for="assignment in wave.assignments" :key="assignment.role" class="orchestration-branch-row">
@@ -171,13 +172,33 @@
                     <span class="branch-dependency-roles">{{ assignment.depends_on.map(specialistRoleLabel).join('、') }}</span>
                   </small>
                 </div>
-                <el-tag :type="handoffFor(assignment.role) ? 'success' : 'info'" size="small">{{ handoffFor(assignment.role) ? `已交接 · R${handoffFor(assignment.role)?.revision_round}` : '等待执行' }}</el-tag>
+                <div class="branch-runtime-actions">
+                  <span
+                    class="branch-runtime-status"
+                    :class="`is-${branchRuntimeState(assignment.role).status}`"
+                    role="status"
+                    :aria-label="`${specialistRoleLabel(assignment.role)}：${branchRuntimeLabel(assignment.role)}${branchRuntimeMeta(assignment.role) ? `，${branchRuntimeMeta(assignment.role)}` : ''}`"
+                  >
+                    <el-icon aria-hidden="true"><component :is="branchRuntimeIcon(branchRuntimeState(assignment.role).status)" /></el-icon>
+                    <span>{{ branchRuntimeLabel(assignment.role) }}</span>
+                    <small v-if="branchRuntimeMeta(assignment.role)">{{ branchRuntimeMeta(assignment.role) }}</small>
+                  </span>
+                  <el-button
+                    v-if="handoffFor(assignment.role)"
+                    class="branch-handoff-button"
+                    :icon="View"
+                    circle
+                    :aria-label="`查看${specialistRoleLabel(assignment.role)}交接`"
+                    :title="`查看${specialistRoleLabel(assignment.role)}交接`"
+                    @click="openHandoff(assignment.role)"
+                  />
+                </div>
               </div>
             </div>
           </section>
         </div>
-        <el-collapse v-if="specialistHandoffs.length" class="handoff-details">
-          <el-collapse-item v-for="handoff in specialistHandoffs" :key="handoff.role" :name="handoff.role" :title="`${specialistRoleLabel(handoff.role)} Handoff · ${handoff.deliverable}`">
+        <el-collapse v-if="specialistHandoffs.length" v-model="activeHandoffRoles" class="handoff-details">
+          <el-collapse-item v-for="handoff in specialistHandoffs" :id="`handoff-${handoff.role}`" :key="handoff.role" :name="handoff.role" :title="`${specialistRoleLabel(handoff.role)} Handoff · ${handoff.deliverable}`">
             <pre>{{ handoff.content }}</pre>
           </el-collapse-item>
         </el-collapse>
@@ -322,9 +343,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
+import { CircleCheck, CircleClose, Clock, Connection, Delete, Edit, Loading, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
@@ -371,6 +392,14 @@ interface WorkflowQualityGate {
   summary: string
 }
 
+type BranchRuntimeStatus = 'waiting' | 'running' | 'retrying' | 'completed' | 'restored' | 'failed' | 'paused' | 'cancelling' | 'cancelled'
+
+interface BranchRuntimeState {
+  status: BranchRuntimeStatus
+  attempt: number
+  retryDelaySeconds: number
+}
+
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
@@ -392,6 +421,7 @@ const workflowError = ref('')
 const workflowFeedback = ref('')
 const selectedPlanVersion = ref(1)
 const workflowEvents = ref<WorkflowEvent[]>([])
+const activeHandoffRoles = ref<string[]>([])
 const workflowSagaSteps = ref<WorkflowSagaStep[]>([])
 const workflowActionBusy = ref(false)
 const running = ref(false)
@@ -585,6 +615,85 @@ const specialistHandoffs = computed<WorkflowHandoff[]>(() => {
   const handoffs = workflowState.value?.specialist_handoffs
   return Array.isArray(handoffs) ? handoffs as WorkflowHandoff[] : []
 })
+const branchRuntimeByRole = computed(() => {
+  const states = new Map<string, BranchRuntimeState>()
+  for (const assignment of executionPlan.value?.assignments || []) {
+    states.set(assignment.role, { status: 'waiting', attempt: 0, retryDelaySeconds: 0 })
+  }
+  const updateState = (role: string, update: Partial<BranchRuntimeState>) => {
+    if (!states.has(role)) return
+    states.set(role, {
+      ...states.get(role)!,
+      ...update
+    })
+  }
+  for (const event of [...workflowEvents.value].sort((left, right) => left.id - right.id)) {
+    const attempt = Number(event.payload?.branch_attempt) || 0
+    if (event.event_type === 'WAVE_RESTORED') {
+      const roles = Array.isArray(event.payload?.roles) ? event.payload.roles : []
+      for (const role of roles) {
+        if (typeof role === 'string') updateState(role, { status: 'restored', attempt })
+      }
+      continue
+    }
+    const role = typeof event.payload?.role === 'string' ? event.payload.role : ''
+    if (!role) continue
+    if (event.event_type === 'BRANCH_STARTED') {
+      updateState(role, { status: 'running', attempt, retryDelaySeconds: 0 })
+    } else if (event.event_type === 'BRANCH_RETRY_SCHEDULED') {
+      updateState(role, {
+        status: 'retrying',
+        attempt,
+        retryDelaySeconds: Number(event.payload?.retry_delay_seconds) || 0
+      })
+    } else if (event.event_type === 'BRANCH_FAILED') {
+      updateState(role, {
+        status: event.payload?.will_retry === true ? 'retrying' : 'failed',
+        attempt
+      })
+    } else if (event.event_type === 'BRANCH_COMPLETED') {
+      updateState(role, { status: 'completed', attempt, retryDelaySeconds: 0 })
+    }
+  }
+  for (const assignment of executionPlan.value?.assignments || []) {
+    const current = states.get(assignment.role)!
+    if (current.status === 'waiting' && handoffFor(assignment.role)) {
+      states.set(assignment.role, { ...current, status: 'completed' })
+      continue
+    }
+    if (!['running', 'retrying'].includes(current.status)) continue
+    if (workflowStatus.value === 'PAUSED') states.set(assignment.role, { ...current, status: 'paused' })
+    else if (workflowStatus.value === 'CANCELLING') states.set(assignment.role, { ...current, status: 'cancelling' })
+    else if (workflowStatus.value === 'CANCELLED') states.set(assignment.role, { ...current, status: 'cancelled' })
+    else if (workflowStatus.value === 'FAILED') states.set(assignment.role, { ...current, status: 'failed' })
+  }
+  return states
+})
+const executionPlanRuntimeSummary = computed(() => {
+  const assignments = executionPlan.value?.assignments || []
+  if (!assignments.length) return ''
+  const states = assignments.map((assignment) => branchRuntimeState(assignment.role).status)
+  const completed = states.filter((status) => ['completed', 'restored'].includes(status)).length
+  const running = states.filter((status) => status === 'running').length
+  const retrying = states.filter((status) => status === 'retrying').length
+  const failed = states.filter((status) => status === 'failed').length
+  if (!completed && !running && !retrying && !failed) return ''
+  const details = [
+    completed ? `${completed}/${assignments.length} 已交接` : '',
+    running ? `${running} 执行中` : '',
+    retrying ? `${retrying} 待重试` : '',
+    failed ? `${failed} 失败` : ''
+  ].filter(Boolean)
+  return details.join(' · ')
+})
+const executionPlanRuntimeType = computed<'primary' | 'success' | 'warning' | 'info' | 'danger'>(() => {
+  const statuses = [...branchRuntimeByRole.value.values()].map((state) => state.status)
+  if (statuses.some((status) => status === 'failed')) return 'danger'
+  if (statuses.some((status) => ['retrying', 'paused', 'cancelling'].includes(status))) return 'warning'
+  if (statuses.some((status) => status === 'running')) return 'primary'
+  if (statuses.length && statuses.every((status) => ['completed', 'restored'].includes(status))) return 'success'
+  return 'info'
+})
 const qualityGate = computed<WorkflowQualityGate | null>(() => {
   const gate = workflowState.value?.quality_gate
   return gate && typeof gate.score === 'number' ? gate as WorkflowQualityGate : null
@@ -730,6 +839,71 @@ function specialistRoleLabel(role: string) {
 
 function handoffFor(role: string) {
   return specialistHandoffs.value.find((handoff) => handoff.role === role)
+}
+
+function branchRuntimeState(role: string): BranchRuntimeState {
+  return branchRuntimeByRole.value.get(role)
+    || { status: 'waiting', attempt: 0, retryDelaySeconds: 0 }
+}
+
+function branchRuntimeLabel(role: string) {
+  return {
+    waiting: '等待执行',
+    running: '执行中',
+    retrying: '等待重试',
+    completed: '已交接',
+    restored: '检查点恢复',
+    failed: '执行失败',
+    paused: '已暂停',
+    cancelling: '正在取消',
+    cancelled: '已取消'
+  }[branchRuntimeState(role).status]
+}
+
+function branchRuntimeMeta(role: string) {
+  const state = branchRuntimeState(role)
+  const handoff = handoffFor(role)
+  return [
+    state.attempt > 0 ? `A${state.attempt}` : '',
+    handoff ? `R${handoff.revision_round}` : '',
+    state.retryDelaySeconds > 0 ? `${state.retryDelaySeconds}s` : ''
+  ].filter(Boolean).join(' · ')
+}
+
+function branchRuntimeIcon(status: BranchRuntimeStatus) {
+  return {
+    waiting: Clock,
+    running: Loading,
+    retrying: RefreshRight,
+    completed: CircleCheck,
+    restored: RefreshRight,
+    failed: CircleClose,
+    paused: VideoPause,
+    cancelling: Loading,
+    cancelled: CircleClose
+  }[status]
+}
+
+function waveRuntimeSummary(assignments: WorkflowAssignment[]) {
+  const states = assignments.map((assignment) => branchRuntimeState(assignment.role).status)
+  if (states.every((status) => status === 'waiting')) {
+    return assignments.length > 1 ? `${assignments.length} 个 Agent 并行` : '单 Agent 执行'
+  }
+  const completed = states.filter((status) => ['completed', 'restored'].includes(status)).length
+  const active = states.filter((status) => ['running', 'retrying', 'paused', 'cancelling'].includes(status)).length
+  const failed = states.filter((status) => ['failed', 'cancelled'].includes(status)).length
+  return [
+    `${completed}/${assignments.length} 已完成`,
+    active ? `${active} 处理中` : '',
+    failed ? `${failed} 异常` : ''
+  ].filter(Boolean).join(' · ')
+}
+
+async function openHandoff(role: string) {
+  if (!handoffFor(role)) return
+  activeHandoffRoles.value = [role]
+  await nextTick()
+  document.getElementById(`handoff-${role}`)?.scrollIntoView({ block: 'nearest' })
 }
 
 function sagaStatusLabel(status: string) {
@@ -1468,6 +1642,90 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-weight: 600;
 }
 
+.branch-runtime-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.branch-runtime-status {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-surface);
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.branch-runtime-status .el-icon {
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+
+.branch-runtime-status small {
+  color: currentColor;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  opacity: 0.78;
+}
+
+.branch-runtime-status.is-running,
+.branch-runtime-status.is-restored {
+  border-color: #bfdbfe;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.branch-runtime-status.is-retrying,
+.branch-runtime-status.is-paused,
+.branch-runtime-status.is-cancelling {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: var(--color-warning);
+}
+
+.branch-runtime-status.is-completed {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: var(--color-success);
+}
+
+.branch-runtime-status.is-failed {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: var(--color-danger);
+}
+
+.branch-runtime-status.is-cancelled {
+  background: #f6f8fa;
+  color: var(--color-muted-text);
+}
+
+.branch-runtime-status.is-running .el-icon,
+.branch-runtime-status.is-cancelling .el-icon {
+  animation: branch-status-spin 1.1s linear infinite;
+}
+
+.branch-handoff-button {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+}
+
+@keyframes branch-status-spin {
+  to { transform: rotate(360deg); }
+}
+
 .handoff-details {
   margin-top: 12px;
   border-top: 0;
@@ -1657,6 +1915,18 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .orchestration-wave-heading {
     align-items: flex-start;
+  }
+
+  .branch-runtime-actions {
+    align-items: flex-end;
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .branch-runtime-status.is-running .el-icon,
+  .branch-runtime-status.is-cancelling .el-icon {
+    animation: none;
   }
 }
 </style>
