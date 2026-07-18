@@ -61,14 +61,18 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
     )
     chunker = None
     if strategy != "legacy":
-        chunker = build_chunker(
-            config,
-            strategy=strategy,
-            semantic_threshold=settings.rag_semantic_threshold,
-            embedding_model=settings.embedding_model,
-            embedding_api_key=settings.embedding_api_key or gateway.api_key,
-            embedding_base_url=settings.embedding_base_url or gateway.base_url,
-        )
+        local_builder = getattr(gateway, "build_semantic_chunker", None)
+        if strategy == "semantic" and callable(local_builder):
+            chunker = local_builder(config, settings.rag_semantic_threshold)
+        else:
+            chunker = build_chunker(
+                config,
+                strategy=strategy,
+                semantic_threshold=settings.rag_semantic_threshold,
+                embedding_model=settings.embedding_model,
+                embedding_api_key=settings.embedding_api_key or gateway.api_key,
+                embedding_base_url=settings.embedding_base_url or gateway.base_url,
+            )
     rows: list[dict] = []
     semantic_boundary_tokens = 0
     for document_id, (filename, data) in enumerate(documents.items(), start=1):
@@ -137,15 +141,24 @@ def judge_prompt(case, answer: str, rows: list[dict]) -> str:
 
 async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     settings = get_settings()
-    gateway = get_llm()
+    if args.provider == "local-open-models":
+        from app.rag.local_evaluation_models import LocalOpenModelSuite
+
+        gateway = LocalOpenModelSuite()
+        active_reranker = gateway
+        reranker_enabled = True
+    else:
+        gateway = get_llm()
+        active_reranker = reranker
+        reranker_enabled = settings.reranker_enabled
     configuration_errors: list[str] = []
-    if not gateway.api_key:
+    if args.provider == "external" and not gateway.api_key:
         configuration_errors.append("LLM_API_KEY or OPENAI_API_KEY is required")
-    if settings.llm_fallback_enabled:
+    if args.provider == "external" and settings.llm_fallback_enabled:
         configuration_errors.append("LLM_FALLBACK_ENABLED must be false for a release evaluation")
-    if args.require_reranker and not settings.reranker_enabled:
+    if args.require_reranker and not reranker_enabled:
         configuration_errors.append("RERANKER_ENABLED must be true when --require-reranker is used")
-    if args.require_reranker and not settings.reranker_base_url:
+    if args.provider == "external" and args.require_reranker and not settings.reranker_base_url:
         configuration_errors.append("RERANKER_BASE_URL is required when --require-reranker is used")
     if configuration_errors:
         return {"status": "configuration_error", "errors": configuration_errors}, 2
@@ -164,7 +177,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
     if args.require_reranker:
         try:
-            await reranker.healthcheck()
+            await active_reranker.healthcheck()
         except Exception as exc:
             return {"status": "configuration_error", "errors": [f"reranker healthcheck failed: {exc}"]}, 2
 
@@ -225,8 +238,9 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
     for case in cases:
         case_started = perf_counter()
-        queries = baseline_queries.get(case.name) or await rewrite_query(case.query)
-        query_vectors = await gateway.embed_many(queries)
+        queries = baseline_queries.get(case.name) or await rewrite_query(case.query, gateway=gateway)
+        query_embedder = getattr(gateway, "embed_queries", gateway.embed_many)
+        query_vectors = await query_embedder(queries)
         embedding_tokens += sum(estimate_tokens(query) for query in queries)
         query_vector = average_vectors(query_vectors)
         sparse_by_query = [sparse_scores(query, contents) for query in queries]
@@ -250,11 +264,11 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             row["score"] = 0.25 * sparse[index] + 0.4 * dense[index] + 0.35 * fusion
             rows.append(row)
         rows = lexical_rerank(queries, rows)
-        if settings.reranker_enabled:
+        if reranker_enabled:
             rerank_tokens += estimate_tokens(case.query) + sum(
                 estimate_tokens(row["content"]) for row in rows[: settings.reranker_candidate_limit]
             )
-        ranked = await reranker.rerank(case.query, rows)
+        ranked = await active_reranker.rerank(case.query, rows)
         selected = select_diverse_results(
             ranked,
             args.top_k,
@@ -415,13 +429,17 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     return (
         {
             "status": "completed",
+            "provider": args.provider,
             "chunk_strategy": args.chunk_strategy,
             "model": gateway.model,
-            "embedding_model": settings.embedding_model,
+            "embedding_model": getattr(gateway, "embedding_model_name", settings.embedding_model),
             "multi_vector_enabled": settings.rag_multi_vector_enabled,
             "parent_embedding_count": len(parent_vectors),
-            "reranker_model": settings.reranker_model if settings.reranker_enabled else None,
+            "reranker_model": getattr(gateway, "reranker_model_name", settings.reranker_model)
+            if reranker_enabled
+            else None,
             "judge_model": args.judge_model or gateway.model,
+            "model_revisions": getattr(gateway, "model_revisions", {}),
             "duration_ms": round((perf_counter() - started) * 1000, 3),
             "metrics": metrics,
             "cost": costs,
@@ -434,7 +452,8 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate external end-to-end RAG quality with an LLM judge")
+    parser = argparse.ArgumentParser(description="Evaluate model-backed end-to-end RAG quality with an LLM judge")
+    parser.add_argument("--provider", choices=("external", "local-open-models"), default="external")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--judge-model")
     parser.add_argument("--top-k", type=int, default=5)

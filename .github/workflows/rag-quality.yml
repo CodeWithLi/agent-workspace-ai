@@ -1,13 +1,78 @@
-name: RAG External Quality Gate
+name: RAG Model Quality Gate
 
 on:
   workflow_dispatch:
+    inputs:
+      provider:
+        description: Evaluation model provider
+        required: true
+        default: open-models
+        type: choice
+        options:
+          - open-models
+          - external
+  schedule:
+    - cron: "0 20 1 * *"
 
 permissions:
   contents: read
 
 jobs:
-  evaluate:
+  open-models:
+    if: github.event_name == 'schedule' || inputs.provider == 'open-models'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      LLM_FALLBACK_ENABLED: "false"
+      RAG_QUERY_REWRITE_ENABLED: "true"
+      RAG_QUERY_REWRITE_MAX_VARIANTS: "3"
+      RAG_MULTI_VECTOR_ENABLED: "true"
+      RERANKER_CANDIDATE_LIMIT: "40"
+      TOKENIZERS_PARALLELISM: "false"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: rag-open-models-v1-${{ runner.os }}-${{ hashFiles('backend/requirements-rag-open-model-eval.txt') }}
+      - run: pip install -r backend/requirements-rag-open-model-eval.txt
+      - name: Run pinned open-model legacy baseline
+        run: >-
+          RAG_MULTI_VECTOR_ENABLED=false python scripts/evaluate_rag_end_to_end.py
+          --provider local-open-models
+          --require-reranker
+          --chunk-strategy legacy
+          --max-p95-end-to-end-ms 120000
+          --output .run/rag-open-model-baseline.json
+      - name: Run pinned open-model answer-quality A/B gate
+        run: >-
+          python scripts/evaluate_rag_end_to_end.py
+          --provider local-open-models
+          --require-reranker
+          --chunk-strategy semantic
+          --enforce-gates
+          --baseline-report .run/rag-open-model-baseline.json
+          --min-ab-primary-gain 0.05
+          --max-p95-end-to-end-ms 120000
+          --output .run/rag-open-model.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-open-model-${{ github.run_id }}
+          path: .run/rag-open-model*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  external:
+    if: github.event_name == 'workflow_dispatch' && inputs.provider == 'external'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -53,6 +118,7 @@ jobs:
       - name: Run legacy external baseline
         run: >-
           RAG_MULTI_VECTOR_ENABLED=false python scripts/evaluate_rag_end_to_end.py
+          --provider external
           --require-reranker
           --chunk-strategy legacy
           --judge-model "${{ secrets.RAG_EVAL_JUDGE_MODEL }}"
@@ -60,6 +126,7 @@ jobs:
       - name: Run external answer-quality A/B gate
         run: >-
           python scripts/evaluate_rag_end_to_end.py
+          --provider external
           --require-reranker
           --chunk-strategy semantic
           --enforce-gates
