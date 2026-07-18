@@ -92,10 +92,11 @@ def test_repeated_chunks_count_as_one_evidence_target() -> None:
 
 
 def test_deterministic_answer_assertions_detect_opposite_claims() -> None:
-    required = (("拒绝启动", "refuse to start"),)
+    required = (("拒绝启动", "不会启动", "refuse to start"),)
     forbidden = ("系统会继续运行",)
 
     assert deterministic_answer_assertion_score("配置无效时应用会拒绝启动。", required, forbidden) == 1.0
+    assert deterministic_answer_assertion_score("配置无效时系统不会启动。", required, forbidden) == 1.0
     assert deterministic_answer_assertion_score("配置无效时系统会继续运行。", required, forbidden) == 0.0
     assert (
         deterministic_answer_assertion_score(

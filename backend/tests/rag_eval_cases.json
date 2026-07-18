@@ -11,7 +11,7 @@
     "query": "生产环境安全配置不合格时系统是否还会启动？",
     "document": "DEPLOYMENT.md",
     "evidence": "生产配置不满足上述安全约束时，应用会拒绝启动",
-    "answer_required_groups": [["拒绝启动", "refuse to start", "will not start"]],
+    "answer_required_groups": [["拒绝启动", "不会启动", "refuse to start", "will not start"]],
     "answer_forbidden_terms": ["系统会继续运行", "应用会继续运行"]
   },
   {
