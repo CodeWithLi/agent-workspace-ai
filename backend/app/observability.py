@@ -25,6 +25,11 @@ from app.models import (
 from app.schemas import (
     TraceAgentMetricOut,
     TraceBottleneckOut,
+    TraceComparisonAgentOut,
+    TraceComparisonMetricOut,
+    TraceComparisonOut,
+    TraceComparisonSpanOut,
+    TraceComparisonSummaryOut,
     TraceDetailMetricsOut,
     TraceDetailOut,
     TraceEventDetailOut,
@@ -838,4 +843,290 @@ def get_trace_detail(db: Session, current_user: User, workflow_id: int) -> Trace
             )
             for event in events
         ],
+    )
+
+
+def _comparison_direction(
+    baseline: int,
+    candidate: int,
+    *,
+    lower_is_better: bool,
+    minimum_delta: int,
+) -> tuple[int, float | None, str]:
+    delta = candidate - baseline
+    percent = round(delta / abs(baseline) * 100, 1) if baseline else None
+    if abs(delta) < minimum_delta or (percent is not None and abs(percent) < 5.0):
+        return delta, percent, "UNCHANGED"
+    if not lower_is_better:
+        return delta, percent, "CHANGED"
+    return delta, percent, "IMPROVED" if delta < 0 else "REGRESSED"
+
+
+def _comparison_metric(
+    key: str,
+    label: str,
+    unit: str,
+    baseline: int,
+    candidate: int,
+    *,
+    lower_is_better: bool = True,
+    minimum_delta: int = 1,
+) -> TraceComparisonMetricOut:
+    delta, percent, direction = _comparison_direction(
+        baseline,
+        candidate,
+        lower_is_better=lower_is_better,
+        minimum_delta=minimum_delta,
+    )
+    return TraceComparisonMetricOut(
+        key=key,
+        label=label,
+        unit=unit,
+        baseline_value=baseline,
+        candidate_value=candidate,
+        delta=delta,
+        delta_percent=percent,
+        direction=direction,
+        lower_is_better=lower_is_better,
+    )
+
+
+def _outcome_direction(baseline: WorkflowStatus, candidate: WorkflowStatus) -> str:
+    if baseline == candidate:
+        return "UNCHANGED"
+    if baseline != WorkflowStatus.completed and candidate == WorkflowStatus.completed:
+        return "IMPROVED"
+    if baseline == WorkflowStatus.completed and candidate != WorkflowStatus.completed:
+        return "REGRESSED"
+    return "CHANGED"
+
+
+def _comparison_verdict(outcome: str, metrics: list[TraceComparisonMetricOut]) -> tuple[str, int, int]:
+    primary = [item for item in metrics if item.key in {"total_duration_ms", "total_tokens", "total_cost_micros"}]
+    regressions = sum(item.direction == "REGRESSED" for item in primary) + (outcome == "REGRESSED")
+    improvements = sum(item.direction == "IMPROVED" for item in primary) + (outcome == "IMPROVED")
+    if regressions and improvements:
+        verdict = "MIXED"
+    elif regressions:
+        verdict = "REGRESSED"
+    elif improvements:
+        verdict = "IMPROVED"
+    else:
+        verdict = "UNCHANGED"
+    return verdict, regressions, improvements
+
+
+def _comparison_agents(
+    baseline: TraceDetailOut,
+    candidate: TraceDetailOut,
+) -> list[TraceComparisonAgentOut]:
+    grouped: dict[str, dict[str, list[TraceModelCallOut]]] = defaultdict(lambda: {"baseline": [], "candidate": []})
+    for side, detail in (("baseline", baseline), ("candidate", candidate)):
+        for call in detail.model_calls:
+            key = call.agent_role or f"agent:{call.agent_id or 'unassigned'}"
+            grouped[key][side].append(call)
+
+    rows: list[TraceComparisonAgentOut] = []
+    for key, sides in grouped.items():
+        baseline_calls = sides["baseline"]
+        candidate_calls = sides["candidate"]
+        representative = (candidate_calls or baseline_calls)[0]
+        baseline_latency = round(sum(item.latency_ms for item in baseline_calls) / len(baseline_calls)) if baseline_calls else 0
+        candidate_latency = round(sum(item.latency_ms for item in candidate_calls) / len(candidate_calls)) if candidate_calls else 0
+        latency_delta, _, latency_direction = _comparison_direction(
+            baseline_latency,
+            candidate_latency,
+            lower_is_better=True,
+            minimum_delta=100,
+        )
+        baseline_models = sorted({item.model for item in baseline_calls})
+        candidate_models = sorted({item.model for item in candidate_calls})
+        baseline_providers = sorted({item.provider for item in baseline_calls})
+        candidate_providers = sorted({item.provider for item in candidate_calls})
+        baseline_tokens = sum(item.total_tokens for item in baseline_calls)
+        candidate_tokens = sum(item.total_tokens for item in candidate_calls)
+        baseline_cost = sum(item.estimated_cost_micros for item in baseline_calls)
+        candidate_cost = sum(item.estimated_cost_micros for item in candidate_calls)
+        if not baseline_calls:
+            change_type = "ADDED"
+        elif not candidate_calls:
+            change_type = "REMOVED"
+        elif (
+            baseline_models != candidate_models
+            or baseline_providers != candidate_providers
+            or len(baseline_calls) != len(candidate_calls)
+            or baseline_tokens != candidate_tokens
+            or baseline_cost != candidate_cost
+            or baseline_latency != candidate_latency
+        ):
+            change_type = "MODIFIED"
+        else:
+            change_type = "UNCHANGED"
+        rows.append(
+            TraceComparisonAgentOut(
+                key=key,
+                agent_id=representative.agent_id,
+                agent_name=representative.agent_name,
+                agent_role=representative.agent_role,
+                change_type=change_type,
+                baseline_providers=baseline_providers,
+                candidate_providers=candidate_providers,
+                baseline_models=baseline_models,
+                candidate_models=candidate_models,
+                baseline_calls=len(baseline_calls),
+                candidate_calls=len(candidate_calls),
+                baseline_tokens=baseline_tokens,
+                candidate_tokens=candidate_tokens,
+                token_delta=candidate_tokens - baseline_tokens,
+                baseline_cost_micros=baseline_cost,
+                candidate_cost_micros=candidate_cost,
+                cost_delta_micros=candidate_cost - baseline_cost,
+                baseline_average_latency_ms=baseline_latency,
+                candidate_average_latency_ms=candidate_latency,
+                latency_delta_ms=latency_delta,
+                latency_direction=latency_direction,
+            )
+        )
+    return sorted(rows, key=lambda item: (item.change_type == "UNCHANGED", -abs(item.cost_delta_micros), item.agent_name))
+
+
+def _span_groups(detail: TraceDetailOut) -> dict[str, dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for span in detail.spans:
+        key = f"{span.kind}:{span.node}:{span.agent_role or '-'}"
+        group = groups.setdefault(
+            key,
+            {
+                "kind": span.kind,
+                "node": span.node,
+                "label": span.label,
+                "agent_role": span.agent_role,
+                "executions": 0,
+                "duration": 0,
+                "tokens": 0,
+                "cost": 0,
+            },
+        )
+        group["executions"] += 1
+        group["duration"] += span.duration_ms
+        group["tokens"] += span.total_tokens
+        group["cost"] += span.total_cost_micros
+    return groups
+
+
+def _comparison_spans(
+    baseline: TraceDetailOut,
+    candidate: TraceDetailOut,
+) -> list[TraceComparisonSpanOut]:
+    baseline_groups = _span_groups(baseline)
+    candidate_groups = _span_groups(candidate)
+    rows: list[TraceComparisonSpanOut] = []
+    for key in baseline_groups.keys() | candidate_groups.keys():
+        baseline_item = baseline_groups.get(key)
+        candidate_item = candidate_groups.get(key)
+        representative = candidate_item or baseline_item
+        baseline_duration = int(baseline_item["duration"]) if baseline_item else 0
+        candidate_duration = int(candidate_item["duration"]) if candidate_item else 0
+        duration_delta, duration_percent, duration_direction = _comparison_direction(
+            baseline_duration,
+            candidate_duration,
+            lower_is_better=True,
+            minimum_delta=1_000,
+        )
+        if not baseline_item:
+            change_type = "ADDED"
+        elif not candidate_item:
+            change_type = "REMOVED"
+        elif (
+            baseline_item["executions"] != candidate_item["executions"]
+            or baseline_duration != candidate_duration
+            or baseline_item["tokens"] != candidate_item["tokens"]
+            or baseline_item["cost"] != candidate_item["cost"]
+        ):
+            change_type = "MODIFIED"
+        else:
+            change_type = "UNCHANGED"
+        baseline_tokens = int(baseline_item["tokens"]) if baseline_item else 0
+        candidate_tokens = int(candidate_item["tokens"]) if candidate_item else 0
+        baseline_cost = int(baseline_item["cost"]) if baseline_item else 0
+        candidate_cost = int(candidate_item["cost"]) if candidate_item else 0
+        rows.append(
+            TraceComparisonSpanOut(
+                key=key,
+                kind=str(representative["kind"]),
+                node=str(representative["node"]),
+                label=str(representative["label"]),
+                agent_role=str(representative["agent_role"]),
+                change_type=change_type,
+                baseline_executions=int(baseline_item["executions"]) if baseline_item else 0,
+                candidate_executions=int(candidate_item["executions"]) if candidate_item else 0,
+                baseline_duration_ms=baseline_duration,
+                candidate_duration_ms=candidate_duration,
+                duration_delta_ms=duration_delta,
+                duration_delta_percent=duration_percent,
+                duration_direction=duration_direction,
+                baseline_tokens=baseline_tokens,
+                candidate_tokens=candidate_tokens,
+                token_delta=candidate_tokens - baseline_tokens,
+                baseline_cost_micros=baseline_cost,
+                candidate_cost_micros=candidate_cost,
+                cost_delta_micros=candidate_cost - baseline_cost,
+            )
+        )
+    return sorted(
+        rows,
+        key=lambda item: (item.change_type == "UNCHANGED", -abs(item.duration_delta_ms), item.label),
+    )
+
+
+def compare_trace_runs(
+    db: Session,
+    current_user: User,
+    *,
+    baseline_id: int,
+    candidate_id: int,
+) -> TraceComparisonOut:
+    baseline = get_trace_detail(db, current_user, baseline_id)
+    candidate = get_trace_detail(db, current_user, candidate_id)
+    if baseline_id == candidate_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Baseline and candidate must be different")
+    if baseline.run.project_id != candidate.run.project_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Workflow traces must belong to the same project",
+        )
+    if not baseline.run.finished_at or not candidate.run.finished_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only finished workflow traces can be compared",
+        )
+
+    metrics = [
+        _comparison_metric("total_duration_ms", "端到端耗时", "duration", baseline.metrics.total_duration_ms, candidate.metrics.total_duration_ms, minimum_delta=1_000),
+        _comparison_metric("queue_ms", "排队耗时", "duration", baseline.metrics.queue_ms, candidate.metrics.queue_ms, minimum_delta=1_000),
+        _comparison_metric("active_compute_ms", "Agent 计算", "duration", baseline.metrics.active_compute_ms, candidate.metrics.active_compute_ms, minimum_delta=1_000),
+        _comparison_metric("human_wait_ms", "人工等待", "duration", baseline.metrics.human_wait_ms, candidate.metrics.human_wait_ms, minimum_delta=1_000),
+        _comparison_metric("coordination_ms", "协调开销", "duration", baseline.metrics.coordination_ms, candidate.metrics.coordination_ms, minimum_delta=1_000),
+        _comparison_metric("total_tokens", "Token", "tokens", baseline.metrics.total_tokens, candidate.metrics.total_tokens, minimum_delta=100),
+        _comparison_metric("total_cost_micros", "预估成本", "cost", baseline.metrics.total_cost_micros, candidate.metrics.total_cost_micros, minimum_delta=100),
+        _comparison_metric("total_llm_calls", "模型调用", "count", baseline.metrics.total_llm_calls, candidate.metrics.total_llm_calls, lower_is_better=False),
+    ]
+    outcome = _outcome_direction(baseline.run.status, candidate.run.status)
+    verdict, regression_count, improvement_count = _comparison_verdict(outcome, metrics)
+    agents = _comparison_agents(baseline, candidate)
+    spans = _comparison_spans(baseline, candidate)
+    return TraceComparisonOut(
+        baseline=baseline.run,
+        candidate=candidate.run,
+        summary=TraceComparisonSummaryOut(
+            verdict=verdict,
+            outcome_direction=outcome,
+            regression_count=regression_count,
+            improvement_count=improvement_count,
+            changed_agent_count=sum(item.change_type != "UNCHANGED" for item in agents),
+            changed_span_count=sum(item.change_type != "UNCHANGED" for item in spans),
+        ),
+        metrics=metrics,
+        agents=agents,
+        spans=spans,
     )

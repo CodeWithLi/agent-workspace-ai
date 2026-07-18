@@ -29,6 +29,14 @@
           />
         </el-select>
         <el-button
+          class="compare-command"
+          :icon="DataAnalysis"
+          :disabled="!hasComparableRuns"
+          :title="hasComparableRuns ? '对比两次已结束运行' : '当前筛选范围内至少需要两次同项目已结束运行'"
+          @click="openComparison"
+        >对比运行</el-button>
+        <el-button
+          class="refresh-command"
           :icon="Refresh"
           circle
           :loading="loading"
@@ -368,15 +376,30 @@
         </section>
       </div>
     </el-drawer>
+
+    <TraceComparisonDialog
+      :model-value="comparisonDialogOpen"
+      :runs="comparisonRunOptions"
+      :baseline-id="compareBaselineId"
+      :candidate-id="compareCandidateId"
+      :comparison="comparison"
+      :loading="comparisonLoading"
+      :error="comparisonError"
+      @update:baseline-id="compareBaselineId = $event"
+      @update:candidate-id="compareCandidateId = $event"
+      @compare="submitComparison"
+      @close="closeComparison"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
-import { Close, Refresh, View } from '@element-plus/icons-vue'
+import { Close, DataAnalysis, Refresh, View } from '@element-plus/icons-vue'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, getApiErrorMessage } from '../api/client'
-import type { TraceDetail, TraceOverview, TraceSpan, WorkflowTraceStatus } from '../api/types'
+import type { TraceComparison, TraceDetail, TraceOverview, TraceRun, TraceSpan, WorkflowTraceStatus } from '../api/types'
+import TraceComparisonDialog from '../components/TraceComparisonDialog.vue'
 import { renderTraceTrendChart, type TraceTrendChart } from '../lib/traceChart'
 
 const dayOptions = [
@@ -430,8 +453,15 @@ const chartElement = ref<HTMLDivElement | null>(null)
 const detail = ref<TraceDetail | null>(null)
 const detailLoading = ref(false)
 const detailError = ref('')
+const comparisonDialogOpen = ref(false)
+const compareBaselineId = ref<number | null>(null)
+const compareCandidateId = ref<number | null>(null)
+const comparison = ref<TraceComparison | null>(null)
+const comparisonLoading = ref(false)
+const comparisonError = ref('')
 let overviewRequest = 0
 let detailRequest = 0
+let comparisonRequest = 0
 let chart: TraceTrendChart | null = null
 let chartObserver: ResizeObserver | null = null
 
@@ -439,6 +469,29 @@ const selectedRunId = computed(() => {
   const raw = Array.isArray(route.query.run) ? route.query.run[0] : route.query.run
   const value = Number(raw)
   return Number.isInteger(value) && value > 0 ? value : null
+})
+const comparisonQuery = computed(() => ({
+  baselineId: positiveQueryId(route.query.baseline),
+  candidateId: positiveQueryId(route.query.candidate)
+}))
+const comparisonRunOptions = computed(() => {
+  const rows = new Map<number, TraceRun>()
+  for (const run of overview.value?.recent_runs || []) rows.set(run.workflow_id, run)
+  if (comparison.value) {
+    rows.set(comparison.value.baseline.workflow_id, comparison.value.baseline)
+    rows.set(comparison.value.candidate.workflow_id, comparison.value.candidate)
+  }
+  return [...rows.values()].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+})
+const hasComparableRuns = computed(() => {
+  const projectCounts = new Map<number, number>()
+  for (const run of comparisonRunOptions.value) {
+    if (!run.finished_at) continue
+    const count = (projectCounts.get(run.project_id) || 0) + 1
+    if (count >= 2) return true
+    projectCounts.set(run.project_id, count)
+  }
+  return false
 })
 const visibleStatuses = computed(() => Object.entries(overview.value?.status_counts || {})
   .filter(([, count]) => count > 0)
@@ -504,14 +557,103 @@ async function loadDetail(workflowId: number) {
   }
 }
 
+async function loadComparison(baselineId: number, candidateId: number) {
+  const requestId = ++comparisonRequest
+  comparisonLoading.value = true
+  comparisonError.value = ''
+  comparison.value = null
+  try {
+    const { data } = await api.get<TraceComparison>('/traces/compare', {
+      params: { baseline_id: baselineId, candidate_id: candidateId },
+      suppressErrorToast: true
+    })
+    if (requestId === comparisonRequest) comparison.value = data
+  } catch (error) {
+    if (requestId === comparisonRequest) comparisonError.value = getApiErrorMessage(error)
+  } finally {
+    if (requestId === comparisonRequest) comparisonLoading.value = false
+  }
+}
+
 function openTrace(workflowId: number) {
-  void router.push({ query: { ...route.query, run: String(workflowId) } })
+  comparisonDialogOpen.value = false
+  void router.push({
+    query: {
+      ...route.query,
+      run: String(workflowId),
+      baseline: undefined,
+      candidate: undefined
+    }
+  })
 }
 
 function closeTrace() {
   const query = { ...route.query }
   delete query.run
   void router.replace({ query })
+}
+
+function defaultComparisonPair() {
+  const finished = comparisonRunOptions.value.filter((run) => Boolean(run.finished_at))
+  for (const candidate of finished) {
+    const baseline = finished.find((run) => (
+      run.workflow_id !== candidate.workflow_id
+      && run.project_id === candidate.project_id
+      && Date.parse(run.created_at) <= Date.parse(candidate.created_at)
+    ))
+    if (baseline) return { baselineId: baseline.workflow_id, candidateId: candidate.workflow_id }
+  }
+  return null
+}
+
+function openComparison() {
+  comparisonDialogOpen.value = true
+  const pair = defaultComparisonPair()
+  if ((!compareBaselineId.value || !compareCandidateId.value) && pair) {
+    compareBaselineId.value = pair.baselineId
+    compareCandidateId.value = pair.candidateId
+  }
+  if (route.query.run) {
+    const query = { ...route.query }
+    delete query.run
+    void router.replace({ query })
+  }
+}
+
+function submitComparison() {
+  if (!compareBaselineId.value || !compareCandidateId.value) return
+  const baselineId = compareBaselineId.value
+  const candidateId = compareCandidateId.value
+  if (
+    comparisonQuery.value.baselineId === baselineId
+    && comparisonQuery.value.candidateId === candidateId
+  ) {
+    void loadComparison(baselineId, candidateId)
+    return
+  }
+  const query = {
+    ...route.query,
+    baseline: String(baselineId),
+    candidate: String(candidateId),
+    run: undefined
+  }
+  void router.push({ query })
+}
+
+function closeComparison() {
+  comparisonDialogOpen.value = false
+  comparisonRequest += 1
+  comparisonLoading.value = false
+  const query = { ...route.query }
+  delete query.baseline
+  delete query.candidate
+  void router.replace({ query })
+}
+
+function positiveQueryId(value: unknown) {
+  const raw = Array.isArray(value) ? value[0] : value
+  const parsed = Number(raw)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null
 }
 
 const numberFormatter = new Intl.NumberFormat('zh-CN')
@@ -567,7 +709,21 @@ watch(selectedRunId, (workflowId) => {
     detailError.value = ''
   }
 }, { immediate: true })
+watch(comparisonQuery, ({ baselineId, candidateId }) => {
+  if (!baselineId || !candidateId) return
+  compareBaselineId.value = baselineId
+  compareCandidateId.value = candidateId
+  comparisonDialogOpen.value = true
+  void loadComparison(baselineId, candidateId)
+}, { immediate: true })
+watch(compareBaselineId, (baselineId) => {
+  if (!baselineId || !compareCandidateId.value) return
+  const baseline = comparisonRunOptions.value.find((run) => run.workflow_id === baselineId)
+  const candidate = comparisonRunOptions.value.find((run) => run.workflow_id === compareCandidateId.value)
+  if (baseline && candidate && baseline.project_id !== candidate.project_id) compareCandidateId.value = null
+})
 onBeforeUnmount(() => {
+  comparisonRequest += 1
   chartObserver?.disconnect()
   chart?.dispose()
 })
@@ -583,6 +739,7 @@ onBeforeUnmount(() => {
 .trace-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
 .trace-toolbar > .el-select { width: 154px; }
 .trace-toolbar > .el-button { width: 40px; min-width: 40px; height: 40px; }
+.trace-toolbar > .compare-command { width: auto; min-width: 112px; }
 .window-switch { flex: 0 0 auto; }
 .trace-loading { padding: 30px 0; }
 .trace-error { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px; border: 1px solid #fecaca; border-radius: 8px; background: #fef2f2; }
@@ -636,14 +793,15 @@ onBeforeUnmount(() => {
 .event-list { margin: 0; padding: 0; list-style: none; }.event-list li { display: grid; min-height: 68px; grid-template-columns: 74px 14px minmax(0, 1fr); gap: 10px; }.event-list time { padding-top: 3px; color: var(--color-muted-text); font-size: 11px; font-variant-numeric: tabular-nums; }.event-marker { position: relative; width: 8px; height: 8px; margin-top: 6px; border: 2px solid var(--color-primary); border-radius: 50%; background: var(--color-surface); }.event-marker::after { position: absolute; top: 9px; left: 2px; width: 1px; height: 52px; background: var(--color-border); content: ''; }.event-list li:last-child .event-marker::after { display: none; }.event-list strong { font-size: 12px; }.event-list p { margin: 3px 0 5px; color: var(--color-secondary-text); font-size: 12px; }.event-list code { display: block; overflow-wrap: anywhere; color: var(--color-muted-text); font-family: inherit; font-size: 10px; }
 :global(.trace-detail-drawer .el-drawer__body) { padding: 0; overflow-x: hidden; overflow-y: auto; }
 
+@media (max-width: 1380px) { .trace-head { align-items: flex-start; flex-direction: column; }.trace-toolbar { width: 100%; justify-content: flex-start; } }
 @media (max-width: 1180px) {
-  .trace-head { align-items: flex-start; flex-direction: column; }.trace-toolbar { width: 100%; justify-content: flex-start; }.metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.metric-card:nth-child(4), .metric-card:nth-child(5) { grid-column: span 1; }.detail-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.metric-card:nth-child(4), .metric-card:nth-child(5) { grid-column: span 1; }.detail-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 820px) {
-  .trace-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 44px; }.window-switch { grid-column: 1 / -1; }.trace-toolbar > .el-select { width: 100%; }.trace-toolbar > .el-button { width: 44px; height: 44px; }.metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.metric-card:last-child { grid-column: 1 / -1; }.section-head { align-items: flex-start; }.desktop-table { display: none; }.mobile-card-list { display: grid; gap: 10px; }.mobile-data-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }.mobile-card-head { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 12px; }.mobile-card-head > strong { flex: 0 0 auto; font-variant-numeric: tabular-nums; }.mobile-data-card > p { overflow: hidden; margin: 9px 0; color: var(--color-muted-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.mobile-data-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--color-border); }.mobile-data-card dt { color: var(--color-muted-text); font-size: 10px; }.mobile-data-card dd { margin: 3px 0 0; overflow: hidden; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }.run-card-button { display: flex; width: 100%; min-height: 44px; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }.run-card-button > span { min-width: 0; }.run-card-button strong, .run-card-button small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.run-card-button small { margin-top: 3px; color: var(--color-muted-text); font-size: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) minmax(120px, .7fr); padding: 10px 0; }.span-track { grid-column: 1 / -1; grid-row: 2; }.detail-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .trace-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto 44px; }.window-switch { grid-column: 1 / -1; }.trace-toolbar > .el-select { width: 100%; }.trace-toolbar > .el-button { width: 44px; height: 44px; }.trace-toolbar > .compare-command { width: auto; min-width: 112px; }.metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.metric-card:last-child { grid-column: 1 / -1; }.section-head { align-items: flex-start; }.desktop-table { display: none; }.mobile-card-list { display: grid; gap: 10px; }.mobile-data-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }.mobile-card-head { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 12px; }.mobile-card-head > strong { flex: 0 0 auto; font-variant-numeric: tabular-nums; }.mobile-data-card > p { overflow: hidden; margin: 9px 0; color: var(--color-muted-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.mobile-data-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--color-border); }.mobile-data-card dt { color: var(--color-muted-text); font-size: 10px; }.mobile-data-card dd { margin: 3px 0 0; overflow: hidden; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }.run-card-button { display: flex; width: 100%; min-height: 44px; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }.run-card-button > span { min-width: 0; }.run-card-button strong, .run-card-button small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.run-card-button small { margin-top: 3px; color: var(--color-muted-text); font-size: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) minmax(120px, .7fr); padding: 10px 0; }.span-track { grid-column: 1 / -1; grid-row: 2; }.detail-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 520px) {
-  .trace-head { margin-bottom: 18px; }.trace-head h1 { font-size: 24px; }.trace-toolbar { grid-template-columns: minmax(0, 1fr) 44px; }.window-switch { display: flex; width: 100%; }.window-switch :deep(.el-radio-button) { flex: 1; }.window-switch :deep(.el-radio-button__inner) { width: 100%; min-height: 44px; padding: 12px 8px; }.trace-toolbar > .project-filter { grid-column: 1; grid-row: 2; }.trace-toolbar > .status-filter { grid-column: 1 / -1; grid-row: 3; }.trace-toolbar > .el-button { grid-column: 2; grid-row: 2; }.metric-grid { gap: 8px; }.metric-card { min-height: 104px; padding: 13px; }.metric-card strong { overflow: visible; font-size: 21px; white-space: normal; }.metric-card small { white-space: normal; }.status-strip { gap: 8px 14px; }.trace-section { padding: 20px 0; }.section-head { flex-direction: column; }.chart-legend { justify-content: flex-start; }.trend-chart { height: 250px; }.drawer-head { min-height: 70px; padding: 12px 14px; }.drawer-head h2 { max-width: none; font-size: 16px; }.drawer-head > .el-button { width: 44px; min-width: 44px; height: 44px; flex-basis: 44px; }.drawer-loading, .trace-detail { padding: 14px; }.detail-metrics > div { padding: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) 110px; gap: 9px; }.span-copy { grid-template-columns: 46px minmax(0, 1fr); }.span-kind { font-size: 9px; }.span-numbers small { display: none; }.event-list li { grid-template-columns: 58px 12px minmax(0, 1fr); gap: 7px; }
+  .trace-head { margin-bottom: 18px; }.trace-head h1 { font-size: 24px; }.trace-toolbar { grid-template-columns: minmax(0, 1fr) 44px; }.window-switch { display: flex; width: 100%; }.window-switch :deep(.el-radio-button) { flex: 1; }.window-switch :deep(.el-radio-button__inner) { width: 100%; min-height: 44px; padding: 12px 8px; }.trace-toolbar > .project-filter { grid-column: 1; grid-row: 2; }.trace-toolbar > .status-filter { grid-column: 1 / -1; grid-row: 3; }.trace-toolbar > .refresh-command { grid-column: 2; grid-row: 2; }.trace-toolbar > .compare-command { grid-column: 1 / -1; grid-row: 4; width: 100%; min-height: 44px; }.metric-grid { gap: 8px; }.metric-card { min-height: 104px; padding: 13px; }.metric-card strong { overflow: visible; font-size: 21px; white-space: normal; }.metric-card small { white-space: normal; }.status-strip { gap: 8px 14px; }.trace-section { padding: 20px 0; }.section-head { flex-direction: column; }.chart-legend { justify-content: flex-start; }.trend-chart { height: 250px; }.drawer-head { min-height: 70px; padding: 12px 14px; }.drawer-head h2 { max-width: none; font-size: 16px; }.drawer-head > .el-button { width: 44px; min-width: 44px; height: 44px; flex-basis: 44px; }.drawer-loading, .trace-detail { padding: 14px; }.detail-metrics > div { padding: 10px; }.span-row { grid-template-columns: minmax(0, 1fr) 110px; gap: 9px; }.span-copy { grid-template-columns: 46px minmax(0, 1fr); }.span-kind { font-size: 9px; }.span-numbers small { display: none; }.event-list li { grid-template-columns: 58px 12px minmax(0, 1fr); gap: 7px; }
 }
 @media (prefers-reduced-motion: reduce) { .span-bar { transition: none; } }
 </style>

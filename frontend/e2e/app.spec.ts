@@ -505,6 +505,12 @@ async function mockApi(page: Page) {
         status: 'COMPLETED', current_node: 'completed', duration_ms: 480000, queue_ms: 30000,
         total_tokens: 2350, total_cost_micros: 11800, llm_call_count: 2, agent_count: 2, event_count: 8,
         error: '', created_at: '2026-07-18T08:00:00Z', started_at: '2026-07-18T08:00:30Z', finished_at: '2026-07-18T08:08:00Z'
+      },
+      {
+        workflow_id: 87, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
+        status: 'COMPLETED', current_node: 'completed', duration_ms: 600000, queue_ms: 45000,
+        total_tokens: 1850, total_cost_micros: 8000, llm_call_count: 3, agent_count: 2, event_count: 9,
+        error: '', created_at: '2026-07-18T07:00:00Z', started_at: '2026-07-18T07:00:45Z', finished_at: '2026-07-18T07:10:00Z'
       }
     ]
   }
@@ -538,6 +544,46 @@ async function mockApi(page: Page) {
       { id: 3, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'Started specialist branch architect', payload: { role: 'architect', revision_round: 0 }, created_at: '2026-07-18T08:02:10Z' },
       { id: 4, node: 'quality_review', event_type: 'PAUSED', message: 'Workflow is waiting for quality revision direction', payload: { approval_gate: 'quality_review' }, created_at: '2026-07-18T08:06:00Z' },
       { id: 5, node: 'completed', event_type: 'COMPLETED', message: 'Workflow completed', payload: {}, created_at: '2026-07-18T08:08:00Z' }
+    ]
+  }
+  const traceComparison = {
+    baseline: traceOverview.recent_runs[1],
+    candidate: traceOverview.recent_runs[0],
+    summary: {
+      verdict: 'MIXED', outcome_direction: 'UNCHANGED', regression_count: 2, improvement_count: 1,
+      changed_agent_count: 2, changed_span_count: 4
+    },
+    metrics: [
+      { key: 'total_duration_ms', label: '端到端耗时', unit: 'duration', baseline_value: 600000, candidate_value: 480000, delta: -120000, delta_percent: -20, direction: 'IMPROVED', lower_is_better: true },
+      { key: 'queue_ms', label: '排队耗时', unit: 'duration', baseline_value: 45000, candidate_value: 30000, delta: -15000, delta_percent: -33.3, direction: 'IMPROVED', lower_is_better: true },
+      { key: 'active_compute_ms', label: 'Agent 计算', unit: 'duration', baseline_value: 420000, candidate_value: 330000, delta: -90000, delta_percent: -21.4, direction: 'IMPROVED', lower_is_better: true },
+      { key: 'human_wait_ms', label: '人工等待', unit: 'duration', baseline_value: 0, candidate_value: 60000, delta: 60000, delta_percent: null, direction: 'REGRESSED', lower_is_better: true },
+      { key: 'coordination_ms', label: '协调开销', unit: 'duration', baseline_value: 135000, candidate_value: 60000, delta: -75000, delta_percent: -55.6, direction: 'IMPROVED', lower_is_better: true },
+      { key: 'total_tokens', label: 'Token', unit: 'tokens', baseline_value: 1850, candidate_value: 2350, delta: 500, delta_percent: 27, direction: 'REGRESSED', lower_is_better: true },
+      { key: 'total_cost_micros', label: '预估成本', unit: 'cost', baseline_value: 8000, candidate_value: 11800, delta: 3800, delta_percent: 47.5, direction: 'REGRESSED', lower_is_better: true },
+      { key: 'total_llm_calls', label: '模型调用', unit: 'count', baseline_value: 3, candidate_value: 2, delta: -1, delta_percent: -33.3, direction: 'CHANGED', lower_is_better: false }
+    ],
+    agents: [
+      {
+        key: 'architect', agent_id: 3, agent_name: 'AI架构师', agent_role: 'architect', change_type: 'MODIFIED',
+        baseline_providers: ['openai'], candidate_providers: ['openai'], baseline_models: ['gpt-4o-mini'], candidate_models: ['gpt-5.2'],
+        baseline_calls: 1, candidate_calls: 1, baseline_tokens: 900, candidate_tokens: 1450, token_delta: 550,
+        baseline_cost_micros: 3500, candidate_cost_micros: 7500, cost_delta_micros: 4000,
+        baseline_average_latency_ms: 4200, candidate_average_latency_ms: 6800, latency_delta_ms: 2600, latency_direction: 'REGRESSED'
+      },
+      {
+        key: 'project_manager', agent_id: 2, agent_name: 'AI项目经理', agent_role: 'project_manager', change_type: 'MODIFIED',
+        baseline_providers: ['openai'], candidate_providers: ['openai'], baseline_models: ['gpt-4o-mini'], candidate_models: ['gpt-5.2-mini'],
+        baseline_calls: 2, candidate_calls: 1, baseline_tokens: 950, candidate_tokens: 900, token_delta: -50,
+        baseline_cost_micros: 4500, candidate_cost_micros: 4300, cost_delta_micros: -200,
+        baseline_average_latency_ms: 3400, candidate_average_latency_ms: 2900, latency_delta_ms: -500, latency_direction: 'IMPROVED'
+      }
+    ],
+    spans: [
+      { key: 'node:planning:project_manager', kind: 'node', node: 'planning', label: '动态规划', agent_role: 'project_manager', change_type: 'MODIFIED', baseline_executions: 1, candidate_executions: 1, baseline_duration_ms: 120000, candidate_duration_ms: 90000, duration_delta_ms: -30000, duration_delta_percent: -25, duration_direction: 'IMPROVED', baseline_tokens: 950, candidate_tokens: 900, token_delta: -50, baseline_cost_micros: 4500, candidate_cost_micros: 4300, cost_delta_micros: -200 },
+      { key: 'branch:specialists:architect', kind: 'branch', node: 'specialists', label: 'AI架构师', agent_role: 'architect', change_type: 'MODIFIED', baseline_executions: 1, candidate_executions: 1, baseline_duration_ms: 270000, candidate_duration_ms: 210000, duration_delta_ms: -60000, duration_delta_percent: -22.2, duration_direction: 'IMPROVED', baseline_tokens: 900, candidate_tokens: 1450, token_delta: 550, baseline_cost_micros: 3500, candidate_cost_micros: 7500, cost_delta_micros: 4000 },
+      { key: 'wait:quality_review:-', kind: 'wait', node: 'quality_review', label: '人工确认等待', agent_role: '', change_type: 'ADDED', baseline_executions: 0, candidate_executions: 1, baseline_duration_ms: 0, candidate_duration_ms: 60000, duration_delta_ms: 60000, duration_delta_percent: null, duration_direction: 'REGRESSED', baseline_tokens: 0, candidate_tokens: 0, token_delta: 0, baseline_cost_micros: 0, candidate_cost_micros: 0, cost_delta_micros: 0 },
+      { key: 'queue:queue:-', kind: 'queue', node: 'queue', label: '队列等待', agent_role: '', change_type: 'MODIFIED', baseline_executions: 1, candidate_executions: 1, baseline_duration_ms: 45000, candidate_duration_ms: 30000, duration_delta_ms: -15000, duration_delta_percent: -33.3, duration_direction: 'IMPROVED', baseline_tokens: 0, candidate_tokens: 0, token_delta: 0, baseline_cost_micros: 0, candidate_cost_micros: 0, cost_delta_micros: 0 }
     ]
   }
   type MockGenerationJob = {
@@ -941,6 +987,7 @@ async function mockApi(page: Page) {
       body = evaluationRuns.find((item) => item.id === id)
     }
     else if (method === 'GET' && path === '/traces/overview') body = traceOverview
+    else if (method === 'GET' && path === '/traces/compare') body = traceComparison
     else if (method === 'GET' && path === '/traces/88') body = traceDetail
     else if (method === 'GET' && path === '/agents') body = discussionAgents
     else if (method === 'GET' && path === '/agents/conversations') body = []
@@ -1153,6 +1200,49 @@ test('traces multi-agent runtime metrics and opens a deep-linked run detail', as
   await expect(page).toHaveURL(/\/traces$/)
 })
 
+test('compares multi-agent runs and restores the comparison deep link', async ({ page }, testInfo) => {
+  await page.goto('/traces')
+
+  await page.getByRole('button', { name: '对比运行' }).click()
+  const dialog = page.locator('.trace-comparison-dialog')
+  await expect(dialog).toBeVisible()
+  await expect(dialog.locator('.comparison-picker')).toContainText('#87')
+  await expect(dialog.locator('.comparison-picker')).toContainText('#88')
+
+  await dialog.getByRole('button', { name: '开始对比' }).click()
+  await expect.poll(() => {
+    const url = new URL(page.url())
+    return `${url.searchParams.get('baseline')}:${url.searchParams.get('candidate')}`
+  }).toBe('87:88')
+  await expect(dialog.getByText('改善与退化并存', { exact: true })).toBeVisible()
+  await expect(dialog.getByRole('heading', { name: '关键指标' })).toBeVisible()
+  await expect(dialog.getByRole('heading', { name: 'Agent 变化' })).toBeVisible()
+  await expect(dialog.getByRole('heading', { name: '节点与分支变化' })).toBeVisible()
+  const visibleAgentComparison = dialog.locator('.desktop-comparison-table:visible, .mobile-comparison-list:visible').first()
+  await expect(visibleAgentComparison).toContainText('gpt-4o-mini')
+  await expect(visibleAgentComparison).toContainText('gpt-5.2')
+
+  const dialogOverflow = await dialog.locator('.el-dialog__body').evaluate((body) => body.scrollWidth - body.clientWidth)
+  expect(dialogOverflow).toBeLessThanOrEqual(0)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+  if (testInfo.project.name === 'mobile-chromium') {
+    const closeTarget = await dialog.locator('.el-dialog__headerbtn').evaluate((button) => {
+      const rect = button.getBoundingClientRect()
+      return { width: rect.width, height: rect.height }
+    })
+    expect(closeTarget.width).toBeGreaterThanOrEqual(44)
+    expect(closeTarget.height).toBeGreaterThanOrEqual(44)
+  }
+
+  await page.reload()
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByText('改善与退化并存', { exact: true })).toBeVisible()
+  await expect.poll(() => {
+    const url = new URL(page.url())
+    return `${url.searchParams.get('baseline')}:${url.searchParams.get('candidate')}`
+  }).toBe('87:88')
+})
+
 test('keeps runtime tracing usable at 375px, landscape and reduced motion', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile-chromium', 'Mobile viewport regression')
   await page.emulateMedia({ reducedMotion: 'reduce' })
@@ -1161,7 +1251,7 @@ test('keeps runtime tracing usable at 375px, landscape and reduced motion', asyn
 
   await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
   await expect(page.getByRole('button', { name: '刷新运行追踪' })).toHaveCSS('width', '44px')
-  await expect(page.locator('.mobile-card-list:visible .run-card')).toHaveCount(1)
+  await expect(page.locator('.mobile-card-list:visible .run-card')).toHaveCount(2)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 
   await page.setViewportSize({ width: 844, height: 390 })

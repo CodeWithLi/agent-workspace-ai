@@ -659,6 +659,82 @@ class TraceDetailOut(BaseModel):
     events: list[TraceEventDetailOut]
 
 
+class TraceComparisonMetricOut(BaseModel):
+    key: str
+    label: str
+    unit: str
+    baseline_value: int
+    candidate_value: int
+    delta: int
+    delta_percent: float | None
+    direction: str
+    lower_is_better: bool
+
+
+class TraceComparisonAgentOut(BaseModel):
+    key: str
+    agent_id: int | None
+    agent_name: str
+    agent_role: str
+    change_type: str
+    baseline_providers: list[str]
+    candidate_providers: list[str]
+    baseline_models: list[str]
+    candidate_models: list[str]
+    baseline_calls: int
+    candidate_calls: int
+    baseline_tokens: int
+    candidate_tokens: int
+    token_delta: int
+    baseline_cost_micros: int
+    candidate_cost_micros: int
+    cost_delta_micros: int
+    baseline_average_latency_ms: int
+    candidate_average_latency_ms: int
+    latency_delta_ms: int
+    latency_direction: str
+
+
+class TraceComparisonSpanOut(BaseModel):
+    key: str
+    kind: str
+    node: str
+    label: str
+    agent_role: str
+    change_type: str
+    baseline_executions: int
+    candidate_executions: int
+    baseline_duration_ms: int
+    candidate_duration_ms: int
+    duration_delta_ms: int
+    duration_delta_percent: float | None
+    duration_direction: str
+    baseline_tokens: int
+    candidate_tokens: int
+    token_delta: int
+    baseline_cost_micros: int
+    candidate_cost_micros: int
+    cost_delta_micros: int
+
+
+class TraceComparisonSummaryOut(BaseModel):
+    verdict: str
+    outcome_direction: str
+    regression_count: int
+    improvement_count: int
+    changed_agent_count: int
+    changed_span_count: int
+
+
+class TraceComparisonOut(BaseModel):
+    baseline: TraceRunOut
+    candidate: TraceRunOut
+    summary: TraceComparisonSummaryOut
+    metrics: list[TraceComparisonMetricOut]
+    agents: list[TraceComparisonAgentOut]
+    spans: list[TraceComparisonSpanOut]
+
+
 class KnowledgeDocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

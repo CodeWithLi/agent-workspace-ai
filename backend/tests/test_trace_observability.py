@@ -20,7 +20,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.observability import get_trace_detail, get_trace_overview
+from app.observability import compare_trace_runs, get_trace_detail, get_trace_overview
 
 
 NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
@@ -267,7 +267,82 @@ def _seed_trace_data(db: Session) -> dict[str, object]:
         "beta": beta,
         "completed": completed,
         "failed": failed,
+        "architect": architect,
+        "product_manager": product_manager,
+        "operations": operations,
     }
+
+
+def _add_comparison_candidate(db: Session, data: dict[str, object]) -> WorkflowRun:
+    base = NOW - timedelta(minutes=30)
+    candidate = WorkflowRun(
+        project_id=data["alpha"].id,
+        user_id=data["alice"].id,
+        status=WorkflowStatus.completed,
+        current_node="completed",
+        state_json=json.dumps({"prompt": "candidate-secret", "artifact": "candidate-body"}),
+        created_at=base,
+        started_at=base + timedelta(seconds=30),
+        finished_at=base + timedelta(minutes=10),
+    )
+    db.add(candidate)
+    db.flush()
+    db.add_all(
+        [
+            _event(candidate, "QUEUED", base, node="requirement"),
+            _event(candidate, "STARTED", base + timedelta(seconds=30), node="requirement"),
+            _event(candidate, "NODE_STARTED", base + timedelta(minutes=1), node="specialists"),
+            _event(
+                candidate,
+                "BRANCH_STARTED",
+                base + timedelta(minutes=1, seconds=10),
+                node="specialists",
+                payload={"role": "architect", "revision_round": 0},
+            ),
+            _event(
+                candidate,
+                "BRANCH_COMPLETED",
+                base + timedelta(minutes=4, seconds=10),
+                node="specialists",
+                payload={"role": "architect", "revision_round": 0, "output_chars": 6200},
+            ),
+            _event(
+                candidate,
+                "NODE_COMPLETED",
+                base + timedelta(minutes=5),
+                node="specialists",
+                payload={"next_node": "report"},
+            ),
+            _event(candidate, "NODE_STARTED", base + timedelta(minutes=5, seconds=30), node="report"),
+            _event(
+                candidate,
+                "NODE_COMPLETED",
+                base + timedelta(minutes=9, seconds=30),
+                node="report",
+                payload={"next_node": "completed"},
+            ),
+            _event(candidate, "COMPLETED", base + timedelta(minutes=10), node="completed"),
+        ]
+    )
+    db.add(
+        LLMUsage(
+            user_id=data["alice"].id,
+            project_id=data["alpha"].id,
+            workflow_id=candidate.id,
+            agent_id=data["architect"].id,
+            operation="workflow",
+            provider="openai",
+            model="gpt-candidate",
+            input_tokens=300,
+            output_tokens=200,
+            total_tokens=500,
+            estimated_cost_micros=5000,
+            latency_ms=5000,
+            created_at=base + timedelta(minutes=4),
+        )
+    )
+    db.commit()
+    return candidate
 
 
 @pytest.fixture(autouse=True)
@@ -446,7 +521,100 @@ def test_trace_sample_truncation_keeps_exact_database_totals(
     assert overview.metrics.total_llm_calls == 4
 
 
+def test_trace_comparison_reports_mixed_efficiency_agent_and_span_changes(db: Session) -> None:
+    data = _seed_trace_data(db)
+    candidate = _add_comparison_candidate(db, data)
+
+    comparison = compare_trace_runs(
+        db,
+        data["alice"],
+        baseline_id=data["completed"].id,
+        candidate_id=candidate.id,
+    )
+    metrics = {item.key: item for item in comparison.metrics}
+    assert comparison.summary.verdict == "MIXED"
+    assert comparison.summary.outcome_direction == "UNCHANGED"
+    assert comparison.summary.regression_count == 2
+    assert comparison.summary.improvement_count == 1
+    assert metrics["total_duration_ms"].baseline_value == 780_000
+    assert metrics["total_duration_ms"].candidate_value == 600_000
+    assert metrics["total_duration_ms"].direction == "IMPROVED"
+    assert metrics["total_tokens"].delta == 150
+    assert metrics["total_tokens"].direction == "REGRESSED"
+    assert metrics["total_cost_micros"].delta == 1500
+    assert metrics["total_cost_micros"].direction == "REGRESSED"
+    assert metrics["total_llm_calls"].direction == "CHANGED"
+
+    agents = {item.key: item for item in comparison.agents}
+    assert agents["architect"].baseline_models == ["gpt-trace"]
+    assert agents["architect"].candidate_models == ["gpt-candidate"]
+    assert agents["architect"].change_type == "MODIFIED"
+    assert agents["product_manager"].change_type == "REMOVED"
+    assert agents["operations_analyst"].change_type == "REMOVED"
+    spans = {item.key: item for item in comparison.spans}
+    assert spans["branch:specialists:architect"].duration_direction == "IMPROVED"
+    assert spans["wait:quality_review:-"].change_type == "REMOVED"
+
+    serialized = comparison.model_dump_json()
+    assert "super-secret-prompt" not in serialized
+    assert "secret-body" not in serialized
+    assert "candidate-secret" not in serialized
+    assert "candidate-body" not in serialized
+
+
+def test_trace_comparison_rejects_invalid_or_inaccessible_pairs(db: Session) -> None:
+    data = _seed_trace_data(db)
+    candidate = _add_comparison_candidate(db, data)
+
+    with pytest.raises(HTTPException) as same_run:
+        compare_trace_runs(
+            db,
+            data["alice"],
+            baseline_id=candidate.id,
+            candidate_id=candidate.id,
+        )
+    assert same_run.value.status_code == 400
+
+    with pytest.raises(HTTPException) as different_project:
+        compare_trace_runs(
+            db,
+            data["admin"],
+            baseline_id=data["completed"].id,
+            candidate_id=data["failed"].id,
+        )
+    assert different_project.value.status_code == 409
+
+    unfinished = WorkflowRun(
+        project_id=data["alpha"].id,
+        user_id=data["alice"].id,
+        status=WorkflowStatus.queued,
+        current_node="requirement",
+        state_json="{}",
+        created_at=NOW - timedelta(minutes=2),
+    )
+    db.add(unfinished)
+    db.commit()
+    with pytest.raises(HTTPException) as active_run:
+        compare_trace_runs(
+            db,
+            data["alice"],
+            baseline_id=candidate.id,
+            candidate_id=unfinished.id,
+        )
+    assert active_run.value.status_code == 409
+
+    with pytest.raises(HTTPException) as hidden:
+        compare_trace_runs(
+            db,
+            data["alice"],
+            baseline_id=candidate.id,
+            candidate_id=data["failed"].id,
+        )
+    assert hidden.value.status_code == 404
+
+
 def test_trace_routes_are_published_in_openapi() -> None:
     paths = app.openapi()["paths"]
     assert "/api/v1/traces/overview" in paths
+    assert "/api/v1/traces/compare" in paths
     assert "/api/v1/traces/{workflow_id}" in paths

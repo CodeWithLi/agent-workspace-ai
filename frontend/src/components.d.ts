@@ -58,6 +58,7 @@ declare module 'vue' {
     PrototypeCanvas: typeof import('./components/PrototypeCanvas.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    TraceComparisonDialog: typeof import('./components/TraceComparisonDialog.vue')['default']
   }
   export interface GlobalDirectives {
     vLoading: typeof import('element-plus/es')['ElLoadingDirective']

@@ -48,6 +48,8 @@
 
 模型调用先按 `workflow_id` 关联，再使用 Agent 角色和调用完成时间归属到最具体的并行分支；无法匹配分支时才归属外层节点，因此同一调用不会在分支与父节点重复累计。运行详情分别展示总耗时、排队、Agent 计算、人工等待和剩余协调开销。汇总中的运行数、状态、Token、成本和趋势是数据库聚合；P95、Agent 性能与节点瓶颈为显式标记截断的最近样本分析。
 
+跨运行基线对比只接受同一项目的两次已结束运行。指标使用 5% 相对容差与最小绝对变化过滤噪声，分别对齐运行结果、端到端阶段、Agent 角色及节点/分支聚合；结论区分 `IMPROVED`、`REGRESSED`、`MIXED` 和 `UNCHANGED`。Token 或成本降低只表示效率改善，不替代内容质量评测。
+
 追踪属于运行元数据视图：响应不读取或返回 `state_json`、Prompt、人工反馈和产物正文，事件 payload 使用字段允许列表。管理员可查看全平台运行，普通成员只能查看本人发起且仍可访问对应项目的运行。
 
 ## Saga 写操作一致性
@@ -73,4 +75,4 @@ dispatcher 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 支持多副本。`locked_
 
 运行中的 worker 使用 `lease_token` fencing，并以租约时长三分之一为周期续租。所有节点提交和 Saga 写入都会锁定工作流行并校验 token；旧 worker 即使在超时后恢复，也不能提交业务写入。
 
-实现文件：`backend/app/langgraph/workflow.py`、`backend/app/observability.py`、`frontend/src/views/TraceCenterView.vue`。
+实现文件：`backend/app/langgraph/workflow.py`、`backend/app/observability.py`、`frontend/src/views/TraceCenterView.vue`、`frontend/src/components/TraceComparisonDialog.vue`。

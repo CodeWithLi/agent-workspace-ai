@@ -656,6 +656,86 @@ export interface TraceDetail {
   events: TraceEventDetail[]
 }
 
+export type TraceComparisonDirection = 'IMPROVED' | 'REGRESSED' | 'CHANGED' | 'UNCHANGED'
+export type TraceComparisonChangeType = 'ADDED' | 'REMOVED' | 'MODIFIED' | 'UNCHANGED'
+export type TraceComparisonVerdict = 'IMPROVED' | 'REGRESSED' | 'MIXED' | 'UNCHANGED'
+
+export interface TraceComparisonMetric {
+  key: string
+  label: string
+  unit: 'duration' | 'tokens' | 'cost' | 'count'
+  baseline_value: number
+  candidate_value: number
+  delta: number
+  delta_percent?: number | null
+  direction: TraceComparisonDirection
+  lower_is_better: boolean
+}
+
+export interface TraceComparisonAgent {
+  key: string
+  agent_id?: number | null
+  agent_name: string
+  agent_role: string
+  change_type: TraceComparisonChangeType
+  baseline_providers: string[]
+  candidate_providers: string[]
+  baseline_models: string[]
+  candidate_models: string[]
+  baseline_calls: number
+  candidate_calls: number
+  baseline_tokens: number
+  candidate_tokens: number
+  token_delta: number
+  baseline_cost_micros: number
+  candidate_cost_micros: number
+  cost_delta_micros: number
+  baseline_average_latency_ms: number
+  candidate_average_latency_ms: number
+  latency_delta_ms: number
+  latency_direction: TraceComparisonDirection
+}
+
+export interface TraceComparisonSpan {
+  key: string
+  kind: string
+  node: string
+  label: string
+  agent_role: string
+  change_type: TraceComparisonChangeType
+  baseline_executions: number
+  candidate_executions: number
+  baseline_duration_ms: number
+  candidate_duration_ms: number
+  duration_delta_ms: number
+  duration_delta_percent?: number | null
+  duration_direction: TraceComparisonDirection
+  baseline_tokens: number
+  candidate_tokens: number
+  token_delta: number
+  baseline_cost_micros: number
+  candidate_cost_micros: number
+  cost_delta_micros: number
+}
+
+export interface TraceComparisonSummary {
+  verdict: TraceComparisonVerdict
+  outcome_direction: TraceComparisonDirection
+  regression_count: number
+  improvement_count: number
+  changed_agent_count: number
+  changed_span_count: number
+}
+
+export interface TraceComparison {
+  baseline: TraceRun
+  candidate: TraceRun
+  summary: TraceComparisonSummary
+  metrics: TraceComparisonMetric[]
+  agents: TraceComparisonAgent[]
+  spans: TraceComparisonSpan[]
+}
+
 export type PrototypeComponentType =
   | 'heading'
   | 'text'

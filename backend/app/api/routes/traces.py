@@ -4,8 +4,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models import User, WorkflowStatus
-from app.observability import get_trace_detail, get_trace_overview
-from app.schemas import TraceDetailOut, TraceOverviewOut
+from app.observability import compare_trace_runs, get_trace_detail, get_trace_overview
+from app.schemas import TraceComparisonOut, TraceDetailOut, TraceOverviewOut
 
 
 router = APIRouter()
@@ -25,6 +25,21 @@ def trace_overview(
         days=days,
         project_id=project_id,
         workflow_status=workflow_status,
+    )
+
+
+@router.get("/compare", response_model=TraceComparisonOut)
+def trace_comparison(
+    baseline_id: int = Query(ge=1),
+    candidate_id: int = Query(ge=1),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TraceComparisonOut:
+    return compare_trace_runs(
+        db,
+        current_user,
+        baseline_id=baseline_id,
+        candidate_id=candidate_id,
     )
 
 
