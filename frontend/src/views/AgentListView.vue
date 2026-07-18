@@ -79,8 +79,8 @@
             <el-table-column prop="release_note" label="发布说明" min-width="180" />
             <el-table-column label="操作" width="130" align="right">
               <template #default="{ row }">
-                <el-button v-if="row.status === 'DRAFT'" link type="primary" @click="publishVersion(row.id)">发布</el-button>
-                <el-button v-if="row.status === 'ARCHIVED'" link @click="rollbackVersion(row.version)">回滚</el-button>
+                <el-button v-if="row.status === 'DRAFT'" link type="primary" @click="evaluateVersion(row.id)">评测发布</el-button>
+                <el-button v-if="row.status === 'ARCHIVED'" link @click="createRollbackCandidate(row)">回滚评测</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -90,7 +90,7 @@
         <el-input v-model="releaseNote" class="release-note-input" placeholder="版本说明" maxlength="500" />
         <el-button @click="configDialog = false">取消</el-button>
         <el-button :loading="savingDraft" :disabled="!validForm" @click="saveDraft">保存草稿</el-button>
-        <el-button type="primary" :loading="saving" :disabled="!validForm" @click="saveAgent">发布配置</el-button>
+        <el-button type="primary" :loading="saving" :disabled="!validForm" @click="saveAgent">保存并评测</el-button>
       </template>
     </el-dialog>
 
@@ -106,7 +106,6 @@ import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import type { Agent, AgentTool, AgentVersion } from '../api/types'
-import { confirmDestructiveAction } from '../utils/confirm'
 
 interface ConfigTool extends AgentTool {
   allowedRoleValues: string[]
@@ -201,29 +200,39 @@ async function saveDraft() {
   }
 }
 
-async function publishVersion(versionId: number) {
+async function evaluateVersion(versionId: number) {
   if (!activeAgent.value) return
-  await api.post(`/agents/${activeAgent.value.id}/versions/${versionId}/publish`)
-  await Promise.all([loadAgents(), loadVersions()])
-  ElMessage.success('Agent 版本已发布')
+  configDialog.value = false
+  await router.push({ path: '/evaluations', query: { agent: activeAgent.value.id, version: versionId } })
 }
 
-async function rollbackVersion(version: number) {
+async function createRollbackCandidate(value: unknown) {
   if (!activeAgent.value) return
-  if (!await confirmDestructiveAction(`将基于 v${version} 创建新的回滚版本，确认继续吗？`, '回滚 Agent 版本')) return
-  await api.post(`/agents/${activeAgent.value.id}/versions/${version}/rollback`)
-  await Promise.all([loadAgents(), loadVersions()])
-  ElMessage.success(`已从 v${version} 创建回滚版本`)
+  const version = value as AgentVersion
+  const { data } = await api.post<AgentVersion>(`/agents/${activeAgent.value.id}/versions`, {
+    description: version.description,
+    system_prompt: version.system_prompt,
+    model: version.model,
+    memory_enable: version.memory_enable,
+    knowledge_access: version.knowledge_access,
+    human_approval_required: version.human_approval_required,
+    concurrency_limit: version.concurrency_limit,
+    release_note: `Rollback candidate from v${version.version}`
+  })
+  configDialog.value = false
+  await router.push({ path: '/evaluations', query: { agent: activeAgent.value.id, version: data.id } })
 }
 
 async function saveAgent() {
   if (!activeAgent.value) return
   saving.value = true
   try {
-    await api.patch(`/agents/${activeAgent.value.id}`, form)
-    ElMessage.success('Agent 配置已保存')
+    const { data } = await api.post<AgentVersion>(`/agents/${activeAgent.value.id}/versions`, {
+      ...form,
+      release_note: releaseNote.value
+    })
     configDialog.value = false
-    await loadAgents()
+    await router.push({ path: '/evaluations', query: { agent: activeAgent.value.id, version: data.id } })
   } finally {
     saving.value = false
   }

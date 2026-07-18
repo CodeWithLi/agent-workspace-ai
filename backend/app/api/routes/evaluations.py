@@ -15,15 +15,32 @@ from app.evaluation import (
     enqueue_evaluation_run,
     retry_evaluation_run,
 )
-from app.models import EvaluationCase, EvaluationResult, EvaluationRun, EvaluationSuiteRevision, User
+from app.models import (
+    Agent,
+    AgentEvaluationRelease,
+    EvaluationCase,
+    EvaluationResult,
+    EvaluationRun,
+    EvaluationSuiteRevision,
+    Notification,
+    User,
+    UserRole,
+)
 from app.schemas import (
+    AgentEvaluationReleaseOut,
     EvaluationCaseCreate,
     EvaluationCaseOut,
     EvaluationCaseUpdate,
     EvaluationResultOut,
+    EvaluationReleaseRequest,
     EvaluationRunCreate,
     EvaluationRunDetailOut,
     EvaluationRunOut,
+)
+from app.services.evaluation_releases import (
+    EvaluationReleaseConflict,
+    publish_candidate_release,
+    rollback_candidate_release,
 )
 
 
@@ -91,7 +108,34 @@ def result_out(item: EvaluationResult) -> EvaluationResultOut:
     )
 
 
-def run_out(item: EvaluationRun, db: Session) -> EvaluationRunOut:
+def release_out(
+    item: AgentEvaluationRelease,
+    db: Session,
+) -> AgentEvaluationReleaseOut:
+    agent = db.get(Agent, item.agent_id)
+    return AgentEvaluationReleaseOut(
+        id=item.id,
+        evaluation_run_id=item.evaluation_run_id,
+        agent_id=item.agent_id,
+        agent_name=agent.name if agent else f"Agent #{item.agent_id}",
+        candidate_version_id=item.candidate_version_id,
+        candidate_version=item.candidate_version,
+        previous_version=item.previous_version,
+        expected_current_version=item.expected_current_version,
+        status=item.status,
+        published_by_user_id=item.published_by_user_id,
+        published_at=item.published_at,
+        rollback_version=item.rollback_version,
+        rolled_back_by_user_id=item.rolled_back_by_user_id,
+        rolled_back_at=item.rolled_back_at,
+    )
+
+
+def run_out(
+    item: EvaluationRun,
+    db: Session,
+    releases_by_run: dict[int, AgentEvaluationRelease] | None = None,
+) -> EvaluationRunOut:
     revision = db.get(EvaluationSuiteRevision, item.suite_revision_id) if item.suite_revision_id else None
     raw_agents = _json_loads(item.agent_snapshot_json, {})
     agents = [
@@ -105,12 +149,35 @@ def run_out(item: EvaluationRun, db: Session) -> EvaluationRunOut:
         for role, agent in raw_agents.items()
         if isinstance(agent, dict) and agent.get("id") is not None
     ]
+    release = (
+        releases_by_run.get(item.id)
+        if releases_by_run is not None
+        else db.scalar(
+            select(AgentEvaluationRelease).where(
+                AgentEvaluationRelease.evaluation_run_id == item.id
+            )
+        )
+    )
+    candidate_agent_name = next(
+        (
+            str(agent.get("name") or "")
+            for agent in raw_agents.values()
+            if isinstance(agent, dict) and agent.get("id") == item.candidate_agent_id
+        ),
+        "",
+    )
     return EvaluationRunOut(
         id=item.id,
         request_id=item.request_id,
         status=item.status,
         suite_revision=revision.version if revision else None,
         baseline_run_id=item.baseline_run_id,
+        candidate_agent_id=item.candidate_agent_id,
+        candidate_agent_name=candidate_agent_name,
+        candidate_version_id=item.candidate_version_id,
+        candidate_version=item.candidate_version,
+        expected_current_version=item.expected_current_version,
+        release=release_out(release, db) if release else None,
         total_cases=item.total_cases,
         completed_cases=item.completed_cases,
         progress_percent=round(item.completed_cases / max(item.total_cases, 1) * 100),
@@ -270,6 +337,7 @@ def _enqueue(
                 request_id=payload.request_id,
                 user_id=current_admin.id,
                 baseline_run_id=payload.baseline_run_id,
+                candidate_version_id=payload.candidate_version_id,
             )
         except IntegrityError:
             db.rollback()
@@ -278,6 +346,7 @@ def _enqueue(
                 request_id=payload.request_id,
                 user_id=current_admin.id,
                 baseline_run_id=payload.baseline_run_id,
+                candidate_version_id=payload.candidate_version_id,
             )
     except EvaluationRequestConflict as exc:
         db.rollback()
@@ -296,6 +365,8 @@ def _enqueue(
                 "request_id": item.request_id,
                 "suite_revision_id": item.suite_revision_id,
                 "baseline_run_id": item.baseline_run_id,
+                "candidate_agent_id": item.candidate_agent_id,
+                "candidate_version": item.candidate_version,
             },
             request=request,
         )
@@ -333,7 +404,20 @@ def list_evaluation_runs(
     db: Session = Depends(get_db),
 ) -> list[EvaluationRunOut]:
     items = list(db.scalars(select(EvaluationRun).order_by(EvaluationRun.created_at.desc()).limit(100)))
-    return [run_out(item, db) for item in items]
+    run_ids = [item.id for item in items]
+    releases = (
+        list(
+            db.scalars(
+                select(AgentEvaluationRelease).where(
+                    AgentEvaluationRelease.evaluation_run_id.in_(run_ids)
+                )
+            )
+        )
+        if run_ids
+        else []
+    )
+    releases_by_run = {release.evaluation_run_id: release for release in releases}
+    return [run_out(item, db, releases_by_run) for item in items]
 
 
 @router.get("/runs/{run_id}", response_model=EvaluationRunDetailOut, name="get_evaluation_run")
@@ -343,6 +427,160 @@ def get_evaluation_run(
     db: Session = Depends(get_db),
 ) -> EvaluationRunDetailOut:
     return detail_out(_get_run(run_id, db), db)
+
+
+def _notify_release_admins(
+    db: Session,
+    *,
+    title: str,
+    content: str,
+    sent_at,
+) -> None:
+    recipients = list(
+        db.scalars(
+            select(User).where(
+                User.role == UserRole.admin,
+                User.is_active.is_(True),
+            )
+        )
+    )
+    for recipient in recipients:
+        db.add(
+            Notification(
+                user_id=recipient.id,
+                recipient_user_id=recipient.id,
+                recipient_email=recipient.email,
+                title=title,
+                content=content,
+                channel="in_app",
+                status="SENT",
+                sent_at=sent_at,
+            )
+        )
+
+
+@router.post(
+    "/runs/{run_id}/publish",
+    response_model=AgentEvaluationReleaseOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def publish_evaluation_run(
+    run_id: int,
+    payload: EvaluationReleaseRequest,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentEvaluationReleaseOut:
+    try:
+        release, created = publish_candidate_release(
+            db,
+            run_id=run_id,
+            request_id=payload.request_id,
+            user_id=current_admin.id,
+        )
+    except IntegrityError:
+        db.rollback()
+        try:
+            release, created = publish_candidate_release(
+                db,
+                run_id=run_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+            )
+        except EvaluationReleaseConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except EvaluationReleaseConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if created:
+        record_audit(
+            db,
+            "evaluation.release_publish",
+            current_admin.id,
+            resource_type="agent_evaluation_release",
+            resource_id=release.id,
+            details={
+                "evaluation_run_id": release.evaluation_run_id,
+                "agent_id": release.agent_id,
+                "candidate_version": release.candidate_version,
+                "previous_version": release.previous_version,
+            },
+            request=request,
+        )
+        _notify_release_admins(
+            db,
+            title="Agent 候选版本已发布",
+            content=(
+                f"评测运行 #{release.evaluation_run_id} 已通过门禁并发布 "
+                f"Agent #{release.agent_id} v{release.candidate_version}，"
+                f"原生产版本为 v{release.previous_version}。"
+            ),
+            sent_at=release.published_at,
+        )
+        db.commit()
+        db.refresh(release)
+    return release_out(release, db)
+
+
+@router.post(
+    "/releases/{release_id}/rollback",
+    response_model=AgentEvaluationReleaseOut,
+)
+def rollback_evaluation_release(
+    release_id: int,
+    payload: EvaluationReleaseRequest,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AgentEvaluationReleaseOut:
+    try:
+        release, created = rollback_candidate_release(
+            db,
+            release_id=release_id,
+            request_id=payload.request_id,
+            user_id=current_admin.id,
+        )
+    except IntegrityError:
+        db.rollback()
+        try:
+            release, created = rollback_candidate_release(
+                db,
+                release_id=release_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+            )
+        except EvaluationReleaseConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except EvaluationReleaseConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if created:
+        record_audit(
+            db,
+            "evaluation.release_rollback",
+            current_admin.id,
+            resource_type="agent_evaluation_release",
+            resource_id=release.id,
+            details={
+                "evaluation_run_id": release.evaluation_run_id,
+                "agent_id": release.agent_id,
+                "candidate_version": release.candidate_version,
+                "rollback_version": release.rollback_version,
+            },
+            request=request,
+        )
+        _notify_release_admins(
+            db,
+            title="Agent 发布已回滚",
+            content=(
+                f"评测发布 #{release.id} 已回滚，Agent #{release.agent_id} "
+                f"当前为恢复版本 v{release.rollback_version}。"
+            ),
+            sent_at=release.rolled_back_at,
+        )
+        db.commit()
+        db.refresh(release)
+    return release_out(release, db)
 
 
 @router.post("/runs/{run_id}/cancel", response_model=EvaluationRunOut)

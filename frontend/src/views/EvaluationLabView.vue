@@ -6,32 +6,77 @@
         <h1>Agent 评测实验室</h1>
         <p>对当前多 Agent 团队执行版本化回归评测，保留逐案例证据与发布门禁结论。</p>
       </div>
-      <div class="run-controls">
+    </div>
+
+    <section class="evaluation-launcher" aria-label="创建评测运行">
+      <div class="launch-field mode-field">
+        <span class="launch-label">评测类型</span>
+        <el-segmented
+          v-model="runMode"
+          :options="runModeOptions"
+          aria-label="选择评测类型"
+          @change="handleRunModeChange"
+        />
+      </div>
+      <div v-if="runMode === 'CHALLENGER'" class="launch-field">
+        <label class="launch-label" for="candidate-agent">候选 Agent</label>
         <el-select
-          v-model="baselineRunId"
-          clearable
-          class="baseline-select"
-          aria-label="选择评测基线"
-          placeholder="无基线运行"
+          id="candidate-agent"
+          v-model="candidateAgentId"
+          aria-label="选择候选 Agent"
+          placeholder="选择 Agent"
+          @change="handleCandidateAgentChange"
+        >
+          <el-option v-for="agent in agents" :key="agent.id" :label="agent.name" :value="agent.id" />
+        </el-select>
+      </div>
+      <div v-if="runMode === 'CHALLENGER'" class="launch-field">
+        <label class="launch-label" for="candidate-version">草稿版本</label>
+        <el-select
+          id="candidate-version"
+          v-model="candidateVersionId"
+          :loading="loadingVersions"
+          :disabled="!candidateAgentId"
+          aria-label="选择草稿版本"
+          placeholder="选择草稿"
         >
           <el-option
-            v-for="run in baselineRuns"
+            v-for="version in candidateVersions"
+            :key="version.id"
+            :label="`v${version.version} · ${version.release_note || version.model}`"
+            :value="version.id"
+          />
+        </el-select>
+      </div>
+      <div class="launch-field baseline-field">
+        <label class="launch-label" for="evaluation-baseline">{{ runMode === 'CHALLENGER' ? '生产基线' : '对比基线' }}</label>
+        <el-select
+          id="evaluation-baseline"
+          v-model="baselineRunId"
+          :clearable="runMode !== 'CHALLENGER'"
+          aria-label="选择评测基线"
+          :placeholder="runMode === 'CHALLENGER' ? '选择生产基线' : '无基线运行'"
+        >
+          <el-option
+            v-for="run in availableBaselineRuns"
             :key="run.id"
             :label="`#${run.id} · ${(run.average_score * 100).toFixed(1)}% · ${formatDate(run.created_at)}`"
             :value="run.id"
           />
         </el-select>
+      </div>
+      <div class="launch-action">
         <el-button
           type="primary"
           :icon="VideoPlay"
           :loading="creatingRun"
-          :disabled="!enabledCases.length || hasActiveRun"
+          :disabled="!canCreateRun"
           @click="createRun"
         >
-          运行团队评测
+          {{ runMode === 'CHALLENGER' ? '运行候选评测' : '运行团队评测' }}
         </el-button>
       </div>
-    </div>
+    </section>
 
     <div class="metric-band" aria-label="最近评测摘要">
       <article class="metric-tile">
@@ -95,7 +140,9 @@
             <el-table-column prop="id" label="运行" min-width="130" sortable>
               <template #default="{ row }">
                 <button class="run-link" @click="openRun(row)">#{{ row.id }}</button>
-                <span class="run-revision">测试集 v{{ row.suite_revision || '—' }}</span>
+                <span class="run-revision">
+                  {{ row.candidate_version ? `${row.candidate_agent_name} · Challenger v${row.candidate_version}` : `测试集 v${row.suite_revision || '—'}` }}
+                </span>
               </template>
             </el-table-column>
             <el-table-column label="状态" min-width="120">
@@ -140,7 +187,10 @@
         <div v-loading="loading" class="mobile-run-list">
           <article v-for="run in filteredRuns" :key="run.id" class="run-card">
             <button class="run-card-main" @click="openRun(run)">
-              <span><strong>#{{ run.id }}</strong><small>测试集 v{{ run.suite_revision || '—' }}</small></span>
+              <span>
+                <strong>#{{ run.id }}</strong>
+                <small>{{ run.candidate_version ? `${run.candidate_agent_name} · Challenger v${run.candidate_version}` : `测试集 v${run.suite_revision || '—'}` }}</small>
+              </span>
               <el-tag :type="statusType(run.status)" size="small" effect="plain">{{ statusLabel(run.status) }}</el-tag>
             </button>
             <dl>
@@ -238,6 +288,46 @@
           <div><span>相对基线</span><strong :class="deltaClass(detailRun.score_delta)">{{ formatDelta(detailRun.score_delta) }}</strong></div>
           <div><span>门禁</span><strong :class="gateClass(detailRun)">{{ gateLabel(detailRun) }}</strong></div>
         </div>
+
+        <section
+          v-if="detailRun.candidate_version"
+          class="release-evidence"
+          aria-label="候选版本发布证据"
+        >
+          <div class="release-identity">
+            <span>Challenger 发布</span>
+            <strong>
+              {{ detailRun.candidate_agent_name }} v{{ detailRun.expected_current_version }} → v{{ detailRun.candidate_version }}
+            </strong>
+            <small>评测 #{{ detailRun.id }} · 基线 #{{ detailRun.baseline_run_id }}</small>
+          </div>
+          <div class="release-state" role="status" aria-live="polite">
+            <el-tag :type="releaseStatusType(detailRun)" effect="plain">
+              {{ releaseStatusLabel(detailRun) }}
+            </el-tag>
+            <span>{{ releaseStatusMessage(detailRun) }}</span>
+          </div>
+          <div class="release-actions">
+            <el-button
+              v-if="!detailRun.release"
+              type="primary"
+              :icon="Upload"
+              :loading="publishingRelease"
+              :disabled="!canPublishRelease(detailRun)"
+              @click="publishRelease(detailRun)"
+            >
+              发布候选版本
+            </el-button>
+            <el-button
+              v-if="detailRun.release?.status === 'PUBLISHED'"
+              :icon="RefreshLeft"
+              :loading="rollingBackRelease"
+              @click="rollbackRelease(detailRun)"
+            >
+              回滚此发布
+            </el-button>
+          </div>
+        </section>
 
         <el-progress
           v-if="isActive(detailRun)"
@@ -344,11 +434,14 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Close, Plus, Refresh, RefreshRight, Search, VideoPlay } from '@element-plus/icons-vue'
+import { Close, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay } from '@element-plus/icons-vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
+import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
+import 'element-plus/es/components/message-box/style/css.mjs'
 import { api } from '../api/client'
-import type { Agent, EvaluationCase, EvaluationRun, EvaluationRunDetail } from '../api/types'
+import type { Agent, AgentEvaluationRelease, AgentVersion, EvaluationCase, EvaluationRun, EvaluationRunDetail } from '../api/types'
 import { confirmDestructiveAction } from '../utils/confirm'
 
 const ACTIVE_STATUSES = new Set(['QUEUED', 'RUNNING', 'CANCELLING'])
@@ -360,15 +453,27 @@ const dimensions = [
   { key: 'completeness', label: '完整性' },
   { key: 'safety', label: '安全性' }
 ]
+const runModeOptions = [
+  { label: '团队基线', value: 'TEAM' },
+  { label: '候选版本', value: 'CHALLENGER' }
+]
 
+const route = useRoute()
 const agents = ref<Agent[]>([])
 const cases = ref<EvaluationCase[]>([])
 const runs = ref<EvaluationRun[]>([])
 const loading = ref(false)
 const creatingRun = ref(false)
+const loadingVersions = ref(false)
+const publishingRelease = ref(false)
+const rollingBackRelease = ref(false)
 const savingCase = ref(false)
 const activeView = ref('runs')
 const baselineRunId = ref<number | null>(null)
+const runMode = ref<'TEAM' | 'CHALLENGER'>('TEAM')
+const candidateAgentId = ref<number | null>(null)
+const candidateVersionId = ref<number | null>(null)
+const candidateVersions = ref<AgentVersion[]>([])
 const runQuery = ref('')
 const caseQuery = ref('')
 const statusFilter = ref('')
@@ -395,7 +500,22 @@ const enabledCases = computed(() => cases.value.filter((item) => item.enabled))
 const latestRun = computed(() => runs.value[0] || null)
 const activeRun = computed(() => runs.value.find((run) => isActive(run)) || null)
 const hasActiveRun = computed(() => Boolean(activeRun.value))
-const baselineRuns = computed(() => runs.value.filter((run) => run.status === 'COMPLETED' && run.suite_revision))
+const baselineRuns = computed(() => runs.value.filter((run) => (
+  run.status === 'COMPLETED' && run.gate_passed === true && run.suite_revision
+)))
+const availableBaselineRuns = computed(() => {
+  if (runMode.value !== 'CHALLENGER' || !candidateAgentId.value) return baselineRuns.value
+  const agent = agents.value.find((item) => item.id === candidateAgentId.value)
+  if (!agent) return []
+  return baselineRuns.value.filter((run) => run.agent_snapshots.some((snapshot) => (
+    snapshot.id === agent.id && snapshot.version === agent.current_version
+  )))
+})
+const canCreateRun = computed(() => {
+  if (!enabledCases.value.length || hasActiveRun.value) return false
+  if (runMode.value === 'TEAM') return true
+  return Boolean(candidateAgentId.value && candidateVersionId.value && baselineRunId.value)
+})
 const filteredRuns = computed(() => {
   const query = runQuery.value.trim().toLocaleLowerCase()
   return runs.value.filter((run) => {
@@ -429,6 +549,45 @@ function requestId() {
   return globalThis.crypto?.randomUUID?.() || `evaluation-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+function selectMatchingBaseline() {
+  if (runMode.value === 'CHALLENGER') {
+    baselineRunId.value = availableBaselineRuns.value[0]?.id || null
+  }
+}
+
+async function loadCandidateVersions(agentId: number, preferredVersionId?: number) {
+  loadingVersions.value = true
+  candidateVersionId.value = null
+  try {
+    const { data } = await api.get<AgentVersion[]>(`/agents/${agentId}/versions`)
+    candidateVersions.value = data.filter((version) => version.status === 'DRAFT')
+    candidateVersionId.value = candidateVersions.value.some((version) => version.id === preferredVersionId)
+      ? preferredVersionId || null
+      : candidateVersions.value[0]?.id || null
+  } finally {
+    loadingVersions.value = false
+  }
+}
+
+async function handleCandidateAgentChange(value: unknown) {
+  const agentId = Number(value)
+  candidateAgentId.value = Number.isFinite(agentId) ? agentId : null
+  candidateVersions.value = []
+  selectMatchingBaseline()
+  if (candidateAgentId.value) await loadCandidateVersions(candidateAgentId.value)
+}
+
+function handleRunModeChange() {
+  if (runMode.value === 'TEAM') {
+    candidateAgentId.value = null
+    candidateVersionId.value = null
+    candidateVersions.value = []
+    baselineRunId.value = baselineRuns.value[0]?.id || null
+    return
+  }
+  selectMatchingBaseline()
+}
+
 function isActive(run: EvaluationRun) {
   return ACTIVE_STATUSES.has(run.status)
 }
@@ -455,6 +614,8 @@ function deltaClass(value?: number | null) {
 function gateLabel(value?: unknown) {
   const run = value as EvaluationRun | null | undefined
   if (!run) return '待评测'
+  if (run.release?.status === 'PUBLISHED') return '已发布'
+  if (run.release?.status === 'ROLLED_BACK') return '已回滚'
   if (run.gate_passed === null || run.gate_passed === undefined) return isActive(run) ? '评测中' : '待评测'
   return run.gate_passed ? '可发布' : '已阻断'
 }
@@ -463,6 +624,31 @@ function gateClass(value?: unknown) {
   const run = value as EvaluationRun | null | undefined
   if (!run || run.gate_passed === null || run.gate_passed === undefined) return 'gate-pending'
   return run.gate_passed ? 'gate-pass' : 'gate-fail'
+}
+
+function releaseStatusLabel(run: EvaluationRun) {
+  if (run.release?.status === 'PUBLISHED') return '已发布'
+  if (run.release?.status === 'ROLLED_BACK') return '已回滚'
+  return run.gate_passed ? '门禁通过' : '禁止发布'
+}
+
+function releaseStatusType(run: EvaluationRun) {
+  if (run.release?.status === 'ROLLED_BACK') return 'info'
+  return run.release?.status === 'PUBLISHED' || run.gate_passed ? 'success' : 'danger'
+}
+
+function releaseStatusMessage(run: EvaluationRun) {
+  if (run.release?.status === 'PUBLISHED') return `候选版本 v${run.release.candidate_version} 已发布`
+  if (run.release?.status === 'ROLLED_BACK') return `发布已回滚至恢复版本 v${run.release.rollback_version}`
+  if (!run.gate_passed) return '门禁未通过，禁止发布'
+  if (!canPublishRelease(run)) return '生产版本已变化，需重新评测'
+  return '评测通过，可安全发布'
+}
+
+function canPublishRelease(run: EvaluationRun) {
+  if (run.status !== 'COMPLETED' || run.gate_passed !== true || run.release) return false
+  const agent = agents.value.find((item) => item.id === run.candidate_agent_id)
+  return Boolean(agent && agent.current_version === run.expected_current_version)
 }
 
 function statusLabel(status: string) {
@@ -522,7 +708,16 @@ async function loadAll() {
     agents.value = agentsResponse.data
     cases.value = casesResponse.data
     runs.value = runsResponse.data
-    if (!baselineRunId.value) baselineRunId.value = baselineRuns.value[0]?.id || null
+    const queryAgentId = Number(route.query.agent || 0)
+    const queryVersionId = Number(route.query.version || 0)
+    if (queryAgentId && agents.value.some((agent) => agent.id === queryAgentId)) {
+      runMode.value = 'CHALLENGER'
+      candidateAgentId.value = queryAgentId
+      selectMatchingBaseline()
+      await loadCandidateVersions(queryAgentId, queryVersionId || undefined)
+    } else if (!baselineRunId.value) {
+      baselineRunId.value = baselineRuns.value[0]?.id || null
+    }
     syncPolling()
   } finally {
     loading.value = false
@@ -555,7 +750,8 @@ async function createRun() {
   try {
     const { data } = await api.post<EvaluationRun>('/evaluations/runs', {
       request_id: requestId(),
-      baseline_run_id: baselineRunId.value || null
+      baseline_run_id: baselineRunId.value || null,
+      candidate_version_id: runMode.value === 'CHALLENGER' ? candidateVersionId.value : null
     })
     runs.value = [data, ...runs.value.filter((run) => run.id !== data.id)]
     activeView.value = 'runs'
@@ -599,6 +795,63 @@ async function retryRun(value: unknown) {
   if (detailRun.value?.id === data.id) await loadRunDetail(data.id)
   ElMessage.success(`评测运行 #${run.id} 已重新入队`)
   syncPolling()
+}
+
+function applyRelease(runId: number, release: AgentEvaluationRelease) {
+  runs.value = runs.value.map((run) => run.id === runId ? { ...run, release } : run)
+  if (detailRun.value?.id === runId) detailRun.value = { ...detailRun.value, release }
+  agents.value = agents.value.map((agent) => {
+    if (agent.id !== release.agent_id) return agent
+    const currentVersion = release.status === 'PUBLISHED'
+      ? release.candidate_version
+      : release.rollback_version || agent.current_version
+    return { ...agent, current_version: currentVersion }
+  })
+}
+
+async function publishRelease(run: EvaluationRunDetail) {
+  try {
+    await ElMessageBox.confirm(
+      `生产版本 v${run.expected_current_version} 将升级到 v${run.candidate_version}，评测证据将永久关联本次发布。`,
+      '发布候选版本',
+      {
+        type: 'warning',
+        confirmButtonText: '确认发布',
+        cancelButtonText: '取消'
+      }
+    )
+  } catch {
+    return
+  }
+  publishingRelease.value = true
+  try {
+    const { data } = await api.post<AgentEvaluationRelease>(`/evaluations/runs/${run.id}/publish`, {
+      request_id: requestId()
+    })
+    applyRelease(run.id, data)
+    ElMessage.success(`Agent v${data.candidate_version} 已发布`)
+  } finally {
+    publishingRelease.value = false
+  }
+}
+
+async function rollbackRelease(run: EvaluationRunDetail) {
+  const release = run.release
+  if (!release) return
+  if (!await confirmDestructiveAction(
+    `将为 Agent v${release.previous_version} 创建新的恢复版本，发布证据会保留。确认继续吗？`,
+    '回滚评测发布'
+  )) return
+  rollingBackRelease.value = true
+  try {
+    const { data } = await api.post<AgentEvaluationRelease>(`/evaluations/releases/${release.id}/rollback`, {
+      request_id: requestId()
+    })
+    applyRelease(run.id, data)
+    ElMessage.success(`发布已回滚至恢复版本 v${data.rollback_version}`)
+  } finally {
+    rollingBackRelease.value = false
+  }
 }
 
 function openCaseDialog(value?: unknown) {
@@ -674,9 +927,15 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .evaluation-page { max-width: 1480px; }
-.evaluation-head { align-items: flex-end; }
-.run-controls { display: flex; align-items: center; gap: 10px; }
-.baseline-select { width: 270px; }
+.evaluation-head { align-items: flex-end; margin-bottom: 14px; }
+.evaluation-launcher { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 18px; padding: 14px 16px; border-block: 1px solid var(--color-border); background: var(--color-surface); }
+.launch-field { display: grid; min-width: 180px; gap: 6px; }
+.launch-field :deep(.el-select) { width: 100%; }
+.mode-field { min-width: 220px; }
+.baseline-field { min-width: 270px; }
+.launch-label { color: var(--color-secondary-text); font-size: 12px; font-weight: 650; }
+.launch-action { margin-left: auto; }
+.launch-action .el-button { min-height: 40px; margin: 0; }
 .metric-band { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
 .metric-tile { min-width: 0; padding: 16px 18px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
 .metric-tile span, .metric-tile small { display: block; color: var(--color-muted-text); }
@@ -718,6 +977,15 @@ onBeforeUnmount(() => {
 .detail-summary span, .detail-summary strong { display: block; }
 .detail-summary span { color: var(--color-muted-text); font-size: 11px; }
 .detail-summary strong { margin-top: 3px; overflow: hidden; color: var(--color-foreground); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.release-evidence { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(240px, 1fr) auto; align-items: center; gap: 18px; margin-bottom: 18px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--color-primary) 24%, var(--color-border)); border-radius: 8px; background: var(--color-primary-soft); }
+.release-identity span, .release-identity strong, .release-identity small { display: block; }
+.release-identity span { color: var(--color-primary-hover); font-size: 11px; font-weight: 700; }
+.release-identity strong { margin-top: 3px; color: var(--color-foreground); font-size: 15px; overflow-wrap: anywhere; }
+.release-identity small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
+.release-state { display: flex; align-items: center; min-width: 0; gap: 8px; }
+.release-state span { color: var(--color-secondary-text); font-size: 12px; overflow-wrap: anywhere; }
+.release-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.release-actions .el-button { margin: 0; }
 .detail-section { margin-top: 24px; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
 .section-heading h2 { margin: 0; color: var(--color-foreground); font-size: 16px; }
@@ -758,19 +1026,25 @@ onBeforeUnmount(() => {
 .case-rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 
 @media (max-width: 980px) {
+  .evaluation-launcher { flex-wrap: wrap; }
+  .launch-field { flex: 1 1 220px; }
+  .launch-action { margin-left: 0; }
   .metric-band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .active-run-band { grid-template-columns: 1fr auto; }
   .active-run-band .el-progress { grid-column: 1 / -1; grid-row: 2; }
   .view-toolbar { align-items: flex-start; flex-direction: column; }
   .toolbar-filters { width: 100%; }
   .toolbar-filters .el-input { flex: 1; width: auto; }
+  .release-evidence { grid-template-columns: 1fr auto; }
+  .release-state { grid-column: 1 / -1; grid-row: 2; }
 }
 
 @media (max-width: 640px) {
   .evaluation-head { align-items: stretch; }
-  .run-controls { align-items: stretch; flex-direction: column; width: 100%; }
-  .baseline-select { width: 100%; }
-  .run-controls .el-button { min-height: 44px; margin: 0; }
+  .evaluation-launcher { align-items: stretch; flex-direction: column; padding: 12px 0; }
+  .launch-field, .mode-field, .baseline-field { width: 100%; min-width: 0; }
+  .launch-action { width: 100%; }
+  .launch-action .el-button { width: 100%; min-height: 44px; }
   .metric-band { gap: 8px; }
   .metric-tile { padding: 13px 14px; }
   .metric-tile strong { font-size: 20px; }
@@ -799,6 +1073,10 @@ onBeforeUnmount(() => {
   .case-card-actions .el-button { min-height: 44px; margin: 0; }
   :deep(.el-input__inner), :deep(.el-textarea__inner) { font-size: 16px; }
   .detail-summary { grid-template-columns: repeat(2, 1fr); }
+  .release-evidence { grid-template-columns: 1fr; gap: 12px; padding: 14px; }
+  .release-state { grid-column: auto; grid-row: auto; align-items: flex-start; flex-direction: column; }
+  .release-actions { justify-content: stretch; }
+  .release-actions .el-button { width: 100%; min-height: 44px; }
   .dimension-row { grid-template-columns: 72px minmax(90px, 1fr) 86px; gap: 8px; }
   .result-title { grid-template-columns: minmax(0, 1fr) 58px; }
   .result-title .el-tag { display: none; }

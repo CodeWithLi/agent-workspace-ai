@@ -95,6 +95,29 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
             "ON workflow_runs(parent_workflow_id)"
         )
 
+    evaluation_run_columns = columns("evaluation_runs")
+    evaluation_run_additions = {
+        "candidate_agent_id": "INTEGER REFERENCES agents(id) ON DELETE SET NULL",
+        "candidate_version_id": (
+            "INTEGER REFERENCES agent_prompt_versions(id) ON DELETE SET NULL"
+        ),
+        "candidate_version": "INTEGER",
+        "expected_current_version": "INTEGER",
+    }
+    for name, definition in evaluation_run_additions.items():
+        if "evaluation_runs" in tables and name not in evaluation_run_columns:
+            statements.append(f"ALTER TABLE evaluation_runs ADD COLUMN {name} {definition}")
+    if "evaluation_runs" in tables and "candidate_agent_id" not in evaluation_run_columns:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_evaluation_runs_candidate_agent_id "
+            "ON evaluation_runs(candidate_agent_id)"
+        )
+    if "evaluation_runs" in tables and "candidate_version_id" not in evaluation_run_columns:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_evaluation_runs_candidate_version_id "
+            "ON evaluation_runs(candidate_version_id)"
+        )
+
     notification_columns = columns("notifications")
     notification_additions = {
         "recipient_user_id": "INTEGER REFERENCES users(id) ON DELETE SET NULL",

@@ -49,8 +49,10 @@
 - `POST /agents/messages/{message_id}/feedback`
 - `POST /agents/messages/{message_id}/regenerate`
 - `GET|POST /evaluations/cases`、`PATCH|DELETE /evaluations/cases/{id}`
-- `POST /evaluations/runs`、`GET /evaluations/runs`、`GET /evaluations/runs/{id}`
+- `POST /evaluations/runs`、`GET /evaluations/runs`、`GET /evaluations/runs/{id}`；创建 Challenger 时同时提交 `baseline_run_id` 与 `candidate_version_id`
 - `POST /evaluations/runs/{id}/cancel`、`POST /evaluations/runs/{id}/retry`
+- `POST /evaluations/runs/{id}/publish`：幂等发布已通过门禁且生产版本未漂移的 Challenger
+- `POST /evaluations/releases/{id}/rollback`：幂等创建恢复版本并保留原发布证据
 - `POST /evaluations/run` 保留为兼容入口；新客户端应使用带 `request_id` 的异步 `/evaluations/runs`。
 
 SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `conversation_id`、`agent_id` 和 `agent_name`。

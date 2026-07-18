@@ -1151,6 +1151,28 @@ class EvaluationCaseOut(BaseModel):
 class EvaluationRunCreate(BaseModel):
     request_id: str = Field(min_length=8, max_length=64)
     baseline_run_id: int | None = Field(default=None, ge=1)
+    candidate_version_id: int | None = Field(default=None, ge=1)
+
+
+class EvaluationReleaseRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class AgentEvaluationReleaseOut(BaseModel):
+    id: int
+    evaluation_run_id: int
+    agent_id: int
+    agent_name: str
+    candidate_version_id: int | None
+    candidate_version: int
+    previous_version: int
+    expected_current_version: int
+    status: str
+    published_by_user_id: int | None
+    published_at: datetime
+    rollback_version: int | None
+    rolled_back_by_user_id: int | None
+    rolled_back_at: datetime | None
 
 
 class EvaluationAgentSnapshotOut(BaseModel):
@@ -1199,6 +1221,12 @@ class EvaluationRunOut(BaseModel):
     status: str
     suite_revision: int | None
     baseline_run_id: int | None
+    candidate_agent_id: int | None
+    candidate_agent_name: str
+    candidate_version_id: int | None
+    candidate_version: int | None
+    expected_current_version: int | None
+    release: AgentEvaluationReleaseOut | None
     total_cases: int
     completed_cases: int
     progress_percent: int

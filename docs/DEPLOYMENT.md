@@ -87,7 +87,7 @@ MINIO_SECRET_KEY=...
 
 AI 原型生成使用独立的持久化 dispatcher。API 只负责把任务写入 PostgreSQL 并返回 `202`；worker 通过带 fencing token 的租约认领任务，阶段进度和终态由 SSE 恢复。租约心跳必须持续运行，`PROTOTYPE_GENERATION_LEASE_SECONDS` 应大于心跳间隔并覆盖短暂数据库抖动；滚动发布超过关机宽限后，未完成任务会由其他实例在租约过期后接管。生产环境应监控原型任务队列、失败率、重试次数和租约恢复事件。
 
-Agent 评测同样使用 PostgreSQL 持久化 dispatcher，并通过 `FOR UPDATE SKIP LOCKED` 支持多副本认领。`EVALUATION_LEASE_SECONDS` 必须覆盖单次 Agent/Judge 调用；worker 会在每个案例落库后续租，异常重启从已完成案例继续。生产发布应监控 `agent_workspace_evaluation_queue`、`agent_workspace_evaluation_duration_seconds`、Judge 降级和发布门禁失败审计事件。
+Agent 评测同样使用 PostgreSQL 持久化 dispatcher，并通过 `FOR UPDATE SKIP LOCKED` 支持多副本认领。`EVALUATION_LEASE_SECONDS` 必须覆盖单次 Agent/Judge 调用；worker 会在每个案例落库后续租，异常重启从已完成案例继续。生产发布应监控 `agent_workspace_evaluation_queue`、`agent_workspace_evaluation_duration_seconds`、Judge 降级、发布门禁失败、`evaluation.release_publish` 与 `evaluation.release_rollback` 审计事件。发布和回滚依赖数据库行锁与唯一索引，所有 API 副本必须连接同一主数据库。
 
 管理员可在系统设置页覆盖模型、Embedding、RAG、计费、注册、通知与运行控制参数。数据库、Redis、MinIO、Milvus 地址及 `SECRET_KEY` 属于启动级配置，只能由部署环境提供。运行时密钥使用 `SECRET_KEY` 派生密钥加密保存，轮换 `SECRET_KEY` 前必须先清除或重新写入这些密钥。多副本每 15 秒刷新一次数据库覆盖值。
 

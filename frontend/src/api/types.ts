@@ -362,12 +362,35 @@ export interface EvaluationAgentSnapshot {
   model: string
 }
 
+export interface AgentEvaluationRelease {
+  id: number
+  evaluation_run_id: number
+  agent_id: number
+  agent_name: string
+  candidate_version_id?: number | null
+  candidate_version: number
+  previous_version: number
+  expected_current_version: number
+  status: 'PUBLISHED' | 'ROLLED_BACK'
+  published_by_user_id?: number | null
+  published_at: string
+  rollback_version?: number | null
+  rolled_back_by_user_id?: number | null
+  rolled_back_at?: string | null
+}
+
 export interface EvaluationRun {
   id: number
   request_id?: string | null
   status: string
   suite_revision?: number | null
   baseline_run_id?: number | null
+  candidate_agent_id?: number | null
+  candidate_agent_name: string
+  candidate_version_id?: number | null
+  candidate_version?: number | null
+  expected_current_version?: number | null
+  release?: AgentEvaluationRelease | null
   total_cases: number
   completed_cases: number
   progress_percent: number

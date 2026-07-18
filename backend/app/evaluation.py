@@ -23,6 +23,7 @@ from app.core.llm_usage import bind_llm_usage
 from app.core.metrics import EVALUATION_DURATION
 from app.models import (
     Agent,
+    AgentPromptVersion,
     EvaluationCase,
     EvaluationResult,
     EvaluationRun,
@@ -127,6 +128,25 @@ def evaluation_agent_snapshot(agent: Agent) -> dict[str, Any]:
     }
 
 
+def evaluation_version_snapshot(
+    agent: Agent,
+    version: AgentPromptVersion,
+) -> dict[str, Any]:
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "role": str(getattr(agent.role, "value", agent.role)),
+        "version": version.version,
+        "description": version.description,
+        "system_prompt": version.system_prompt,
+        "model": version.model,
+        "memory_enable": version.memory_enable,
+        "knowledge_access": version.knowledge_access,
+        "human_approval_required": version.human_approval_required,
+        "concurrency_limit": version.concurrency_limit,
+    }
+
+
 def _suite_revision(
     db: Session,
     cases_snapshot: list[dict[str, Any]],
@@ -154,6 +174,7 @@ def enqueue_evaluation_run(
     request_id: str,
     user_id: int | None,
     baseline_run_id: int | None = None,
+    candidate_version_id: int | None = None,
 ) -> tuple[EvaluationRun, bool]:
     request_id = request_id.strip()[:64]
     if not request_id:
@@ -163,6 +184,7 @@ def enqueue_evaluation_run(
         "request_id": request_id,
         "user_id": user_id,
         "baseline_run_id": baseline_run_id,
+        "candidate_version_id": candidate_version_id,
     }
     payload_hash = _payload_hash(stable_payload)
     if existing:
@@ -178,6 +200,7 @@ def enqueue_evaluation_run(
     cases_snapshot = [evaluation_case_snapshot(case) for case in cases]
     revision = _suite_revision(db, cases_snapshot, user_id)
 
+    baseline = None
     if baseline_run_id is not None:
         baseline = db.get(EvaluationRun, baseline_run_id)
         if not baseline or baseline.status != "COMPLETED":
@@ -190,11 +213,41 @@ def enqueue_evaluation_run(
     agent_snapshot = {
         str(getattr(agent.role, "value", agent.role)): evaluation_agent_snapshot(agent) for agent in agents
     }
+    candidate_agent = None
+    candidate_version = None
+    expected_current_version = None
+    if candidate_version_id is not None:
+        candidate_version = db.get(AgentPromptVersion, candidate_version_id)
+        if not candidate_version or candidate_version.status != "DRAFT":
+            raise ValueError("Candidate Agent version must be an existing draft")
+        candidate_agent = db.get(Agent, candidate_version.agent_id)
+        if not candidate_agent:
+            raise ValueError("Candidate Agent no longer exists")
+        candidate_role = str(getattr(candidate_agent.role, "value", candidate_agent.role))
+        if candidate_role not in roles:
+            raise ValueError("Candidate Agent has no enabled evaluation cases")
+        if baseline is None:
+            raise ValueError("Candidate evaluation requires a completed production baseline")
+        if baseline.suite_revision_id != revision.id:
+            raise ValueError("Candidate evaluation baseline must use the current test suite revision")
+        baseline_agents = _json_loads(baseline.agent_snapshot_json, {})
+        baseline_agent = baseline_agents.get(candidate_role, {})
+        expected_current_version = candidate_agent.current_version
+        if (
+            baseline_agent.get("id") != candidate_agent.id
+            or baseline_agent.get("version") != expected_current_version
+        ):
+            raise ValueError("Candidate evaluation baseline does not match the current production version")
+        agent_snapshot[candidate_role] = evaluation_version_snapshot(candidate_agent, candidate_version)
     run = EvaluationRun(
         request_id=request_id,
         request_payload_hash=payload_hash,
         suite_revision_id=revision.id,
         baseline_run_id=baseline_run_id,
+        candidate_agent_id=candidate_agent.id if candidate_agent else None,
+        candidate_version_id=candidate_version.id if candidate_version else None,
+        candidate_version=candidate_version.version if candidate_version else None,
+        expected_current_version=expected_current_version,
         status="QUEUED",
         total_cases=len(cases_snapshot),
         completed_cases=0,

@@ -210,12 +210,19 @@ const discussionAgents = [
 
 function mockEvaluationRun(id: number, status = 'COMPLETED') {
   const completed = status === 'COMPLETED'
+  const candidate = id === 81
   return {
     id,
     request_id: `evaluation-${id}`,
     status,
     suite_revision: 3,
     baseline_run_id: id === 81 ? 80 : id === 82 ? 81 : null,
+    candidate_agent_id: candidate ? 2 : null,
+    candidate_agent_name: candidate ? 'AI架构师' : '',
+    candidate_version_id: candidate ? 202 : null,
+    candidate_version: candidate ? 2 : null,
+    expected_current_version: candidate ? 1 : null,
+    release: null,
     total_cases: 2,
     completed_cases: completed ? 2 : 0,
     progress_percent: completed ? 100 : 0,
@@ -232,8 +239,8 @@ function mockEvaluationRun(id: number, status = 'COMPLETED') {
       ? {}
       : { requirements: 0.8, correctness: 0.82, relevance: 0.84, completeness: 0.78, safety: 1 },
     agent_snapshots: [
-      { id: 1, name: 'AI产品经理', role: 'product_manager', version: 2, model: 'test-model' },
-      { id: 2, name: 'AI架构师', role: 'architect', version: 3, model: 'test-model' }
+      { id: 1, name: 'AI产品经理', role: 'product_manager', version: 1, model: 'test-model' },
+      { id: 2, name: 'AI架构师', role: 'architect', version: candidate ? 2 : 1, model: 'test-model' }
     ],
     error: '',
     attempt_count: 1,
@@ -1049,6 +1056,40 @@ async function mockApi(page: Page) {
       evaluationRuns = [queued, ...evaluationRuns.filter((item) => item.id !== 82)]
       body = queued
     }
+    else if (method === 'POST' && /^\/evaluations\/runs\/\d+\/publish$/.test(path)) {
+      const id = Number(path.split('/')[3])
+      const run = evaluationRuns.find((item) => item.id === id)
+      const release = {
+        id: 601,
+        evaluation_run_id: id,
+        agent_id: run?.candidate_agent_id || 2,
+        agent_name: run?.candidate_agent_name || 'AI架构师',
+        candidate_version_id: run?.candidate_version_id || 202,
+        candidate_version: run?.candidate_version || 2,
+        previous_version: run?.expected_current_version || 1,
+        expected_current_version: run?.expected_current_version || 1,
+        status: 'PUBLISHED',
+        published_by_user_id: 1,
+        published_at: '2026-07-18T10:05:00Z',
+        rollback_version: null,
+        rolled_back_by_user_id: null,
+        rolled_back_at: null
+      }
+      evaluationRuns = evaluationRuns.map((item) => item.id === id ? { ...item, release } : item)
+      body = release
+    }
+    else if (method === 'POST' && /^\/evaluations\/releases\/\d+\/rollback$/.test(path)) {
+      const run = evaluationRuns.find((item) => item.release?.id === Number(path.split('/')[3]))
+      const release = {
+        ...run?.release,
+        status: 'ROLLED_BACK',
+        rollback_version: 3,
+        rolled_back_by_user_id: 1,
+        rolled_back_at: '2026-07-18T10:10:00Z'
+      }
+      evaluationRuns = evaluationRuns.map((item) => item.id === run?.id ? { ...item, release } : item)
+      body = release
+    }
     else if (method === 'POST' && /^\/evaluations\/runs\/\d+\/(cancel|retry)$/.test(path)) {
       const parts = path.split('/')
       const id = Number(parts[3])
@@ -1079,6 +1120,45 @@ async function mockApi(page: Page) {
     else if (method === 'GET' && path === '/traces/88') body = traceDetail
     else if (method === 'GET' && path === '/traces/87') body = { ...traceDetail, run: traceOverview.recent_runs[1] }
     else if (method === 'GET' && path === '/agents') body = discussionAgents
+    else if (method === 'GET' && /^\/agents\/\d+\/tools$/.test(path)) body = []
+    else if (method === 'GET' && /^\/agents\/\d+\/versions$/.test(path)) {
+      const agentId = Number(path.split('/')[2])
+      const agent = discussionAgents.find((item) => item.id === agentId)
+      body = agent ? [
+        {
+          id: agentId * 100 + 2,
+          agent_id: agentId,
+          version: 2,
+          status: 'DRAFT',
+          description: agent.description,
+          system_prompt: `${agent.name}候选提示词`,
+          model: agent.model,
+          memory_enable: true,
+          knowledge_access: true,
+          human_approval_required: false,
+          concurrency_limit: 4,
+          release_note: '质量候选版本',
+          created_at: '2026-07-18T09:30:00Z',
+          published_at: null
+        },
+        {
+          id: agentId * 100 + 1,
+          agent_id: agentId,
+          version: 1,
+          status: 'PUBLISHED',
+          description: agent.description,
+          system_prompt: agent.system_prompt,
+          model: agent.model,
+          memory_enable: true,
+          knowledge_access: true,
+          human_approval_required: false,
+          concurrency_limit: 4,
+          release_note: 'Initial version',
+          created_at: '2026-07-18T08:00:00Z',
+          published_at: '2026-07-18T08:00:00Z'
+        }
+      ] : []
+    }
     else if (method === 'GET' && path === '/agents/conversations') body = []
     else if (method === 'POST' && path === '/agents/discussion/stream') {
       await new Promise((resolve) => setTimeout(resolve, 300))
@@ -1225,6 +1305,61 @@ test('manages versioned Agent evaluations and completes an async regression run'
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('publishes and rolls back a gated Challenger with visible evidence', async ({ page }) => {
+  await page.goto('/evaluations')
+
+  const candidateRun = page.locator('.desktop-run-table:visible .run-link, .mobile-run-list:visible .run-card-main').first()
+  await candidateRun.click()
+  await expect(page.getByText('AI架构师 v1 → v2', { exact: true })).toBeVisible()
+  await expect(page.getByText('评测通过，可安全发布', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '发布候选版本' }).click()
+  const publishDialog = page.getByRole('dialog', { name: '发布候选版本' })
+  await expect(publishDialog).toContainText('生产版本 v1 将升级到 v2')
+  await publishDialog.getByRole('button', { name: '确认发布' }).click()
+  await expect(page.getByText('候选版本 v2 已发布', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '回滚此发布' }).click()
+  const rollbackDialog = page.getByRole('dialog', { name: '回滚评测发布' })
+  await rollbackDialog.getByRole('button', { name: '确认' }).click()
+  await expect(page.locator('[aria-label="候选版本发布证据"]').getByText('发布已回滚至恢复版本 v3', { exact: true })).toBeVisible()
+
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
+test('prefills an Agent draft and submits it as a Challenger evaluation', async ({ page }) => {
+  await page.goto('/evaluations?agent=2&version=202')
+
+  await expect(page.getByLabel('选择评测类型')).toContainText('候选版本')
+  await expect(page.locator('.launch-field').filter({ hasText: '候选 Agent' })).toContainText('AI架构师')
+  await expect(page.locator('.launch-field').filter({ hasText: '草稿版本' })).toContainText('v2 · 质量候选版本')
+  await expect(page.locator('.launch-field').filter({ hasText: '生产基线' })).toContainText('#80')
+
+  const submitted = page.waitForRequest((request) => (
+    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/evaluations/runs')
+  ))
+  await page.getByRole('button', { name: '运行候选评测' }).click()
+  const payload = (await submitted).postDataJSON() as {
+    baseline_run_id: number
+    candidate_version_id: number
+  }
+  expect(payload.baseline_run_id).toBe(80)
+  expect(payload.candidate_version_id).toBe(202)
+})
+
+test('routes Agent drafts through evaluation instead of direct publish', async ({ page }) => {
+  await page.goto('/agents')
+
+  const architectCard = page.locator('.employee-card').filter({ hasText: 'AI架构师' })
+  await expect(architectCard).toHaveCount(1)
+  await architectCard.getByRole('button', { name: '配置 AI 员工' }).click()
+  await page.getByRole('tab', { name: '版本记录' }).click()
+  await page.getByRole('button', { name: '评测发布' }).click()
+
+  await expect(page).toHaveURL(/\/evaluations\?agent=2&version=202$/)
+  await expect(page.getByLabel('选择评测类型')).toContainText('候选版本')
 })
 
 test('keeps the evaluation lab usable at 375px and mobile landscape', async ({ page }, testInfo) => {

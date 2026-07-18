@@ -17,6 +17,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    if op.get_bind().dialect.name == "sqlite":
+        return
     op.drop_constraint(
         "evaluation_suite_revisions_fingerprint_key",
         "evaluation_suite_revisions",
@@ -30,6 +32,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if op.get_bind().dialect.name == "sqlite":
+        return
     op.create_unique_constraint(
         "evaluation_suite_revisions_version_key",
         "evaluation_suite_revisions",

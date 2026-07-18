@@ -1029,6 +1029,14 @@ class EvaluationRun(Base):
         ForeignKey("evaluation_suite_revisions.id", ondelete="SET NULL"), index=True
     )
     baseline_run_id: Mapped[int | None] = mapped_column(ForeignKey("evaluation_runs.id", ondelete="SET NULL"), index=True)
+    candidate_agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), index=True
+    )
+    candidate_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_prompt_versions.id", ondelete="SET NULL"), index=True
+    )
+    candidate_version: Mapped[int | None] = mapped_column(Integer)
+    expected_current_version: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
     total_cases: Mapped[int] = mapped_column(Integer, default=0)
     completed_cases: Mapped[int] = mapped_column(Integer, default=0)
@@ -1052,6 +1060,51 @@ class EvaluationRun(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentEvaluationRelease(Base):
+    __tablename__ = "agent_evaluation_releases"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PUBLISHED', 'ROLLED_BACK')",
+            name="ck_agent_evaluation_release_status",
+        ),
+        CheckConstraint("candidate_version > 0", name="ck_agent_evaluation_release_candidate_version"),
+        CheckConstraint("previous_version > 0", name="ck_agent_evaluation_release_previous_version"),
+        CheckConstraint(
+            "expected_current_version > 0",
+            name="ck_agent_evaluation_release_expected_current_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    evaluation_run_id: Mapped[int] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="RESTRICT"), unique=True, index=True
+    )
+    agent_id: Mapped[int] = mapped_column(
+        ForeignKey("agents.id", ondelete="RESTRICT"), index=True
+    )
+    candidate_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_prompt_versions.id", ondelete="SET NULL"), index=True
+    )
+    candidate_version: Mapped[int] = mapped_column(Integer)
+    previous_version: Mapped[int] = mapped_column(Integer)
+    expected_current_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), default="PUBLISHED", index=True)
+    published_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    rollback_request_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    rollback_created_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_prompt_versions.id", ondelete="SET NULL")
+    )
+    rollback_version: Mapped[int | None] = mapped_column(Integer)
+    rolled_back_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EvaluationResult(Base):
