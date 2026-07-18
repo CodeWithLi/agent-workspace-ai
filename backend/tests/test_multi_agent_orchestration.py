@@ -199,3 +199,94 @@ def test_reviewer_cannot_override_deterministic_failure_and_can_request_revision
     assert merged.score < 80
     assert len(tasks) == len(plan.assignments) + 2
     assert len({task["title"] for task in tasks}) == len(tasks)
+
+
+def test_blocking_collaboration_ledger_forces_targeted_revision() -> None:
+    plan = build_fallback_plan("设计可灰度发布并可回滚的项目交付流程")
+    handoffs = [
+        AgentHandoff(
+            role=assignment.role,
+            objective=assignment.objective,
+            deliverable=assignment.deliverable,
+            content=(
+                "明确范围、关键决策、依赖、边界场景、失败信号、验收证据和后续负责人。"
+                "同时给出灰度发布、回滚条件、监控阈值和可复现的验证步骤。"
+                "每项结论都关联成功标准、证据来源、完成时限和可审计的责任边界。"
+            ),
+            revision_round=0,
+        )
+        for assignment in plan.assignments
+    ]
+    deterministic = evaluate_handoffs(plan, handoffs)
+    reviewer = json.dumps(
+        {
+            "passed": True,
+            "score": 96,
+            "issues": [],
+            "revision_roles": [],
+            "summary": "专业结论完整，但发布条件仍有阻塞冲突。",
+            "decisions": [
+                {
+                    "title": "发布策略",
+                    "outcome": "采用分阶段灰度发布。",
+                    "rationale": "降低首次上线风险并保留快速回滚窗口。",
+                    "source_roles": ["test_engineer", "operations_analyst"],
+                    "confidence": 0.92,
+                }
+            ],
+            "conflicts": [
+                {
+                    "topic": "发布准入条件",
+                    "positions": [
+                        {"role": "test_engineer", "position": "全量回归通过后才能发布。"},
+                        {"role": "operations_analyst", "position": "核心冒烟通过即可开始灰度。"},
+                    ],
+                    "status": "OPEN",
+                    "resolution": "",
+                    "blocking": True,
+                    "revision_roles": [],
+                }
+            ],
+            "open_questions": [
+                {
+                    "question": "谁负责确认灰度扩容阈值？",
+                    "owner_role": "operations_analyst",
+                    "blocking": True,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    merged = merge_reviewer_decision(deterministic, reviewer, plan)
+
+    assert deterministic.passed is True
+    assert merged.passed is False
+    assert merged.score <= 79
+    assert set(merged.revision_roles) == {"test_engineer", "operations_analyst"}
+    assert merged.decisions[0].title == "发布策略"
+    assert merged.conflicts[0].status == "OPEN"
+    assert set(merged.conflicts[0].revision_roles) == {"test_engineer", "operations_analyst"}
+    assert merged.open_questions[0].blocking is True
+    assert any("阻塞冲突" in issue for issue in merged.issues)
+    assert any("阻塞问题" in issue for issue in merged.issues)
+
+    resolved_payload = json.loads(reviewer)
+    resolved_payload["conflicts"][0].update(
+        {
+            "status": "RESOLVED",
+            "resolution": "核心冒烟通过后启动灰度，全量回归通过后才能扩容。",
+            "blocking": False,
+        }
+    )
+    resolved_payload["open_questions"] = []
+    resolved = merge_reviewer_decision(
+        deterministic,
+        json.dumps(resolved_payload, ensure_ascii=False),
+        plan,
+    )
+
+    assert resolved.passed is True
+    assert resolved.score == 96
+    assert resolved.conflicts[0].status == "RESOLVED"
+    assert resolved.conflicts[0].resolution.startswith("核心冒烟通过后")

@@ -423,7 +423,32 @@ async function mockApi(page: Page) {
         passed: false,
         issues: ['缺少可复现验收证据'],
         revision_roles: ['test_engineer'],
-        summary: '测试交接需要补充证据来源与负责人。'
+        summary: '测试交接需要补充证据来源与负责人。',
+        decisions: [
+          {
+            title: '灰度发布策略',
+            outcome: '采用 10% 到 50% 再到全量的分阶段灰度。',
+            rationale: '控制首发风险并保留回滚观察窗口。',
+            source_roles: ['test_engineer', 'operations_analyst'],
+            confidence: 0.91
+          }
+        ],
+        conflicts: [
+          {
+            topic: '发布准入条件',
+            positions: [
+              { role: 'test_engineer', position: '全量回归通过后才能发布。' },
+              { role: 'operations_analyst', position: '核心冒烟通过即可开始灰度。' }
+            ],
+            status: 'OPEN',
+            resolution: '',
+            blocking: true,
+            revision_roles: ['test_engineer', 'operations_analyst']
+          }
+        ],
+        open_questions: [
+          { question: '由谁确认灰度扩容阈值？', owner_role: 'operations_analyst', blocking: true }
+        ]
       },
       revision_round: 1,
       manual_revision_count: 0,
@@ -1457,7 +1482,23 @@ async function mockApi(page: Page) {
         current_node: 'report',
         state: {
           ...qualityWorkflow.state,
-          quality_gate: { ...qualityWorkflow.state.quality_gate, score: 95, passed: true, issues: [], summary: '质量门禁已通过。' },
+          quality_gate: {
+            ...qualityWorkflow.state.quality_gate,
+            score: 95,
+            passed: true,
+            issues: [],
+            summary: '质量门禁已通过。',
+            conflicts: [
+              {
+                ...qualityWorkflow.state.quality_gate.conflicts[0],
+                status: 'RESOLVED',
+                resolution: '核心冒烟通过后启动 10% 灰度，全量回归通过后才能扩容。',
+                blocking: false,
+                revision_roles: []
+              }
+            ],
+            open_questions: []
+          },
           manual_revision_count: 1
         }
       }
@@ -2431,7 +2472,7 @@ test('restores live specialist retry states and opens completed handoffs', async
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
-test('shows dynamic specialist handoffs and submits quality revision feedback', async ({ page }) => {
+test('shows dynamic specialist handoffs and submits quality revision feedback', async ({ page }, testInfo) => {
   await page.goto('/projects/2')
 
   await expect(page.getByRole('heading', { name: '质量门禁项目' })).toBeVisible()
@@ -2439,6 +2480,12 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await expect(page.getByText('2 个并行分支', { exact: true })).toBeVisible()
   await expect(page.getByText('Quality Gate 需要修订', { exact: true })).toBeVisible()
   await expect(page.getByText('缺少可复现验收证据', { exact: true })).toBeVisible()
+  const ledger = page.getByRole('region', { name: '多 Agent 协作决策账本' })
+  await expect(ledger.getByText('灰度发布策略', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('发布准入条件', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('全量回归通过后才能发布。', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('由谁确认灰度扩容阈值？', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('阻塞中', { exact: true }).first()).toBeVisible()
 
   const revisionButton = page.getByRole('button', { name: '提交修订意见', exact: true })
   await expect(revisionButton).toBeDisabled()
@@ -2446,8 +2493,18 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await revisionButton.click()
 
   await expect(page.getByText('Quality Gate 已通过', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('已解决', { exact: true })).toBeVisible()
+  await expect(ledger.getByText('核心冒烟通过后启动 10% 灰度，全量回归通过后才能扩容。', { exact: true })).toBeVisible()
   await expect(page.getByText('最终报告等待人工确认', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: '确认并生成报告', exact: true })).toBeEnabled()
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+      await page.setViewportSize(viewport)
+      await expect(ledger).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+    }
+  }
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
 })

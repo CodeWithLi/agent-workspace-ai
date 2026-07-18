@@ -102,6 +102,51 @@ class AgentHandoff(BaseModel):
     revision_round: int = Field(default=0, ge=0, le=20)
 
 
+class CollaborationDecision(BaseModel):
+    title: str = Field(min_length=2, max_length=160)
+    outcome: str = Field(min_length=2, max_length=2000)
+    rationale: str = Field(min_length=2, max_length=2000)
+    source_roles: list[SpecialistRole] = Field(min_length=1, max_length=4)
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_source_roles(self) -> "CollaborationDecision":
+        if len(self.source_roles) != len(set(self.source_roles)):
+            raise ValueError("decision source roles must be unique")
+        return self
+
+
+class ConflictPosition(BaseModel):
+    role: SpecialistRole
+    position: str = Field(min_length=2, max_length=2000)
+
+
+class CollaborationConflict(BaseModel):
+    topic: str = Field(min_length=2, max_length=200)
+    positions: list[ConflictPosition] = Field(min_length=2, max_length=4)
+    status: Literal["OPEN", "RESOLVED"]
+    resolution: str = Field(default="", max_length=2000)
+    blocking: bool = True
+    revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_conflict(self) -> "CollaborationConflict":
+        roles = [position.role for position in self.positions]
+        if len(roles) != len(set(roles)):
+            raise ValueError("conflict position roles must be unique")
+        if self.status == "RESOLVED" and not self.resolution.strip():
+            raise ValueError("resolved conflicts require a resolution")
+        if len(self.revision_roles) != len(set(self.revision_roles)):
+            raise ValueError("conflict revision roles must be unique")
+        return self
+
+
+class CollaborationQuestion(BaseModel):
+    question: str = Field(min_length=2, max_length=1000)
+    owner_role: SpecialistRole
+    blocking: bool = False
+
+
 class QualityGateDecision(BaseModel):
     score: float = Field(ge=0, le=100)
     passed: bool
@@ -110,6 +155,9 @@ class QualityGateDecision(BaseModel):
     revision_roles: list[SpecialistRole] = Field(default_factory=list)
     summary: str = Field(default="", max_length=4000)
     reviewer_summary: str = Field(default="", max_length=8000)
+    decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
+    conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
+    open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
 
 
 class ReviewerDecision(BaseModel):
@@ -118,6 +166,9 @@ class ReviewerDecision(BaseModel):
     issues: list[str] = Field(default_factory=list, max_length=20)
     revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
     summary: str = Field(default="", max_length=4000)
+    decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
+    conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
+    open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
 
 
 def _json_candidates(text: str) -> list[str]:
@@ -284,24 +335,86 @@ def merge_reviewer_decision(
         )
 
     expected_roles = {assignment.role for assignment in plan.assignments}
+    decisions = []
+    for decision in reviewer.decisions:
+        source_roles = [role for role in decision.source_roles if role in expected_roles]
+        if source_roles:
+            decisions.append(decision.model_copy(update={"source_roles": source_roles}))
+    conflicts = []
+    for conflict in reviewer.conflicts:
+        positions = [
+            position for position in conflict.positions if position.role in expected_roles
+        ]
+        if len(positions) < 2:
+            continue
+        revision_roles = [
+            role for role in conflict.revision_roles if role in expected_roles
+        ]
+        if conflict.status == "OPEN" and conflict.blocking and not revision_roles:
+            revision_roles = [position.role for position in positions]
+        conflicts.append(
+            conflict.model_copy(
+                update={"positions": positions, "revision_roles": revision_roles}
+            )
+        )
+    open_questions = [
+        question
+        for question in reviewer.open_questions
+        if question.owner_role in expected_roles
+    ]
+    blocking_conflicts = [
+        conflict
+        for conflict in conflicts
+        if conflict.status == "OPEN" and conflict.blocking
+    ]
+    blocking_questions = [question for question in open_questions if question.blocking]
+    ledger_revision_roles = [
+        role
+        for conflict in blocking_conflicts
+        for role in (
+            conflict.revision_roles
+            or [position.role for position in conflict.positions]
+        )
+    ]
+    ledger_revision_roles.extend(question.owner_role for question in blocking_questions)
     revision_roles = list(
         dict.fromkeys(
             [
                 *deterministic.revision_roles,
                 *(role for role in reviewer.revision_roles if role in expected_roles),
+                *ledger_revision_roles,
             ]
         )
     )
     score = min(deterministic.score, reviewer.score)
-    passed = deterministic.passed and reviewer.passed and score >= 80
+    if blocking_conflicts or blocking_questions:
+        score = min(score, 79.0)
+    passed = (
+        deterministic.passed
+        and reviewer.passed
+        and score >= 80
+        and not blocking_conflicts
+        and not blocking_questions
+    )
+    ledger_issues = [
+        *(f"未解决阻塞冲突：{conflict.topic}" for conflict in blocking_conflicts),
+        *(f"未解决阻塞问题：{question.question}" for question in blocking_questions),
+    ]
     return deterministic.model_copy(
         update={
             "score": score,
             "passed": passed,
-            "issues": list(dict.fromkeys([*deterministic.issues, *reviewer.issues])),
+            "issues": list(
+                dict.fromkeys(
+                    [*deterministic.issues, *reviewer.issues, *ledger_issues]
+                )
+            ),
             "revision_roles": revision_roles,
             "summary": reviewer.summary or deterministic.summary,
             "reviewer_summary": reviewer_output[:8000],
+            "decisions": decisions,
+            "conflicts": conflicts,
+            "open_questions": open_questions,
         }
     )
 

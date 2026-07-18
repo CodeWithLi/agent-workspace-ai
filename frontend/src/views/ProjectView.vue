@@ -207,6 +207,64 @@
           <p>{{ qualityGate.summary }}</p>
           <ul v-if="qualityGate.issues.length"><li v-for="issue in qualityGate.issues" :key="issue">{{ issue }}</li></ul>
         </div>
+        <section v-if="qualityLedgerVisible" class="decision-ledger" aria-label="多 Agent 协作决策账本">
+          <div class="decision-ledger-heading">
+            <div>
+              <strong>协作决策账本</strong>
+              <span>AI 质量审查归约的共同结论、角色分歧与待确认责任</span>
+            </div>
+            <div class="decision-ledger-counts" aria-label="决策账本摘要">
+              <el-tag type="info">{{ qualityDecisions.length }} 项决策</el-tag>
+              <el-tag v-if="qualityConflicts.length" :type="qualityOpenBlockerCount ? 'warning' : 'success'">{{ qualityConflicts.length }} 项冲突</el-tag>
+              <el-tag v-if="qualityOpenBlockerCount" type="danger">{{ qualityOpenBlockerCount }} 个阻塞项</el-tag>
+            </div>
+          </div>
+          <div class="decision-ledger-grid">
+            <section v-if="qualityDecisions.length" class="decision-ledger-section" aria-label="共同决策">
+              <h5>共同决策</h5>
+              <article v-for="(decision, decisionIndex) in qualityDecisions" :key="`${decision.title}:${decisionIndex}`" class="ledger-entry decision-entry">
+                <header>
+                  <strong>{{ decision.title }}</strong>
+                  <span>审查置信 {{ Math.round(decision.confidence * 100) }}%</span>
+                </header>
+                <p>{{ decision.outcome }}</p>
+                <small>{{ decision.rationale }}</small>
+                <div class="ledger-role-tags" aria-label="决策来源角色">
+                  <el-tag v-for="role in decision.source_roles" :key="role" size="small" type="info">{{ specialistRoleLabel(role) }}</el-tag>
+                </div>
+              </article>
+            </section>
+            <section v-if="qualityConflicts.length" class="decision-ledger-section" aria-label="角色冲突与解决">
+              <h5>冲突与解决</h5>
+              <article v-for="(conflict, conflictIndex) in qualityConflicts" :key="`${conflict.topic}:${conflictIndex}`" class="ledger-entry conflict-entry" :class="{ open: conflict.status === 'OPEN' }">
+                <header>
+                  <strong>{{ conflict.topic }}</strong>
+                  <el-tag size="small" :type="conflict.status === 'RESOLVED' ? 'success' : conflict.blocking ? 'danger' : 'warning'">
+                    {{ conflict.status === 'RESOLVED' ? '已解决' : conflict.blocking ? '阻塞中' : '待协调' }}
+                  </el-tag>
+                </header>
+                <dl class="conflict-positions">
+                  <div v-for="position in conflict.positions" :key="position.role">
+                    <dt>{{ specialistRoleLabel(position.role) }}</dt>
+                    <dd>{{ position.position }}</dd>
+                  </div>
+                </dl>
+                <p v-if="conflict.resolution" class="conflict-resolution"><strong>解决结论</strong><span>{{ conflict.resolution }}</span></p>
+                <small v-else-if="conflict.blocking">需要 {{ conflict.revision_roles.map(specialistRoleLabel).join('、') }} 协同返修后复审</small>
+              </article>
+            </section>
+            <section v-if="qualityOpenQuestions.length" class="decision-ledger-section" aria-label="待确认问题">
+              <h5>待确认问题</h5>
+              <article v-for="(question, questionIndex) in qualityOpenQuestions" :key="`${question.question}:${questionIndex}`" class="ledger-entry question-entry">
+                <header>
+                  <strong>{{ question.question }}</strong>
+                  <el-tag size="small" :type="question.blocking ? 'danger' : 'warning'">{{ question.blocking ? '阻塞中' : '待确认' }}</el-tag>
+                </header>
+                <p>负责人：{{ specialistRoleLabel(question.owner_role) }}</p>
+              </article>
+            </section>
+          </div>
+        </section>
       </section>
       <div v-if="workflowEvents.length" class="workflow-events" aria-live="polite">
         <div v-for="event in workflowEvents.slice(-8)" :key="event.id" class="workflow-event-row">
@@ -384,12 +442,43 @@ interface WorkflowHandoff extends WorkflowAssignment {
   revision_round: number
 }
 
+interface WorkflowCollaborationDecision {
+  title: string
+  outcome: string
+  rationale: string
+  source_roles: string[]
+  confidence: number
+}
+
+interface WorkflowConflictPosition {
+  role: string
+  position: string
+}
+
+interface WorkflowCollaborationConflict {
+  topic: string
+  positions: WorkflowConflictPosition[]
+  status: 'OPEN' | 'RESOLVED'
+  resolution: string
+  blocking: boolean
+  revision_roles: string[]
+}
+
+interface WorkflowCollaborationQuestion {
+  question: string
+  owner_role: string
+  blocking: boolean
+}
+
 interface WorkflowQualityGate {
   score: number
   passed: boolean
   issues: string[]
   revision_roles: string[]
   summary: string
+  decisions?: WorkflowCollaborationDecision[]
+  conflicts?: WorkflowCollaborationConflict[]
+  open_questions?: WorkflowCollaborationQuestion[]
 }
 
 type BranchRuntimeStatus = 'waiting' | 'running' | 'retrying' | 'completed' | 'restored' | 'failed' | 'paused' | 'cancelling' | 'cancelled'
@@ -698,6 +787,16 @@ const qualityGate = computed<WorkflowQualityGate | null>(() => {
   const gate = workflowState.value?.quality_gate
   return gate && typeof gate.score === 'number' ? gate as WorkflowQualityGate : null
 })
+const qualityDecisions = computed(() => Array.isArray(qualityGate.value?.decisions) ? qualityGate.value.decisions : [])
+const qualityConflicts = computed(() => Array.isArray(qualityGate.value?.conflicts) ? qualityGate.value.conflicts : [])
+const qualityOpenQuestions = computed(() => Array.isArray(qualityGate.value?.open_questions) ? qualityGate.value.open_questions : [])
+const qualityOpenBlockerCount = computed(() => (
+  qualityConflicts.value.filter((conflict) => conflict.status === 'OPEN' && conflict.blocking).length
+  + qualityOpenQuestions.value.filter((question) => question.blocking).length
+))
+const qualityLedgerVisible = computed(() => (
+  qualityDecisions.value.length + qualityConflicts.value.length + qualityOpenQuestions.value.length > 0
+))
 const workflowDocuments = computed(() => {
   const documents = workflowState.value?.documents
   if (!Array.isArray(documents)) return []
@@ -1791,6 +1890,155 @@ onBeforeUnmount(disposeWorkflowEventStream)
   padding-left: 18px;
 }
 
+.decision-ledger {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border);
+}
+
+.decision-ledger-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+}
+
+.decision-ledger-heading > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.decision-ledger-heading strong,
+.decision-ledger-section h5 {
+  font-size: 13px;
+}
+
+.decision-ledger-heading span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.decision-ledger-counts {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.decision-ledger-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  border-block: 1px solid var(--color-border);
+}
+
+.decision-ledger-section {
+  min-width: 0;
+  padding: 12px;
+}
+
+.decision-ledger-section + .decision-ledger-section {
+  border-left: 1px solid var(--color-border);
+}
+
+.decision-ledger-section h5 {
+  margin: 0 0 8px;
+  color: var(--color-secondary-text);
+}
+
+.ledger-entry {
+  display: grid;
+  gap: 7px;
+  padding: 10px 0;
+  border-top: 1px solid var(--color-border);
+  overflow-wrap: anywhere;
+}
+
+.ledger-entry header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ledger-entry header strong,
+.ledger-entry p,
+.ledger-entry small,
+.conflict-positions dt,
+.conflict-positions dd,
+.conflict-resolution span {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ledger-entry header > strong {
+  min-width: 0;
+}
+
+.decision-entry header span,
+.ledger-entry small {
+  color: var(--color-muted-text);
+}
+
+.decision-entry header span {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ledger-entry p,
+.conflict-positions,
+.conflict-positions dd {
+  margin: 0;
+}
+
+.ledger-entry p,
+.conflict-positions dd {
+  color: var(--color-secondary-text);
+}
+
+.ledger-role-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.conflict-entry.open {
+  border-top-color: #fde68a;
+}
+
+.conflict-positions {
+  display: grid;
+  gap: 6px;
+}
+
+.conflict-positions > div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.conflict-positions dt {
+  color: var(--color-primary);
+  font-weight: 650;
+}
+
+.conflict-resolution {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-success);
+  background: #f0fdf4;
+}
+
+.conflict-resolution strong {
+  color: var(--color-success);
+  font-size: 11px;
+}
+
 .workflow-approval-gate {
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.4fr) auto;
@@ -1835,6 +2083,15 @@ onBeforeUnmount(disposeWorkflowEventStream)
 }
 
 @media (max-width: 900px) {
+  .decision-ledger-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .decision-ledger-section + .decision-ledger-section {
+    border-top: 1px solid var(--color-border);
+    border-left: 0;
+  }
+
   .workflow-approval-gate {
     grid-template-columns: 1fr;
   }
@@ -1897,6 +2154,14 @@ onBeforeUnmount(disposeWorkflowEventStream)
     flex-direction: column;
   }
 
+  .decision-ledger-heading {
+    flex-direction: column;
+  }
+
+  .decision-ledger-counts {
+    justify-content: flex-start;
+  }
+
   .orchestration-tags {
     justify-content: flex-start;
   }
@@ -1920,6 +2185,11 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .branch-runtime-actions {
     align-items: flex-end;
     flex-direction: column;
+  }
+
+  .conflict-positions > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 }
 

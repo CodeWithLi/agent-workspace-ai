@@ -803,7 +803,12 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             AgentRole.test_engineer,
             (
                 "你是交接质量评审 Agent。只输出 JSON，字段为 passed、score、issues、"
-                "revision_roles、summary。检查可追溯性、冲突、边界场景、验收证据和发布风险。"
+                "revision_roles、summary、decisions、conflicts、open_questions。"
+                "decisions 每项包含 title、outcome、rationale、source_roles、confidence；"
+                "conflicts 每项包含 topic、positions（role 与 position）、status（OPEN 或 RESOLVED）、"
+                "resolution、blocking、revision_roles；open_questions 每项包含 question、owner_role、blocking。"
+                "检查可追溯性、跨角色冲突、边界场景、验收证据和发布风险。"
+                "阻塞冲突未解决或阻塞问题未闭合时必须判定不通过，并指明需要返修的已分配角色。"
             ),
             json.dumps(
                 agent_context(state, {
@@ -841,6 +846,12 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "revision_roles": decision.revision_roles,
                 "revision_round": revision_round,
                 "next_node": next_node,
+                "decision_count": len(decision.decisions),
+                "conflict_count": len(decision.conflicts),
+                "open_blocker_count": sum(
+                    conflict.status == "OPEN" and conflict.blocking
+                    for conflict in decision.conflicts
+                ) + sum(question.blocking for question in decision.open_questions),
             },
         )
         feedback = "\n".join([decision.summary, *decision.issues])

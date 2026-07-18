@@ -734,6 +734,29 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
                     "issues": [] if passed else ["缺少可复现验收证据"],
                     "revision_roles": [] if passed else ["test_engineer", "operations_analyst"],
                     "summary": "质量门禁通过" if passed else "需要补充证据后复审",
+                    "decisions": [
+                        {
+                            "title": "发布准入",
+                            "outcome": "验收证据和回滚负责人同时就绪后开始灰度。",
+                            "rationale": "将质量证据与运营恢复能力绑定为同一门禁。",
+                            "source_roles": ["test_engineer", "operations_analyst"],
+                            "confidence": 0.94,
+                        }
+                    ] if passed else [],
+                    "conflicts": [] if passed else [
+                        {
+                            "topic": "验收证据负责人",
+                            "positions": [
+                                {"role": "test_engineer", "position": "由测试工程师维护。"},
+                                {"role": "operations_analyst", "position": "由发布负责人维护。"},
+                            ],
+                            "status": "OPEN",
+                            "resolution": "",
+                            "blocking": True,
+                            "revision_roles": ["test_engineer", "operations_analyst"],
+                        }
+                    ],
+                    "open_questions": [],
                 },
                 ensure_ascii=False,
             )
@@ -793,6 +816,26 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
     assert workflow.current_node == "report"
     assert revised_state["manual_revision_count"] == 1
     assert revised_state["quality_gate"]["passed"] is True
+    assert revised_state["quality_gate"]["decisions"][0]["title"] == "发布准入"
+    assert revised_state["quality_gate"]["conflicts"] == []
+    passed_event = db.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "QUALITY_GATE_PASSED",
+        )
+        .order_by(WorkflowEvent.id.desc())
+    )
+    assert passed_event is not None
+    passed_payload = json.loads(passed_event.payload_json)
+    assert {
+        key: passed_payload[key]
+        for key in ("decision_count", "conflict_count", "open_blocker_count")
+    } == {
+        "decision_count": 1,
+        "conflict_count": 0,
+        "open_blocker_count": 0,
+    }
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == len(revised_state["tasks"])
 
 

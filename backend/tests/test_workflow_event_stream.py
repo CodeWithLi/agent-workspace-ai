@@ -46,6 +46,9 @@ def add_event(db: Session, workflow: WorkflowRun, event_type: str, sequence: int
         payload_json=json.dumps(
             {
                 "plan_version": sequence,
+                "decision_count": sequence,
+                "conflict_count": 1,
+                "open_blocker_count": 0,
                 "error": f"secret-error-{sequence}",
                 "human_feedback": f"secret-feedback-{sequence}",
                 "prompt": f"secret-prompt-{sequence}",
@@ -68,7 +71,10 @@ def test_event_history_returns_latest_window_in_chronological_order_and_is_tenan
     history = list_workflow_event_history(workflow.id, limit=2, current_user=owner, db=db)
 
     assert [event.id for event in history] == [events[1].id, events[2].id]
-    assert [event.payload for event in history] == [{"plan_version": 2}, {"plan_version": 3}]
+    assert [event.payload for event in history] == [
+        {"plan_version": 2, "decision_count": 2, "conflict_count": 1, "open_blocker_count": 0},
+        {"plan_version": 3, "decision_count": 3, "conflict_count": 1, "open_blocker_count": 0},
+    ]
     assert "secret-" not in "".join(event.model_dump_json() for event in history)
     with pytest.raises(HTTPException) as hidden:
         list_workflow_event_history(workflow.id, limit=100, current_user=outsider, db=db)
@@ -107,7 +113,7 @@ async def test_workflow_sse_resumes_after_header_cursor_and_emits_reconnect_cont
     assert f"id: {terminal.id}" in body
     assert f"id: {first.id}\n" not in body
     assert '"event_type":"COMPLETED"' in body
-    assert '"payload":{"plan_version":2}' in body
+    assert '"payload":{"plan_version":2,"decision_count":2,"conflict_count":1,"open_blocker_count":0}' in body
     assert "secret-" not in body
 
 
