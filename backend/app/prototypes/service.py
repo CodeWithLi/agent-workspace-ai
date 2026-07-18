@@ -1,8 +1,9 @@
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,18 @@ from app.core.llm import get_llm
 from app.core.llm_usage import bind_llm_usage
 from app.models import Agent, AgentRole, ProductPrototype, ProductPrototypeVersion, Requirement, User
 from app.prototypes.schemas import PrototypeSpecification, PrototypeVersionOut
+
+
+MAX_PROTOTYPE_REPAIR_ROUNDS = 2
+MAX_REVIEW_CONTRACT_REPAIRS = 1
+PROTOTYPE_REVIEW_MIN_SCORE = 80
+
+
+class PrototypeReviewDecision(BaseModel):
+    passed: bool
+    score: float = Field(ge=0, le=100)
+    issues: list[str] = Field(default_factory=list, max_length=12)
+    summary: str = Field(min_length=1, max_length=2000)
 
 
 def _component(component_id: str, component_type: str, **values: Any) -> dict[str, Any]:
@@ -367,16 +380,42 @@ def build_fallback_spec(title: str, prompt: str) -> PrototypeSpecification:
     return _generic_product_spec(title, prompt)
 
 
-def extract_prototype_spec(text: str) -> PrototypeSpecification | None:
+def _json_candidates(text: str) -> list[str]:
     candidates = [text.strip()]
     candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE))
     first = text.find("{")
     last = text.rfind("}")
     if first >= 0 and last > first:
         candidates.append(text[first : last + 1])
-    for candidate in candidates:
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def validate_prototype_specification(
+    text: str,
+) -> tuple[PrototypeSpecification | None, list[str]]:
+    validation_issues: list[str] = []
+    for candidate in _json_candidates(text):
         try:
-            return PrototypeSpecification.model_validate(json.loads(candidate))
+            return PrototypeSpecification.model_validate(json.loads(candidate)), []
+        except json.JSONDecodeError:
+            validation_issues = ["output: invalid JSON object"]
+        except ValidationError as exc:
+            validation_issues = [
+                f"{'.'.join(str(part) for part in error['loc']) or 'root'}: {error['msg']}"
+                for error in exc.errors()[:12]
+            ]
+    return None, validation_issues or ["output: missing JSON object"]
+
+
+def extract_prototype_spec(text: str) -> PrototypeSpecification | None:
+    spec, _issues = validate_prototype_specification(text)
+    return spec
+
+
+def extract_review_decision(text: str) -> PrototypeReviewDecision | None:
+    for candidate in _json_candidates(text):
+        try:
+            return PrototypeReviewDecision.model_validate(json.loads(candidate))
         except (json.JSONDecodeError, ValidationError):
             continue
     return None
@@ -389,11 +428,20 @@ async def _invoke_agent(
     role: AgentRole,
     fallback_prompt: str,
     content: str,
+    *,
+    json_mode: bool = False,
+    contract_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
+    response_format = {"type": "json_object"} if json_mode else None
     agent = db.scalar(select(Agent).where(Agent.role == role))
     if not agent:
-        output = await get_llm().chat(fallback_prompt, content)
+        output = await get_llm().chat(fallback_prompt, content, None, response_format)
         return output, {"role": role.value, "agent_id": None, "name": role.value, "model": "default", "output": output}
+    system_prompt = fallback_prompt if contract_only else (
+        f"{agent.system_prompt}\n\n"
+        "当前任务的输出契约优先于以上通用角色说明。\n"
+        f"{fallback_prompt}"
+    )
     lease = await acquire_agent_slot(agent.id, agent.concurrency_limit)
     try:
         with bind_llm_usage(
@@ -403,9 +451,10 @@ async def _invoke_agent(
             agent_id=agent.id,
         ):
             output = await get_llm().chat(
-                f"{agent.system_prompt}\n{fallback_prompt}",
+                system_prompt,
                 content,
                 agent.model,
+                response_format,
             )
     finally:
         await lease.release()
@@ -425,7 +474,9 @@ def evaluate_specification(spec: PrototypeSpecification) -> dict[str, Any]:
     input_count = 0
     primary_actions = 0
     interactive_count = 0
+    screens_without_actions: list[str] = []
     for screen in spec.screens:
+        screen_action_count = 0
         for section in screen.sections:
             for component in section.components:
                 if component.type in {"input", "textarea", "select"}:
@@ -434,8 +485,11 @@ def evaluate_specification(spec: PrototypeSpecification) -> dict[str, Any]:
                     primary_actions += 1
                 if component.action:
                     interactive_count += 1
+                    screen_action_count += 1
                     if component.action.type == "navigate" and component.action.target:
                         edges[screen.id].add(component.action.target)
+        if screen_action_count == 0:
+            screens_without_actions.append(screen.name)
     reachable = {spec.start_screen_id}
     frontier = [spec.start_screen_id]
     while frontier:
@@ -446,13 +500,234 @@ def evaluate_specification(spec: PrototypeSpecification) -> dict[str, Any]:
     checks = [
         {"name": "navigation_integrity", "passed": reachable == screen_ids, "detail": f"{len(reachable)}/{len(screen_ids)} screens reachable"},
         {"name": "interactive_paths", "passed": interactive_count >= len(spec.screens), "detail": f"{interactive_count} interactive actions"},
+        {
+            "name": "screen_action_coverage",
+            "passed": not screens_without_actions,
+            "detail": "all screens expose an action" if not screens_without_actions else f"missing actions: {', '.join(screens_without_actions)}",
+        },
         {"name": "primary_actions", "passed": primary_actions >= max(1, len(spec.screens) - 1), "detail": f"{primary_actions} primary actions"},
         {"name": "visible_form_labels", "passed": True, "detail": f"{input_count} labeled form controls"},
         {"name": "responsive_contract", "passed": all(screen.sections for screen in spec.screens), "detail": "structured sections support desktop and mobile renderers"},
     ]
     score = round(sum(1 for check in checks if check["passed"]) / len(checks) * 100, 1)
     issues = [check["detail"] for check in checks if not check["passed"]]
-    return {"score": score, "passed": score >= 80, "checks": checks, "issues": issues}
+    return {"score": score, "passed": all(check["passed"] for check in checks), "checks": checks, "issues": issues}
+
+
+def repair_specification_structure(
+    spec: PrototypeSpecification,
+) -> tuple[PrototypeSpecification, list[str]]:
+    quality = evaluate_specification(spec)
+    failed_checks = {check["name"] for check in quality["checks"] if not check["passed"]}
+    structural_checks = {
+        "navigation_integrity",
+        "interactive_paths",
+        "screen_action_coverage",
+        "primary_actions",
+    }
+    if not failed_checks or not failed_checks.issubset(structural_checks):
+        return spec, []
+
+    payload = spec.model_dump(mode="json")
+    screens = payload["screens"]
+    start_index = next(
+        index for index, screen in enumerate(screens) if screen["id"] == spec.start_screen_id
+    )
+    ordered_screens = [screens[start_index], *screens[:start_index], *screens[start_index + 1 :]]
+    component_ids = {
+        component["id"]
+        for screen in screens
+        for section in screen["sections"]
+        for component in section["components"]
+    }
+    primary_count = sum(
+        1
+        for screen in screens
+        for section in screen["sections"]
+        for component in section["components"]
+        if component.get("variant") == "primary" and component.get("action")
+    )
+    required_primary = max(1, len(screens) - 1)
+    repairs: list[str] = []
+
+    for index, screen in enumerate(ordered_screens):
+        target = ordered_screens[(index + 1) % len(ordered_screens)]
+        has_target = any(
+            (component.get("action") or {}).get("type") == "navigate"
+            and (component.get("action") or {}).get("target") == target["id"]
+            for section in screen["sections"]
+            for component in section["components"]
+        )
+        if has_target:
+            continue
+        base_id = f"{screen['id'][:48]}-flow-{index + 1}"
+        component_id = base_id
+        suffix = 2
+        while component_id in component_ids:
+            component_id = f"{base_id[:60]}-{suffix}"
+            suffix += 1
+        variant = "primary" if primary_count < required_primary else "secondary"
+        if variant == "primary":
+            primary_count += 1
+        screen["sections"][-1]["components"].append(
+            {
+                "id": component_id,
+                "type": "link",
+                "label": f"前往{target['name']}",
+                "variant": variant,
+                "action": {"type": "navigate", "target": target["id"]},
+            }
+        )
+        component_ids.add(component_id)
+        repairs.append(f"{screen['name']} -> {target['name']}")
+
+    if primary_count < required_primary:
+        for screen in ordered_screens:
+            for section in screen["sections"]:
+                for component in section["components"]:
+                    if primary_count >= required_primary:
+                        break
+                    if component.get("action") and component.get("variant") != "primary":
+                        component["variant"] = "primary"
+                        primary_count += 1
+                        repairs.append(f"{screen['name']}: 提升主要操作 {component['id']}")
+                if primary_count >= required_primary:
+                    break
+            if primary_count >= required_primary:
+                break
+
+    repaired = PrototypeSpecification.model_validate(payload)
+    return repaired, repairs
+
+
+def merge_quality_decision(
+    automated: dict[str, Any],
+    reviewer: PrototypeReviewDecision | None,
+    raw_review: str,
+    repair_rounds: int,
+    review_contract_repairs: int,
+) -> dict[str, Any]:
+    reviewer_passed = bool(
+        reviewer and reviewer.passed and reviewer.score >= PROTOTYPE_REVIEW_MIN_SCORE
+    )
+    reviewer_summary = reviewer.summary if reviewer else (
+        "测试 Agent 未返回可验证的结构化结论。" + (f" 原始输出：{raw_review[:1200]}" if raw_review.strip() else "")
+    )
+    checks = [
+        *automated["checks"],
+        {
+            "name": "agent_review",
+            "passed": reviewer_passed,
+            "detail": reviewer_summary,
+        },
+    ]
+    issues = list(automated["issues"])
+    if reviewer:
+        for issue in reviewer.issues:
+            if issue not in issues:
+                issues.append(issue)
+        if reviewer.passed and reviewer.score < PROTOTYPE_REVIEW_MIN_SCORE:
+            issues.append(
+                f"测试 Agent 分数 {reviewer.score:g} 低于 {PROTOTYPE_REVIEW_MIN_SCORE} 分门禁"
+            )
+    else:
+        issues.append("测试 Agent 结构化评审失败")
+    reviewer_score = reviewer.score if reviewer else 0.0
+    return {
+        "score": round(min(float(automated["score"]), reviewer_score), 1),
+        "passed": bool(automated["passed"] and reviewer_passed),
+        "checks": checks,
+        "issues": issues,
+        "reviewer_summary": reviewer_summary,
+        "reviewer_score": reviewer_score,
+        "reviewer_passed": reviewer_passed,
+        "repair_rounds": repair_rounds,
+        "review_contract_repairs": review_contract_repairs,
+    }
+
+
+async def review_prototype_specification(
+    db: Session,
+    user: User,
+    prototype: ProductPrototype,
+    spec: PrototypeSpecification,
+    automated: dict[str, Any],
+    trace: list[dict[str, Any]],
+    repair_rounds: int,
+    *,
+    fallback: bool = False,
+) -> dict[str, Any]:
+    review_prompt = (
+        "你是原型质量门禁判定 Agent。本步骤不是编写测试策略或测试用例；"
+        "禁止输出 test_strategy、functional_test_cases 等额外结构。"
+        "检查用户路径、边界状态、表单可访问性、移动端可用性和验收风险。"
+        "只输出一个 JSON 对象且只能包含四个字段："
+        "{\"passed\":boolean,\"score\":0-100,\"issues\":[string],\"summary\":string}。"
+        f"存在任何阻塞验收的问题或分数低于 {PROTOTYPE_REVIEW_MIN_SCORE} 时 passed 必须为 false。"
+        "不要输出 Markdown。"
+    )
+    review_output, review_trace = await _invoke_agent(
+        db,
+        user,
+        prototype.project_id,
+        AgentRole.test_engineer,
+        review_prompt,
+        json.dumps(
+            {"specification": spec.model_dump(mode="json"), "automated_quality": automated},
+            ensure_ascii=False,
+        ),
+        json_mode=True,
+        contract_only=True,
+    )
+    review_trace.update(
+        {"stage": "quality_review", "round": repair_rounds, "fallback": fallback}
+    )
+    trace.append(review_trace)
+    reviewer = extract_review_decision(review_output)
+    contract_repairs = 0
+
+    while reviewer is None and contract_repairs < MAX_REVIEW_CONTRACT_REPAIRS:
+        contract_repairs += 1
+        normalized_output, normalized_trace = await _invoke_agent(
+            db,
+            user,
+            prototype.project_id,
+            AgentRole.test_engineer,
+            (
+                "你是 JSON 质量门禁归一化器。忽略其他角色说明，不重新编写测试方案。"
+                "根据自动检查和上一份评审，只输出一个 JSON 对象且只能包含："
+                "{\"passed\":boolean,\"score\":0-100,\"issues\":[string],\"summary\":string}。"
+                "不得输出 Markdown、test_strategy、测试用例或其他字段。"
+            ),
+            json.dumps(
+                {
+                    "automated_quality": automated,
+                    "previous_review": review_output[:12000],
+                },
+                ensure_ascii=False,
+            ),
+            json_mode=True,
+            contract_only=True,
+        )
+        normalized_trace.update(
+            {
+                "stage": "quality_review_repair",
+                "round": repair_rounds,
+                "contract_repair": contract_repairs,
+                "fallback": fallback,
+            }
+        )
+        trace.append(normalized_trace)
+        review_output = normalized_output
+        reviewer = extract_review_decision(review_output)
+
+    return merge_quality_decision(
+        automated,
+        reviewer,
+        review_output,
+        repair_rounds,
+        contract_repairs,
+    )
 
 
 async def generate_prototype_version(
@@ -481,8 +756,10 @@ async def generate_prototype_version(
         "你正在生成交互原型。先定义目标用户、核心路径、界面清单、每个界面的成功条件。不要声称已实现代码。",
         json.dumps(context, ensure_ascii=False),
     )
+    product_trace.update({"stage": "product_definition", "round": 0})
     trace.append(product_trace)
     schema_guide = {
+        "json_schema": PrototypeSpecification.model_json_schema(),
         "component_types": ["heading", "text", "input", "textarea", "select", "button", "link", "stepper", "stats", "callout", "table", "tabs", "list", "divider"],
         "action_types": ["navigate", "toast", "submit", "copy", "advance_step", "back"],
         "layouts": ["auth", "app", "dashboard", "form", "list"],
@@ -493,32 +770,147 @@ async def generate_prototype_version(
         user,
         prototype.project_id,
         AgentRole.architect,
-        "你是交互架构师。把产品方案转换为安全的结构化原型 DSL，只输出 JSON，不输出 HTML、JavaScript 或 Markdown。",
+        (
+            "你是交互原型 DSL 编译器。把产品方案转换为安全的结构化原型，只输出一个满足用户消息中"
+            " json_schema 的 JSON 对象。顶层必须且只能使用 product_name、summary、start_screen_id、"
+            "theme、screens；不要回显 context、product_brief、schema_guide，不输出 HTML、JavaScript、"
+            "Markdown 或解释。"
+        ),
         json.dumps(
             {"context": context, "product_brief": product_brief, "schema_guide": schema_guide},
             ensure_ascii=False,
         ),
+        json_mode=True,
+        contract_only=True,
     )
+    architect_trace.update({"stage": "architecture", "round": 0})
     trace.append(architect_trace)
-    spec = extract_prototype_spec(architect_output)
+    spec: PrototypeSpecification | None = None
+    quality: dict[str, Any] | None = None
+    best_spec: PrototypeSpecification | None = None
+    best_quality: dict[str, Any] | None = None
+    repair_rounds = 0
+    deterministic_repairs = 0
     generation_mode = "MULTI_AGENT"
+
+    for attempt in range(MAX_PROTOTYPE_REPAIR_ROUNDS + 1):
+        spec, validation_issues = validate_prototype_specification(architect_output)
+        repair_issues: list[str]
+        if spec is None:
+            repair_issues = validation_issues
+        else:
+            automated = evaluate_specification(spec)
+            if not automated["passed"]:
+                repaired_spec, structural_repairs = repair_specification_structure(spec)
+                if structural_repairs:
+                    repaired_quality = evaluate_specification(repaired_spec)
+                    if repaired_quality["score"] > automated["score"]:
+                        spec = repaired_spec
+                        automated = repaired_quality
+                        deterministic_repairs += 1
+                        trace.append(
+                            {
+                                "role": "quality_gate",
+                                "agent_id": None,
+                                "name": "确定性原型修复器",
+                                "model": "local",
+                                "output": json.dumps(
+                                    {
+                                        "repairs": structural_repairs,
+                                        "quality": automated,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                "stage": "deterministic_repair",
+                                "round": attempt,
+                            }
+                        )
+            quality = await review_prototype_specification(
+                db,
+                user,
+                prototype,
+                spec,
+                automated,
+                trace,
+                repair_rounds,
+            )
+            quality["deterministic_repairs"] = deterministic_repairs
+            if best_quality is None or quality["score"] > best_quality["score"]:
+                best_spec = spec.model_copy(deep=True)
+                best_quality = deepcopy(quality)
+            if quality["passed"]:
+                break
+            repair_issues = quality["issues"]
+
+        if attempt >= MAX_PROTOTYPE_REPAIR_ROUNDS:
+            break
+        repair_rounds += 1
+        previous_spec = spec.model_dump(mode="json") if spec else architect_output[:20000]
+        architect_output, repair_trace = await _invoke_agent(
+            db,
+            user,
+            prototype.project_id,
+            AgentRole.architect,
+            (
+                "你是交互架构返修 Agent。根据确定性门禁和测试 Agent 反馈修复原型。"
+                "保留已正确的产品需求，返回完整且可独立校验的原型 DSL JSON；"
+                "顶层必须且只能使用 product_name、summary、start_screen_id、theme、screens；"
+                "严格满足用户消息中的 json_schema，不要输出 answer、context、HTML、JavaScript、"
+                "Markdown 或解释。"
+            ),
+            json.dumps(
+                {
+                    "context": context,
+                    "product_brief": product_brief,
+                    "schema_guide": schema_guide,
+                    "repair_round": repair_rounds,
+                    "quality_issues": repair_issues,
+                    "previous_specification": previous_spec,
+                },
+                ensure_ascii=False,
+            ),
+            json_mode=True,
+            contract_only=True,
+        )
+        repair_trace.update({"stage": "architecture_repair", "round": repair_rounds})
+        trace.append(repair_trace)
+
+    if best_spec is not None and (
+        spec is None
+        or quality is None
+        or (
+            not quality["passed"]
+            and best_quality is not None
+            and best_quality["score"] >= quality["score"]
+        )
+    ):
+        spec = best_spec
+        quality = best_quality
+        if quality is not None:
+            quality["repair_rounds"] = repair_rounds
+
     if spec is None:
         spec = build_fallback_spec(prototype.title, source_prompt)
         generation_mode = "MULTI_AGENT_TEMPLATE_FALLBACK"
-    quality = evaluate_specification(spec)
-    review_output, review_trace = await _invoke_agent(
-        db,
-        user,
-        prototype.project_id,
-        AgentRole.test_engineer,
-        "你是原型质量评审 Agent。检查用户路径、边界状态、表单可访问性、移动端可用性和验收风险，给出简洁评审结论。",
-        json.dumps(
-            {"specification": spec.model_dump(mode="json"), "automated_quality": quality},
-            ensure_ascii=False,
-        ),
-    )
-    trace.append(review_trace)
-    quality["reviewer_summary"] = review_output
+        automated = evaluate_specification(spec)
+        quality = await review_prototype_specification(
+            db,
+            user,
+            prototype,
+            spec,
+            automated,
+            trace,
+            repair_rounds,
+            fallback=True,
+        )
+        quality["deterministic_repairs"] = deterministic_repairs
+    elif quality and quality["passed"] and (repair_rounds or deterministic_repairs):
+        generation_mode = "MULTI_AGENT_REPAIRED"
+    elif not quality or not quality["passed"]:
+        generation_mode = "MULTI_AGENT_REVIEW_REQUIRED"
+
+    if quality is None:
+        raise RuntimeError("Prototype generation completed without a quality decision")
     item = ProductPrototypeVersion(
         prototype_id=prototype.id,
         version=version,

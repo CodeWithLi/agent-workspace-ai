@@ -50,7 +50,13 @@ class LLMGateway:
             return "fallback"
         raise LLMGatewayError("LLM provider request failed") from exc
 
-    async def chat(self, system_prompt: str, user_prompt: str, model: str | None = None) -> str:
+    async def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: str | None = None,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
         started = perf_counter()
         resolved_model = self.resolve_model(model)
         input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
@@ -77,6 +83,8 @@ class LLMGateway:
             ],
             "temperature": 0.3,
         }
+        if response_format:
+            payload["response_format"] = response_format
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             async with httpx.AsyncClient(timeout=90) as client:
@@ -257,6 +265,19 @@ class LLMGateway:
         return [value / norm for value in resized] if norm else resized
 
     def _mock_response(self, system_prompt: str, user_prompt: str) -> str:
+        if (
+            "原型质量门禁判定 Agent" in system_prompt
+            or "JSON 质量门禁归一化器" in system_prompt
+        ):
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 92,
+                    "issues": [],
+                    "summary": "本地安全模板通过路径、表单标签和响应式结构检查。",
+                },
+                ensure_ascii=False,
+            )
         roles = (
             ("产品经理", "AI 产品经理"),
             ("项目经理", "AI 项目经理"),

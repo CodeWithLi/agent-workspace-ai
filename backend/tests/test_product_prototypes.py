@@ -42,7 +42,14 @@ from app.prototypes.schemas import (
     PrototypeSpecification,
     PrototypeUpdateRequest,
 )
-from app.prototypes.service import build_fallback_spec, evaluate_specification
+from app.prototypes.service import (
+    build_fallback_spec,
+    evaluate_specification,
+    merge_quality_decision,
+    PrototypeReviewDecision,
+    repair_specification_structure,
+    validate_prototype_specification,
+)
 
 
 def http_request(path: str) -> Request:
@@ -84,6 +91,53 @@ def prototype_context(db: Session) -> tuple[User, Project, Requirement]:
     return user, project, requirement
 
 
+def unreachable_specification() -> PrototypeSpecification:
+    return PrototypeSpecification.model_validate(
+        {
+            "product_name": "Quality Gate",
+            "summary": "A valid DSL with one unreachable screen.",
+            "start_screen_id": "start",
+            "screens": [
+                {
+                    "id": "start",
+                    "name": "Start",
+                    "sections": [
+                        {
+                            "id": "start-main",
+                            "components": [
+                                {
+                                    "id": "start-action",
+                                    "type": "button",
+                                    "label": "Continue",
+                                    "variant": "primary",
+                                    "action": {"type": "toast", "message": "Saved"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "unreachable",
+                    "name": "Unreachable",
+                    "sections": [
+                        {
+                            "id": "unreachable-main",
+                            "components": [
+                                {
+                                    "id": "unreachable-back",
+                                    "type": "button",
+                                    "label": "Back",
+                                    "action": {"type": "back"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+
 def test_prototype_schema_rejects_unknown_navigation_target() -> None:
     valid = build_fallback_spec("Test", "手机号注册登录和邀请链接")
     payload = valid.model_dump(mode="json")
@@ -91,6 +145,14 @@ def test_prototype_schema_rejects_unknown_navigation_target() -> None:
 
     with pytest.raises(ValidationError):
         PrototypeSpecification.model_validate(payload)
+
+
+def test_prototype_validation_reports_actionable_schema_paths() -> None:
+    spec, issues = validate_prototype_specification('{"answer":"not a prototype"}')
+
+    assert spec is None
+    assert any(issue.startswith("product_name:") for issue in issues)
+    assert any(issue.startswith("screens:") for issue in issues)
 
 
 def test_fallback_auth_prototype_has_complete_reachable_flow() -> None:
@@ -108,6 +170,57 @@ def test_fallback_auth_prototype_has_complete_reachable_flow() -> None:
     assert quality["checks"][0]["passed"] is True
 
 
+def test_quality_gate_rejects_high_scoring_prototype_with_failed_invariant() -> None:
+    quality = evaluate_specification(unreachable_specification())
+
+    assert quality["score"] >= 80
+    assert quality["checks"][0]["name"] == "navigation_integrity"
+    assert quality["checks"][0]["passed"] is False
+    assert quality["passed"] is False
+
+
+def test_deterministic_structure_repair_connects_valid_custom_dsl() -> None:
+    repaired, repairs = repair_specification_structure(unreachable_specification())
+    quality = evaluate_specification(repaired)
+
+    assert repairs == ["Start -> Unreachable", "Unreachable -> Start"]
+    assert quality["passed"] is True
+    assert quality["score"] == 100
+
+    payload = repaired.model_dump(mode="json")
+    for screen in payload["screens"]:
+        for section in screen["sections"]:
+            for component in section["components"]:
+                component["variant"] = "secondary"
+    promoted, promotion_repairs = repair_specification_structure(
+        PrototypeSpecification.model_validate(payload)
+    )
+    assert any("提升主要操作" in item for item in promotion_repairs)
+    assert evaluate_specification(promoted)["passed"] is True
+
+
+def test_reviewer_score_cannot_contradict_passed_decision() -> None:
+    automated = evaluate_specification(
+        build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接")
+    )
+    quality = merge_quality_decision(
+        automated,
+        PrototypeReviewDecision(
+            passed=True,
+            score=79,
+            issues=[],
+            summary="错误地声称可以通过。",
+        ),
+        "",
+        repair_rounds=0,
+        review_contract_repairs=0,
+    )
+
+    assert quality["passed"] is False
+    assert quality["score"] == 79
+    assert any("低于 80 分门禁" in issue for issue in quality["issues"])
+
+
 @pytest.mark.asyncio
 async def test_multi_agent_generation_persists_versions_and_allows_restore(
     db: Session,
@@ -119,9 +232,17 @@ async def test_multi_agent_generation_persists_versions_and_allows_restore(
     class FakeLLM:
         async def chat(self, system_prompt: str, prompt: str, *_args) -> str:
             calls.append(system_prompt)
-            if "质量评审" in system_prompt:
-                return "路径完整，表单标签清晰，建议补充验证码频控说明。"
-            if "交互架构师" in system_prompt:
+            if "质量门禁" in system_prompt:
+                return json.dumps(
+                    {
+                        "passed": True,
+                        "score": 95,
+                        "issues": [],
+                        "summary": "路径完整，表单标签清晰。",
+                    },
+                    ensure_ascii=False,
+                )
+            if "交互原型 DSL" in system_prompt or "交互架构" in system_prompt:
                 return "invalid provider JSON triggers validated fallback"
             return "目标用户为粉丝，核心路径覆盖注册、登录、重置密码和邀请裂变。"
 
@@ -150,8 +271,9 @@ async def test_multi_agent_generation_persists_versions_and_allows_restore(
     assert created.screen_count == 5
     assert created.current.generation_mode == "MULTI_AGENT_TEMPLATE_FALLBACK"
     assert created.current.quality["passed"] is True
-    assert len(created.current.agent_trace) == 3
-    assert len(calls) == 3
+    assert created.current.quality["repair_rounds"] == 2
+    assert len(created.current.agent_trace) == 5
+    assert len(calls) == 5
 
     regenerated = await regenerate_prototype(
         created.id,
@@ -185,6 +307,206 @@ async def test_multi_agent_generation_persists_versions_and_allows_restore(
     assert restored.status == "DRAFT"
     assert get_prototype(created.id, user, db).current.version == 1
     assert [item.id for item in list_prototypes(project.id, requirement.id, user, db)] == [created.id]
+
+
+@pytest.mark.asyncio
+async def test_generation_repairs_failed_architecture_and_records_each_round(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, project, requirement = prototype_context(db)
+    architecture_calls = 0
+    architect_system_prompts: list[str] = []
+    review_calls = 0
+
+    class FakeLLM:
+        async def chat(self, system_prompt: str, _prompt: str, *_args) -> str:
+            nonlocal architecture_calls, review_calls
+            if "质量门禁" in system_prompt:
+                review_calls += 1
+                return json.dumps(
+                    {
+                        "passed": review_calls > 1,
+                        "score": 96 if review_calls > 1 else 70,
+                        "issues": [] if review_calls > 1 else ["需要补充业务边界说明"],
+                        "summary": "所有阻塞问题均已解决。" if review_calls > 1 else "需要继续返修。",
+                    },
+                    ensure_ascii=False,
+                )
+            if "交互原型 DSL" in system_prompt or "交互架构" in system_prompt:
+                architecture_calls += 1
+                architect_system_prompts.append(system_prompt)
+                if architecture_calls == 1:
+                    return unreachable_specification().model_dump_json()
+                return build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接").model_dump_json()
+            return "产品路径覆盖注册、登录、密码重置和邀请转化。"
+
+    class FakeLease:
+        async def release(self) -> None:
+            return None
+
+    async def fake_slot(*_args):
+        return FakeLease()
+
+    monkeypatch.setattr("app.prototypes.service.get_llm", lambda: FakeLLM())
+    monkeypatch.setattr("app.prototypes.service.acquire_agent_slot", fake_slot)
+
+    created = await generate_prototype(
+        PrototypeGenerateRequest(
+            project_id=project.id,
+            requirement_id=requirement.id,
+            title="自动返修原型",
+            prompt="生成手机号注册、登录、密码重置和邀请链接的完整可交互原型。",
+        ),
+        http_request("/api/v1/prototypes/generate"),
+        user,
+        db,
+    )
+
+    assert architecture_calls == 2
+    assert all("技术选型" not in prompt for prompt in architect_system_prompts)
+    assert created.current.generation_mode == "MULTI_AGENT_REPAIRED"
+    assert created.current.quality["passed"] is True
+    assert created.current.quality["repair_rounds"] == 1
+    assert created.current.quality["deterministic_repairs"] == 1
+    assert [trace["stage"] for trace in created.current.agent_trace] == [
+        "product_definition",
+        "architecture",
+        "deterministic_repair",
+        "quality_review",
+        "architecture_repair",
+        "quality_review",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generation_repairs_invalid_reviewer_contract_without_weakening_gate(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, project, requirement = prototype_context(db)
+
+    class FakeLLM:
+        async def chat(self, system_prompt: str, _prompt: str, *_args) -> str:
+            if "JSON 质量门禁归一化器" in system_prompt:
+                return json.dumps(
+                    {
+                        "passed": True,
+                        "score": 94,
+                        "issues": [],
+                        "summary": "评审输出契约已校正，质量门禁通过。",
+                    },
+                    ensure_ascii=False,
+                )
+            if "质量门禁判定" in system_prompt:
+                return json.dumps(
+                    {
+                        "test_strategy": {
+                            "functional_test_cases": ["注册", "登录", "邀请"],
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+            if "交互原型 DSL" in system_prompt or "交互架构" in system_prompt:
+                return build_fallback_spec(
+                    "偶像泡泡", "手机号注册登录和邀请链接"
+                ).model_dump_json()
+            return "产品路径覆盖注册、登录、密码重置和邀请转化。"
+
+    class FakeLease:
+        async def release(self) -> None:
+            return None
+
+    async def fake_slot(*_args):
+        return FakeLease()
+
+    monkeypatch.setattr("app.prototypes.service.get_llm", lambda: FakeLLM())
+    monkeypatch.setattr("app.prototypes.service.acquire_agent_slot", fake_slot)
+
+    created = await generate_prototype(
+        PrototypeGenerateRequest(
+            project_id=project.id,
+            requirement_id=requirement.id,
+            title="评审契约校正原型",
+            prompt="生成手机号注册、登录、密码重置和邀请链接的完整可交互原型。",
+        ),
+        http_request("/api/v1/prototypes/generate"),
+        user,
+        db,
+    )
+
+    assert created.current.generation_mode == "MULTI_AGENT"
+    assert created.current.quality["passed"] is True
+    assert created.current.quality["reviewer_score"] == 94
+    assert created.current.quality["review_contract_repairs"] == 1
+    assert [trace["stage"] for trace in created.current.agent_trace] == [
+        "product_definition",
+        "architecture",
+        "quality_review",
+        "quality_review_repair",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generation_preserves_best_custom_candidate_when_repairs_break_schema(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, project, requirement = prototype_context(db)
+    architecture_calls = 0
+
+    class FakeLLM:
+        async def chat(self, system_prompt: str, _prompt: str, *_args) -> str:
+            nonlocal architecture_calls
+            if "质量门禁" in system_prompt:
+                return json.dumps(
+                    {
+                        "passed": False,
+                        "score": 70,
+                        "issues": ["需要人工确认奖励规则"],
+                        "summary": "结构有效，但业务规则需要评审。",
+                    },
+                    ensure_ascii=False,
+                )
+            if "交互原型 DSL" in system_prompt or "交互架构" in system_prompt:
+                architecture_calls += 1
+                if architecture_calls == 1:
+                    custom = build_fallback_spec(
+                        "定制候选", "手机号注册登录和邀请链接"
+                    ).model_copy(update={"product_name": "定制候选"})
+                    return custom.model_dump_json()
+                return '{"answer":"schema repair failed"}'
+            return "产品路径覆盖注册、登录、密码重置和邀请转化。"
+
+    class FakeLease:
+        async def release(self) -> None:
+            return None
+
+    async def fake_slot(*_args):
+        return FakeLease()
+
+    monkeypatch.setattr("app.prototypes.service.get_llm", lambda: FakeLLM())
+    monkeypatch.setattr("app.prototypes.service.acquire_agent_slot", fake_slot)
+
+    created = await generate_prototype(
+        PrototypeGenerateRequest(
+            project_id=project.id,
+            requirement_id=requirement.id,
+            title="保留定制候选",
+            prompt="生成手机号注册、登录、密码重置和邀请链接的完整可交互原型。",
+        ),
+        http_request("/api/v1/prototypes/generate"),
+        user,
+        db,
+    )
+
+    assert architecture_calls == 3
+    assert created.current.generation_mode == "MULTI_AGENT_REVIEW_REQUIRED"
+    assert created.current.specification.product_name == "定制候选"
+    assert created.current.quality["passed"] is False
+    assert created.current.quality["score"] == 70
+    assert created.current.quality["repair_rounds"] == 2
+    assert not any(trace.get("fallback") for trace in created.current.agent_trace)
 
 
 def test_review_gate_and_materialization_are_traceable_and_idempotent(db: Session) -> None:

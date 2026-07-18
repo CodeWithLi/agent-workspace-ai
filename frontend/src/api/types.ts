@@ -505,15 +505,24 @@ export interface PrototypeQuality {
   checks: PrototypeQualityCheck[]
   issues: string[]
   reviewer_summary?: string
+  reviewer_score?: number
+  reviewer_passed?: boolean
+  repair_rounds?: number
+  review_contract_repairs?: number
+  deterministic_repairs?: number
 }
 
 export interface PrototypeAgentTrace {
   role: string
-  agent_id: number
+  agent_id: number | null
   name: string
   model: string
-  prompt_version: number
+  prompt_version?: number
   output: string
+  stage?: 'product_definition' | 'architecture' | 'architecture_repair' | 'deterministic_repair' | 'quality_review' | 'quality_review_repair'
+  round?: number
+  fallback?: boolean
+  contract_repair?: number
 }
 
 export interface PrototypeVersion {

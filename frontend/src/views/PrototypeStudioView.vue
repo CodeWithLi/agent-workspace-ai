@@ -143,7 +143,7 @@
                   </li>
                 </ul>
                 <div v-if="activePrototype.current.quality.reviewer_summary" class="reviewer-summary">
-                  <strong>测试 Agent 结论</strong>
+                  <strong>测试 Agent 结论<span v-if="activePrototype.current.quality.reviewer_score !== undefined"> · {{ Math.round(activePrototype.current.quality.reviewer_score) }} 分</span></strong>
                   <p>{{ activePrototype.current.quality.reviewer_summary }}</p>
                 </div>
               </el-tab-pane>
@@ -173,13 +173,16 @@
               <el-tab-pane label="Agent" name="agents">
                 <div class="agent-run-meta">
                   <span>{{ generationModeLabel(activePrototype.current.generation_mode) }}</span>
-                  <span>{{ activePrototype.current.agent_trace.length }} 个 Agent</span>
+                  <span>{{ activePrototype.current.agent_trace.length }} 个协作步骤</span>
+                  <span v-if="activePrototype.current.quality.repair_rounds">{{ activePrototype.current.quality.repair_rounds }} 轮自动返修</span>
+                  <span v-if="activePrototype.current.quality.deterministic_repairs">{{ activePrototype.current.quality.deterministic_repairs }} 次结构修复</span>
+                  <span v-if="activePrototype.current.quality.review_contract_repairs">{{ activePrototype.current.quality.review_contract_repairs }} 次评审校正</span>
                 </div>
                 <el-collapse accordion class="agent-trace-list">
-                  <el-collapse-item v-for="trace in activePrototype.current.agent_trace" :key="`${trace.role}-${trace.agent_id}`" :name="trace.role">
+                  <el-collapse-item v-for="(trace, index) in activePrototype.current.agent_trace" :key="`${trace.role}-${trace.agent_id}-${trace.round ?? 0}-${index}`" :name="`trace-${index}`">
                     <template #title>
                       <span class="trace-avatar">{{ trace.name.slice(0, 1) }}</span>
-                      <span class="trace-title"><strong>{{ trace.name }}</strong><small>{{ roleLabel(trace.role) }} · {{ trace.model }}</small></span>
+                      <span class="trace-title"><strong>{{ trace.name }}</strong><small>{{ roleLabel(trace.role) }} · {{ traceStageLabel(trace.stage, trace.round, trace.fallback) }} · {{ trace.model }}</small></span>
                     </template>
                     <pre>{{ trace.output }}</pre>
                   </el-collapse-item>
@@ -707,18 +710,36 @@ function qualityCheckLabel(name: string) {
   return {
     navigation_integrity: '导航完整性',
     interactive_paths: '交互路径',
+    screen_action_coverage: '界面操作覆盖',
     primary_actions: '主要操作',
     visible_form_labels: '表单可访问性',
-    responsive_contract: '响应式结构'
+    responsive_contract: '响应式结构',
+    agent_review: '测试 Agent 评审'
   }[name] || name
 }
 
 function roleLabel(role: string) {
-  return { product_manager: '产品定义', architect: '交互架构', test_engineer: '质量评审' }[role] || role
+  return { product_manager: '产品定义', architect: '交互架构', test_engineer: '质量评审', quality_gate: '确定性门禁' }[role] || role
+}
+
+function traceStageLabel(stage?: string, round = 0, fallback = false) {
+  if (fallback) return '安全模板复审'
+  if (stage === 'architecture_repair') return `第 ${round} 轮返修`
+  if (stage === 'deterministic_repair') return '结构修复'
+  if (stage === 'quality_review_repair') return '评审契约校正'
+  if (stage === 'quality_review') return round ? `第 ${round} 轮复审` : '首次评审'
+  if (stage === 'product_definition') return '产品定义'
+  if (stage === 'architecture') return '首次生成'
+  return '协作执行'
 }
 
 function generationModeLabel(mode: string) {
-  return mode === 'MULTI_AGENT' ? '多 Agent 生成' : mode === 'MULTI_AGENT_TEMPLATE_FALLBACK' ? '多 Agent + 安全模板' : mode
+  return {
+    MULTI_AGENT: '多 Agent 生成',
+    MULTI_AGENT_REPAIRED: '多 Agent 自动返修通过',
+    MULTI_AGENT_REVIEW_REQUIRED: '多 Agent 生成 · 需要人工评审',
+    MULTI_AGENT_TEMPLATE_FALLBACK: '多 Agent + 安全模板'
+  }[mode] || mode
 }
 
 watch(() => route.query.prototype, (value) => {
