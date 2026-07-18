@@ -75,7 +75,7 @@ python scripts/benchmark_rag_parsers.py run \
   --output .run/parser-native.json
 ```
 
-当前本机 native 基线为：解析成功率 `0.6667`、marker recall `0.6667`、结构 recall `0.3333`、阅读顺序 `0.6667`、PDF 页码覆盖 `0.5`、bbox 覆盖 `0`。它正确暴露了原生解析没有扫描 PDF OCR、文本 PDF 不恢复表格/标题和 bbox 的限制。Docling、Unstructured、MinerU 的结果只能以 `RAG Parser Benchmark` 绿色 artifact 为证；工作流或适配器代码存在不代表比较已经完成。部署体积的 scope 会随报告明确记录：Docling 使用压缩容器镜像，Unstructured 使用隔离 Python 环境，MinerU 使用隔离环境加模型缓存，不能把这些数字误写成完全相同的口径。
+当前本机 native 基线为：解析成功率 `0.6667`、marker recall `0.6667`、结构 recall `0.3333`、阅读顺序 `0.6667`、PDF 页码覆盖 `0.5`、bbox 覆盖 `0`。它正确暴露了原生解析没有扫描 PDF OCR、文本 PDF 不恢复表格/标题和 bbox 的限制。部署体积的 scope 会随报告明确记录：Docling 使用容器镜像，Unstructured 使用隔离 Python 环境，MinerU 使用隔离环境加模型缓存，不能把这些数字误写成完全相同的口径。
 
 2026-07-18 在同一 `c3252b62...35c85` corpus hash 上完成了本地 CPU 实测。Docling 使用真实 Docling Serve 1.26.0，MinerU 使用 3.4.4 `pipeline`；两者都成功恢复 DOCX 标题/表格、两页 PDF 阅读顺序/表格/bbox 和扫描 PDF OCR。资源数字仅在各自行内口径比较，不能视为容器压缩体积的等价值。
 
@@ -88,12 +88,23 @@ python scripts/benchmark_rag_parsers.py run \
 
 MinerU 3.4.4 的 pipeline wheel 使用了未声明的 `six` 依赖；基准专用 requirements 已显式固定 `six==1.17.0`，防止隔离 job 在模型加载前失败。本地真实 Docling 集成测试也已通过 DOCX 表格和扫描 PDF OCR。以上结果支持在当前合成边界语料上优先 Docling，但仍不能替代四后端 Linux artifact 或业务复杂文档验证。
 
+同日，[`RAG Parser Benchmark #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629969071) 在 Linux runner 上完成首次四后端绿色矩阵及严格 comparison gate。所有报告共享 `70e00e55...3dea1c` corpus hash；资源口径仍按各行的 artifact scope 解读。
+
+| 后端 | 质量分 | 成功率 | 结构 recall | p95 | 峰值内存 | artifact 体积 |
+|---|---:|---:|---:|---:|---:|---:|
+| MinerU 3.4.4 | 1.0000 | 1.0000 | 1.0000 | 15.09 s | 3,468.1 MB | 6,468 MB |
+| Docling 1.26 JSON | 0.9167 | 1.0000 | 0.6667 | 8.03 s | 1,792.0 MB | 4,734.57 MB |
+| Unstructured 0.24.1 | 0.9167 | 1.0000 | 0.6667 | 25.17 s | 2,009.7 MB | 6,177 MB |
+| native | 0.4792 | 0.6667 | 0.3333 | 124 ms | 51.1 MB | 646 MB |
+
+Linux 证据表明 MinerU 在该合成边界语料上质量最高，Docling 是高级解析器中延迟最低且体积较小的选项，Unstructured 能在 Linux 正常运行但本轮没有质量或资源优势。因此保留 Docling 作为默认高级解析器候选，MinerU 作为质量优先的复杂中文 PDF 离线候选；在真实业务文档验证前不把该排序外推成普遍结论。
+
 ## 尚未完成的验证
 
 - 当前已固化 6 份仓库真实文档快照并增加 DOCX 表格、随机 Unicode 和扫描 PDF OCR 自动样本；仍需加入业务方脱敏的真实复杂 PDF、中文表格、公式和代码文档。
-- Docling 与 MinerU 已取得本地真实同样本报告，Unstructured 因本机无 AVX2 未完成；四后端严格汇总门禁仍需取得首次 Linux 绿色 artifact，并用业务脱敏样本复核合成语料结论。
+- Docling、MinerU、Unstructured 与 native 的 Linux 同样本矩阵和严格汇总门禁已绿色；仍需用业务脱敏样本复核合成语料结论。
 - 确定性结构分块 A/B 已进入门禁；真实多语 embedding、查询改写、reranker、答案忠实度与引用正确率工作流已实现，但尚需配置受控外部服务并取得绿色运行报告。
-- Milvus v4 child/parent 多向量、个人 owner 隔离、4 并发 p95 的真实 CI 测试已实现；当前机器无 Docker，尚需首次 GitHub Actions 绿色运行作为证据。双版本索引、原子激活和回滚已有 SQLite/API/E2E 证据。
-- Docling DOCX 表格与图片型 PDF OCR 已在本地真实 1.26.0 服务通过，定期工作流也已实现；Docling、MinerU 与 Unstructured 同样本矩阵尚需首次全后端绿色 artifact，不能以本地三后端报告代替。
+- Milvus v4 child/parent 多向量、个人 owner 隔离、4 并发 p95 已在 `CI #7/#8` 真实服务 job 绿色；双版本索引、原子激活和回滚另有 SQLite/API/E2E 证据。
+- Docling DOCX 表格与图片型 PDF OCR 已在本地及 [`RAG Docling Integration #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629854246) 真实 1.26.0 服务通过。
 
 在上述验证完成前，本 ADR 不把任何单一外部库描述为“最佳”。
