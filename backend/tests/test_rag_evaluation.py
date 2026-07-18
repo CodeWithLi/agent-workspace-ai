@@ -97,6 +97,14 @@ def test_deterministic_answer_assertions_detect_opposite_claims() -> None:
 
     assert deterministic_answer_assertion_score("配置无效时应用会拒绝启动。", required, forbidden) == 1.0
     assert deterministic_answer_assertion_score("配置无效时系统会继续运行。", required, forbidden) == 0.0
+    assert (
+        deterministic_answer_assertion_score(
+            "knowledge_access 为 false 时会移除 knowledge_search。",
+            (("knowledge_access",), ("false",), ("knowledge_search",), ("移除", "remove")),
+            (),
+        )
+        == 1.0
+    )
 
 
 def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> None:

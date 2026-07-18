@@ -118,7 +118,15 @@ class LocalOpenModelSuite:
         if digest.hexdigest() != expected_sha256:
             raise RuntimeError(f"Model checksum mismatch: {path}")
 
-    def _load_llm(self, repository: str, filename: str, revision: str, sha256: str) -> Any:
+    def _load_llm(
+        self,
+        repository: str,
+        filename: str,
+        revision: str,
+        sha256: str,
+        *,
+        n_ctx: int = 4096,
+    ) -> Any:
         from huggingface_hub import hf_hub_download
         from llama_cpp import Llama
 
@@ -126,7 +134,7 @@ class LocalOpenModelSuite:
         self._verify_model(model_path, sha256)
         return Llama(
             model_path=model_path,
-            n_ctx=4096,
+            n_ctx=n_ctx,
             n_batch=256,
             n_threads=self._threads,
             seed=42,
@@ -150,8 +158,16 @@ class LocalOpenModelSuite:
                 JUDGE_MODEL_FILENAME,
                 JUDGE_MODEL_REVISION,
                 JUDGE_MODEL_SHA256,
+                n_ctx=8192,
             )
         return self._judge_llm
+
+    async def warmup(self) -> None:
+        try:
+            await asyncio.to_thread(self._load_answer_llm)
+            await asyncio.to_thread(self._load_judge_llm)
+        except Exception as exc:
+            raise LLMGatewayError(f"Local model warmup failed: {type(exc).__name__}: {exc}") from exc
 
     def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
         model = self._load_embedding_model()

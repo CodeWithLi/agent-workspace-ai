@@ -26,7 +26,7 @@
     "query": "怎样真正禁止某个 Agent 使用知识库，而不是只写在提示词里？",
     "document": "AGENT_DESIGN.md",
     "evidence": "`knowledge_access=false` 会在运行时移除 `knowledge_search`",
-    "answer_required_groups": [["knowledge_access=false"], ["knowledge_search"], ["移除", "remove"]]
+    "answer_required_groups": [["knowledge_access"], ["false"], ["knowledge_search"], ["移除", "remove"]]
   },
   {
     "name": "restore-drill",

@@ -99,6 +99,18 @@ async def test_local_open_models_constrain_judge_to_required_json_schema() -> No
 
 
 @pytest.mark.asyncio
+async def test_local_open_models_warm_up_answer_and_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    suite = LocalOpenModelSuite()
+    loaded: list[str] = []
+    monkeypatch.setattr(suite, "_load_answer_llm", lambda: loaded.append("answer"))
+    monkeypatch.setattr(suite, "_load_judge_llm", lambda: loaded.append("judge"))
+
+    await suite.warmup()
+
+    assert loaded == ["answer", "judge"]
+
+
+@pytest.mark.asyncio
 async def test_rewrite_query_uses_injected_gateway(monkeypatch) -> None:
     class Gateway:
         async def chat(self, *_args, **_kwargs) -> str:
