@@ -60,8 +60,16 @@ class LocalOpenModelSuite:
         return RERANKER_MODEL
 
     @property
+    def rerank_min_score(self) -> float:
+        return 0.08
+
+    @property
+    def rerank_min_query_coverage(self) -> float:
+        return 0.08
+
+    @property
     def rerank_relevance_threshold(self) -> float:
-        return 0.06
+        return 0.12
 
     @property
     def model_revisions(self) -> dict[str, dict[str, str]]:

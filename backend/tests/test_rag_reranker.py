@@ -108,3 +108,68 @@ def test_result_selection_preserves_dense_fallback_when_reranker_fails() -> None
     selected = select_diverse_results(rows, 5, 0.2, 0.15, 0.72, 0.6)
 
     assert [row["vector_id"] for row in selected] == ["fallback"]
+
+
+def test_result_selection_uses_two_stage_reranker_gate() -> None:
+    rows = [
+        {
+            "vector_id": "low-coverage-evidence",
+            "document_id": 1,
+            "stable_id": "low-coverage-evidence",
+            "parent_stable_id": "parent-evidence",
+            "score": 0.5,
+            "dense_score": 0.9,
+            "rerank_score": 0.1003,
+            "rerank_fallback": False,
+            "query_coverage": 0.1053,
+        },
+        {
+            "vector_id": "high-coverage-noise",
+            "document_id": 2,
+            "stable_id": "high-coverage-noise",
+            "parent_stable_id": "parent-noise",
+            "score": 0.5,
+            "dense_score": 0.9,
+            "rerank_score": 0.0046,
+            "rerank_fallback": False,
+            "query_coverage": 0.1579,
+        },
+        {
+            "vector_id": "zero-coverage-noise",
+            "document_id": 3,
+            "stable_id": "zero-coverage-noise",
+            "parent_stable_id": "parent-zero-noise",
+            "score": 0.5,
+            "dense_score": 0.9,
+            "rerank_score": 0.1115,
+            "rerank_fallback": False,
+            "query_coverage": 0.0,
+        },
+        {
+            "vector_id": "zero-coverage-evidence",
+            "document_id": 4,
+            "stable_id": "zero-coverage-evidence",
+            "parent_stable_id": "parent-zero-evidence",
+            "score": 0.5,
+            "dense_score": 0.9,
+            "rerank_score": 0.4495,
+            "rerank_fallback": False,
+            "query_coverage": 0.0,
+        },
+    ]
+
+    selected = select_diverse_results(
+        rows,
+        5,
+        0.2,
+        0.15,
+        0.72,
+        0.12,
+        rerank_min_score=0.08,
+        rerank_min_query_coverage=0.08,
+    )
+
+    assert [row["vector_id"] for row in selected] == [
+        "low-coverage-evidence",
+        "zero-coverage-evidence",
+    ]

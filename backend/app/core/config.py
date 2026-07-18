@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     reranker_candidate_limit: int = Field(default=40, ge=5, le=200)
     reranker_timeout_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
     reranker_cost_per_million: float = Field(default=0.0, ge=0, le=10000)
+    rag_rerank_min_score: float = Field(default=0.1, ge=0.0, le=1.0)
+    rag_rerank_min_query_coverage: float = Field(default=0.08, ge=0.0, le=1.0)
     rag_rerank_override_score: float = Field(default=0.6, ge=0.0, le=1.0)
     rag_fallback_candidate_limit: int = Field(default=1000, ge=50, le=10000)
     rag_parser_backend: str = "native"

@@ -127,10 +127,14 @@ async def test_rewrite_query_uses_injected_gateway(monkeypatch) -> None:
 
 
 def test_local_open_model_revisions_are_pinned() -> None:
-    revisions = LocalOpenModelSuite().model_revisions
+    suite = LocalOpenModelSuite()
+    revisions = suite.model_revisions
 
     assert all(len(model["revision"]) == 40 for model in revisions.values())
     assert all(len(model["sha256"]) == 64 for name, model in revisions.items() if name in {"answer", "judge"})
+    assert suite.rerank_min_score == 0.08
+    assert suite.rerank_min_query_coverage == 0.08
+    assert suite.rerank_relevance_threshold == 0.12
 
 
 def test_local_open_model_rejects_checksum_mismatch(tmp_path) -> None:

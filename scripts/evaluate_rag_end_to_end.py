@@ -256,6 +256,12 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         "rerank_relevance_threshold",
         settings.rag_rerank_override_score,
     )
+    rerank_min_score = getattr(active_reranker, "rerank_min_score", settings.rag_rerank_min_score)
+    rerank_min_query_coverage = getattr(
+        active_reranker,
+        "rerank_min_query_coverage",
+        settings.rag_rerank_min_query_coverage,
+    )
 
     for case in cases:
         case_started = perf_counter()
@@ -297,6 +303,8 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             settings.rag_min_query_coverage,
             settings.rag_dense_override_score,
             rerank_relevance_threshold,
+            rerank_min_score=rerank_min_score,
+            rerank_min_query_coverage=rerank_min_query_coverage,
         )
 
         def matches_evidence(row: dict) -> bool:
@@ -401,6 +409,10 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                     "passes_min_score": row["score"] >= args.min_score,
                     "passes_coverage": row.get("query_coverage", 0.0) >= settings.rag_min_query_coverage,
                     "dense_override": row["dense_score"] >= settings.rag_dense_override_score,
+                    "passes_rerank_min_score": row.get("rerank_score", 0.0) >= rerank_min_score,
+                    "passes_rerank_coverage": (
+                        row.get("query_coverage", 0.0) >= rerank_min_query_coverage
+                    ),
                     "rerank_override": row.get("rerank_score", 0.0) >= rerank_relevance_threshold,
                     "parent_stable_id": row["parent_stable_id"],
                 }
@@ -499,6 +511,8 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             "reranker_model": getattr(gateway, "reranker_model_name", settings.reranker_model)
             if reranker_enabled
             else None,
+            "rerank_min_score": rerank_min_score,
+            "rerank_min_query_coverage": rerank_min_query_coverage,
             "rerank_relevance_threshold": rerank_relevance_threshold,
             "judge_model": args.judge_model
             or getattr(gateway, "judge_model_name", gateway.model),

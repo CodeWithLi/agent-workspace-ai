@@ -91,6 +91,8 @@ CONFIG_DEFINITIONS = {
         ConfigDefinition("reranker_candidate_limit", "Reranker Candidate Limit", "rag", int, minimum=5, maximum=200),
         ConfigDefinition("reranker_timeout_seconds", "Reranker Timeout Seconds", "rag", float, minimum=1, maximum=120),
         ConfigDefinition("reranker_cost_per_million", "Reranker Cost / 1M Tokens", "billing", float, minimum=0, maximum=10000),
+        ConfigDefinition("rag_rerank_min_score", "Reranker Minimum Score", "rag", float, minimum=0, maximum=1),
+        ConfigDefinition("rag_rerank_min_query_coverage", "Reranker Minimum Query Coverage", "rag", float, minimum=0, maximum=1),
         ConfigDefinition("rag_rerank_override_score", "Reranker Override Score", "rag", float, minimum=0, maximum=1),
         ConfigDefinition("rag_fallback_candidate_limit", "Fallback Candidate Limit", "rag", int, minimum=50, maximum=10000),
         ConfigDefinition("rag_parser_backend", "Parser Backend", "rag", str),

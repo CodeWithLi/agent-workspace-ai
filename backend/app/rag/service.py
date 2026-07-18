@@ -616,10 +616,16 @@ def select_diverse_results(
     min_query_coverage: float,
     dense_override_score: float,
     rerank_override_score: float,
+    *,
+    rerank_min_score: float = 0.0,
+    rerank_min_query_coverage: float | None = None,
 ) -> list[dict]:
     selected: list[dict] = []
     seen_parents: set[tuple[int, str]] = set()
     reranker_succeeded = any(row.get("rerank_fallback") is False for row in rows)
+    rerank_coverage = (
+        min_query_coverage if rerank_min_query_coverage is None else rerank_min_query_coverage
+    )
     for row in rows:
         if row["score"] < min_score:
             continue
@@ -627,7 +633,10 @@ def select_diverse_results(
         if reranker_succeeded:
             if row.get("rerank_fallback") is not False:
                 continue
-            if coverage_below_minimum and row.get("rerank_score", 0.0) < rerank_override_score:
+            rerank_score = row.get("rerank_score", 0.0)
+            if rerank_score < rerank_min_score:
+                continue
+            if row.get("query_coverage", 0.0) < rerank_coverage and rerank_score < rerank_override_score:
                 continue
         elif coverage_below_minimum and row["dense_score"] < dense_override_score:
             continue
@@ -838,6 +847,8 @@ async def search_knowledge(
         settings.rag_min_query_coverage,
         settings.rag_dense_override_score,
         settings.rag_rerank_override_score,
+        rerank_min_score=settings.rag_rerank_min_score,
+        rerank_min_query_coverage=settings.rag_rerank_min_query_coverage,
     )
     for row in results:
         row["score"] = round(row["score"], 4)
