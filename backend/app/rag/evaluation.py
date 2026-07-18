@@ -22,6 +22,8 @@ class RetrievalCase:
     document: str | None
     evidence: str | None
     answerable: bool = True
+    answer_required_groups: tuple[tuple[str, ...], ...] = ()
+    answer_forbidden_terms: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -119,6 +121,19 @@ def first_relevant_rank(matches: Iterable[bool]) -> int | None:
     return next((rank for rank, matched in enumerate(matches, start=1) if matched), None)
 
 
+def deterministic_answer_assertion_score(
+    answer: str,
+    required_groups: Iterable[Iterable[str]],
+    forbidden_terms: Iterable[str],
+) -> float:
+    normalized = answer.casefold()
+    required = tuple(tuple(term.casefold() for term in group if term) for group in required_groups)
+    forbidden = tuple(term.casefold() for term in forbidden_terms if term)
+    required_match = all(group and any(term in normalized for term in group) for group in required)
+    forbidden_match = any(term in normalized for term in forbidden)
+    return 1.0 if required and required_match and not forbidden_match else 0.0
+
+
 def compare_end_to_end_reports(
     baseline: dict,
     candidate: dict,
@@ -145,6 +160,7 @@ def compare_end_to_end_reports(
         "answer_relevance",
         "deterministic_citation_validity",
         "judge_citation_correctness",
+        "answer_assertion_accuracy",
         "refusal_accuracy",
     )
     deltas: dict[str, float] = {}
@@ -174,7 +190,15 @@ def compare_end_to_end_reports(
 
 def load_cases(path: Path) -> list[RetrievalCase]:
     rows = json.loads(path.read_text(encoding="utf-8"))
-    return [RetrievalCase(**row) for row in rows]
+    cases = []
+    for source in rows:
+        row = dict(source)
+        row["answer_required_groups"] = tuple(
+            tuple(group) for group in row.get("answer_required_groups", ())
+        )
+        row["answer_forbidden_terms"] = tuple(row.get("answer_forbidden_terms", ()))
+        cases.append(RetrievalCase(**row))
+    return cases
 
 
 def load_documents(cases: list[RetrievalCase], directory: Path) -> dict[str, bytes]:

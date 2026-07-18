@@ -44,7 +44,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: rag-open-models-v1-${{ runner.os }}-${{ hashFiles('backend/requirements-rag-open-model-eval.txt') }}
+          key: rag-open-models-v2-${{ runner.os }}-${{ hashFiles('backend/requirements-rag-open-model-eval.txt', 'backend/app/rag/local_evaluation_models.py') }}
       - run: pip install -r backend/requirements-rag-open-model-eval.txt
       - name: Run pinned open-model legacy baseline
         run: >-

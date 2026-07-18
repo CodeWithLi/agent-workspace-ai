@@ -619,14 +619,17 @@ def select_diverse_results(
 ) -> list[dict]:
     selected: list[dict] = []
     seen_parents: set[tuple[int, str]] = set()
+    reranker_succeeded = any(row.get("rerank_fallback") is False for row in rows)
     for row in rows:
         if row["score"] < min_score:
             continue
-        if (
-            row.get("query_coverage", 0.0) < min_query_coverage
-            and row["dense_score"] < dense_override_score
-            and row.get("rerank_score", 0.0) < rerank_override_score
-        ):
+        coverage_below_minimum = row.get("query_coverage", 0.0) < min_query_coverage
+        if reranker_succeeded:
+            if row.get("rerank_fallback") is not False:
+                continue
+            if coverage_below_minimum and row.get("rerank_score", 0.0) < rerank_override_score:
+                continue
+        elif coverage_below_minimum and row["dense_score"] < dense_override_score:
             continue
         parent_key = (row["document_id"], row.get("parent_stable_id") or row["stable_id"])
         if parent_key in seen_parents:

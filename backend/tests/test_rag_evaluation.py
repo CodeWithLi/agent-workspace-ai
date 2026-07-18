@@ -5,6 +5,7 @@ import pytest
 
 from app.rag.evaluation import (
     compare_end_to_end_reports,
+    deterministic_answer_assertion_score,
     deterministic_citation_score,
     evaluate_candidates,
     first_relevant_rank,
@@ -90,6 +91,14 @@ def test_repeated_chunks_count_as_one_evidence_target() -> None:
     assert first_relevant_rank([False, False]) is None
 
 
+def test_deterministic_answer_assertions_detect_opposite_claims() -> None:
+    required = (("拒绝启动", "refuse to start"),)
+    forbidden = ("系统会继续运行",)
+
+    assert deterministic_answer_assertion_score("配置无效时应用会拒绝启动。", required, forbidden) == 1.0
+    assert deterministic_answer_assertion_score("配置无效时系统会继续运行。", required, forbidden) == 0.0
+
+
 def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> None:
     baseline_metrics = {
         "recall_at_k": 0.7,
@@ -101,6 +110,7 @@ def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> No
         "answer_relevance": 0.9,
         "deterministic_citation_validity": 1.0,
         "judge_citation_correctness": 0.95,
+        "answer_assertion_accuracy": 1.0,
         "refusal_accuracy": 1.0,
     }
     candidate_metrics = {**baseline_metrics, "recall_at_k": 0.76}

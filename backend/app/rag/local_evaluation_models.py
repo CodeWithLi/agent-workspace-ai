@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 from typing import Any
@@ -13,9 +14,14 @@ EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 EMBEDDING_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
 RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 RERANKER_REVISION = "1427fd652930e4ba29e8149678df786c240d8825"
-CHAT_MODEL_REPOSITORY = "bartowski/Qwen2.5-0.5B-Instruct-GGUF"
-CHAT_MODEL_FILENAME = "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-CHAT_MODEL_REVISION = "41ba88dbac95fed2528c92514c131d73eb5a174b"
+ANSWER_MODEL_REPOSITORY = "bartowski/Qwen2.5-1.5B-Instruct-GGUF"
+ANSWER_MODEL_FILENAME = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+ANSWER_MODEL_REVISION = "9eadc66189c7641e1ddd226b8267a9119b2ce2d4"
+ANSWER_MODEL_SHA256 = "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370"
+JUDGE_MODEL_REPOSITORY = "bartowski/Phi-3.5-mini-instruct-GGUF"
+JUDGE_MODEL_FILENAME = "Phi-3.5-mini-instruct-Q4_K_M.gguf"
+JUDGE_MODEL_REVISION = "6d70da17e749a471ccb62ade694486011a75cda3"
+JUDGE_MODEL_SHA256 = "e4165e3a71af97f1b4820da61079826d8752a2088e313af0c7d346796c38eff5"
 
 
 class LocalOpenModelSuite:
@@ -24,7 +30,8 @@ class LocalOpenModelSuite:
     def __init__(self) -> None:
         self._embedding_model: Any | None = None
         self._reranker: Any | None = None
-        self._llm: Any | None = None
+        self._answer_llm: Any | None = None
+        self._judge_llm: Any | None = None
         self._threads = max(1, min(os.cpu_count() or 1, 4))
         self._reranker_candidate_limit = 40
 
@@ -38,7 +45,11 @@ class LocalOpenModelSuite:
 
     @property
     def model(self) -> str:
-        return f"{CHAT_MODEL_REPOSITORY}/{CHAT_MODEL_FILENAME}"
+        return f"{ANSWER_MODEL_REPOSITORY}/{ANSWER_MODEL_FILENAME}"
+
+    @property
+    def judge_model_name(self) -> str:
+        return f"{JUDGE_MODEL_REPOSITORY}/{JUDGE_MODEL_FILENAME}"
 
     @property
     def embedding_model_name(self) -> str:
@@ -49,14 +60,27 @@ class LocalOpenModelSuite:
         return RERANKER_MODEL
 
     @property
+    def rerank_relevance_threshold(self) -> float:
+        return 0.06
+
+    @property
     def model_revisions(self) -> dict[str, dict[str, str]]:
         return {
             "embedding": {"model": EMBEDDING_MODEL, "revision": EMBEDDING_REVISION},
             "reranker": {"model": RERANKER_MODEL, "revision": RERANKER_REVISION},
-            "chat_and_judge": {
-                "model": CHAT_MODEL_REPOSITORY,
-                "filename": CHAT_MODEL_FILENAME,
-                "revision": CHAT_MODEL_REVISION,
+            "answer": {
+                "model": ANSWER_MODEL_REPOSITORY,
+                "filename": ANSWER_MODEL_FILENAME,
+                "revision": ANSWER_MODEL_REVISION,
+                "sha256": ANSWER_MODEL_SHA256,
+                "license": "apache-2.0",
+            },
+            "judge": {
+                "model": JUDGE_MODEL_REPOSITORY,
+                "filename": JUDGE_MODEL_FILENAME,
+                "revision": JUDGE_MODEL_REVISION,
+                "sha256": JUDGE_MODEL_SHA256,
+                "license": "mit",
             },
         }
 
@@ -85,25 +109,49 @@ class LocalOpenModelSuite:
             )
         return self._reranker
 
-    def _load_llm(self) -> Any:
-        if self._llm is None:
-            from huggingface_hub import hf_hub_download
-            from llama_cpp import Llama
+    @staticmethod
+    def _verify_model(path: str, expected_sha256: str) -> None:
+        digest = hashlib.sha256()
+        with open(path, "rb") as model_file:
+            for block in iter(lambda: model_file.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError(f"Model checksum mismatch: {path}")
 
-            model_path = hf_hub_download(
-                repo_id=CHAT_MODEL_REPOSITORY,
-                filename=CHAT_MODEL_FILENAME,
-                revision=CHAT_MODEL_REVISION,
+    def _load_llm(self, repository: str, filename: str, revision: str, sha256: str) -> Any:
+        from huggingface_hub import hf_hub_download
+        from llama_cpp import Llama
+
+        model_path = hf_hub_download(repo_id=repository, filename=filename, revision=revision)
+        self._verify_model(model_path, sha256)
+        return Llama(
+            model_path=model_path,
+            n_ctx=4096,
+            n_batch=256,
+            n_threads=self._threads,
+            seed=42,
+            verbose=False,
+        )
+
+    def _load_answer_llm(self) -> Any:
+        if self._answer_llm is None:
+            self._answer_llm = self._load_llm(
+                ANSWER_MODEL_REPOSITORY,
+                ANSWER_MODEL_FILENAME,
+                ANSWER_MODEL_REVISION,
+                ANSWER_MODEL_SHA256,
             )
-            self._llm = Llama(
-                model_path=model_path,
-                n_ctx=4096,
-                n_batch=256,
-                n_threads=self._threads,
-                seed=42,
-                verbose=False,
+        return self._answer_llm
+
+    def _load_judge_llm(self) -> Any:
+        if self._judge_llm is None:
+            self._judge_llm = self._load_llm(
+                JUDGE_MODEL_REPOSITORY,
+                JUDGE_MODEL_FILENAME,
+                JUDGE_MODEL_REVISION,
+                JUDGE_MODEL_SHA256,
             )
-        return self._llm
+        return self._judge_llm
 
     def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
         model = self._load_embedding_model()
@@ -245,7 +293,8 @@ class LocalOpenModelSuite:
     ) -> str:
         effective_format: dict[str, Any] | None = response_format
         max_tokens = 320
-        if "strict RAG evaluation judge" in system_prompt:
+        is_judge = "strict RAG evaluation judge" in system_prompt
+        if is_judge:
             effective_format = self._judge_response_format()
             max_tokens = 256
         elif '"queries"' in system_prompt:
@@ -263,7 +312,8 @@ class LocalOpenModelSuite:
         }
         if effective_format:
             request["response_format"] = effective_format
-        result = self._load_llm().create_chat_completion(**request)
+        active_model = self._load_judge_llm() if is_judge else self._load_answer_llm()
+        result = active_model.create_chat_completion(**request)
         content = result["choices"][0]["message"].get("content")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("Local chat model returned no content")

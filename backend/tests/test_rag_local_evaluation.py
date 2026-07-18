@@ -79,7 +79,7 @@ async def test_local_open_models_apply_real_reranker_scores() -> None:
 async def test_local_open_models_constrain_judge_to_required_json_schema() -> None:
     suite = LocalOpenModelSuite()
     model = FakeLlama()
-    suite._llm = model
+    suite._judge_llm = model
 
     result = await suite.chat(
         "You are a strict RAG evaluation judge. Output JSON only.",
@@ -118,3 +118,12 @@ def test_local_open_model_revisions_are_pinned() -> None:
     revisions = LocalOpenModelSuite().model_revisions
 
     assert all(len(model["revision"]) == 40 for model in revisions.values())
+    assert all(len(model["sha256"]) == 64 for name, model in revisions.items() if name in {"answer", "judge"})
+
+
+def test_local_open_model_rejects_checksum_mismatch(tmp_path) -> None:
+    model_path = tmp_path / "model.gguf"
+    model_path.write_bytes(b"not the pinned model")
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        LocalOpenModelSuite._verify_model(str(model_path), "0" * 64)

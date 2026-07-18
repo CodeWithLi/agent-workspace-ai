@@ -18,6 +18,7 @@ from app.rag.chunking import ChunkingConfig, build_chunker  # noqa: E402
 from app.rag.evaluation import (  # noqa: E402
     answer_citations,
     compare_end_to_end_reports,
+    deterministic_answer_assertion_score,
     deterministic_citation_score,
     first_relevant_rank,
     load_cases,
@@ -245,10 +246,16 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     faithfulness: list[float] = []
     answer_relevance: list[float] = []
     judged_citations: list[float] = []
+    answer_assertion_scores: list[float] = []
     refusal_scores: list[float] = []
     judge_refusal_scores: list[float] = []
     results: list[dict] = []
     judge_errors: list[str] = []
+    rerank_relevance_threshold = getattr(
+        active_reranker,
+        "rerank_relevance_threshold",
+        settings.rag_rerank_override_score,
+    )
 
     for case in cases:
         case_started = perf_counter()
@@ -289,7 +296,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             args.min_score,
             settings.rag_min_query_coverage,
             settings.rag_dense_override_score,
-            settings.rag_rerank_override_score,
+            rerank_relevance_threshold,
         )
 
         def matches_evidence(row: dict) -> bool:
@@ -322,6 +329,15 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             answer = ensure_valid_citations(answer, selected)
         else:
             answer = "未检索到足够证据，无法回答。"
+
+        answer_assertion_score = None
+        if case.answerable and case.answer_required_groups:
+            answer_assertion_score = deterministic_answer_assertion_score(
+                answer,
+                case.answer_required_groups,
+                case.answer_forbidden_terms,
+            )
+            answer_assertion_scores.append(answer_assertion_score)
 
         allowed = {row["citation"] for row in selected}
         deterministic_score = deterministic_citation_score(answer, allowed, answerable=case.answerable)
@@ -379,7 +395,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                     "passes_min_score": row["score"] >= args.min_score,
                     "passes_coverage": row.get("query_coverage", 0.0) >= settings.rag_min_query_coverage,
                     "dense_override": row["dense_score"] >= settings.rag_dense_override_score,
-                    "rerank_override": row.get("rerank_score", 0.0) >= settings.rag_rerank_override_score,
+                    "rerank_override": row.get("rerank_score", 0.0) >= rerank_relevance_threshold,
                     "parent_stable_id": row["parent_stable_id"],
                 }
             )
@@ -392,6 +408,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                 "first_relevant_rank": relevant_rank,
                 "top_candidates": candidate_diagnostics,
                 "answer": answer,
+                "answer_assertion_score": answer_assertion_score,
                 "deterministic_citation_score": deterministic_score,
                 "judge": judge_payload,
             }
@@ -408,6 +425,9 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         "faithfulness": round(mean(faithfulness), 4) if faithfulness else 0.0,
         "answer_relevance": round(mean(answer_relevance), 4) if answer_relevance else 0.0,
         "judge_citation_correctness": round(mean(judged_citations), 4) if judged_citations else 0.0,
+        "answer_assertion_accuracy": round(mean(answer_assertion_scores), 4)
+        if answer_assertion_scores
+        else 0.0,
         "refusal_accuracy": round(mean(refusal_scores), 4) if refusal_scores else 0.0,
         "judge_refusal_accuracy": round(mean(judge_refusal_scores), 4) if judge_refusal_scores else 0.0,
         "p95_end_to_end_ms": round(percentile(latencies, 0.95), 3),
@@ -442,6 +462,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         "recall_at_k": args.min_recall,
         "faithfulness": args.min_faithfulness,
         "citation_correctness": args.min_citation_correctness,
+        "answer_assertion_accuracy": args.min_answer_assertion_accuracy,
         "refusal_accuracy": args.min_refusal_accuracy,
         "max_p95_end_to_end_ms": args.max_p95_end_to_end_ms,
     }
@@ -449,6 +470,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         ("recall_at_k", args.min_recall),
         ("faithfulness", args.min_faithfulness),
         ("judge_citation_correctness", args.min_citation_correctness),
+        ("answer_assertion_accuracy", args.min_answer_assertion_accuracy),
         ("refusal_accuracy", args.min_refusal_accuracy),
     ):
         if metrics[metric] < minimum:
@@ -467,7 +489,9 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             "reranker_model": getattr(gateway, "reranker_model_name", settings.reranker_model)
             if reranker_enabled
             else None,
-            "judge_model": args.judge_model or gateway.model,
+            "rerank_relevance_threshold": rerank_relevance_threshold,
+            "judge_model": args.judge_model
+            or getattr(gateway, "judge_model_name", gateway.model),
             "model_revisions": getattr(gateway, "model_revisions", {}),
             "duration_ms": round((perf_counter() - started) * 1000, 3),
             "metrics": metrics,
@@ -504,6 +528,7 @@ def main() -> int:
     parser.add_argument("--min-recall", type=float, default=0.8)
     parser.add_argument("--min-faithfulness", type=float, default=0.9)
     parser.add_argument("--min-citation-correctness", type=float, default=0.95)
+    parser.add_argument("--min-answer-assertion-accuracy", type=float, default=1.0)
     parser.add_argument("--min-refusal-accuracy", type=float, default=1.0)
     parser.add_argument("--max-p95-end-to-end-ms", type=float, default=5000.0)
     args = parser.parse_args()
