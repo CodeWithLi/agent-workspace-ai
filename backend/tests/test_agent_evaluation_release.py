@@ -151,6 +151,34 @@ def test_gate_and_optimistic_version_conflicts_block_release(db: Session) -> Non
     assert "changed" in str(version_error.value.detail).lower()
 
 
+def test_release_rechecks_current_core_agent_coverage(db: Session) -> None:
+    admin, _, _, _, run = seed_candidate_release(db)
+    db.add(
+        Agent(
+            name="Release Product Manager",
+            role=AgentRole.product_manager,
+            description="Added after the historical green run",
+            system_prompt="product-v1",
+            model="test-model",
+            tools="",
+            current_version=1,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(HTTPException) as coverage_error:
+        publish_evaluation_run(
+            run.id,
+            EvaluationReleaseRequest(request_id="release-missing-role-coverage"),
+            request(),
+            admin,
+            db,
+        )
+
+    assert coverage_error.value.status_code == 409
+    assert "product_manager" in str(coverage_error.value.detail)
+
+
 def test_passed_candidate_release_is_idempotent_audited_and_redacted(db: Session) -> None:
     admin, agent, candidate, _, run = seed_candidate_release(db)
     observer = User(

@@ -354,6 +354,16 @@ export interface EvaluationCase {
   updated_at: string
 }
 
+export interface EvaluationCoverage {
+  required_roles: string[]
+  covered_roles: string[]
+  missing_roles: string[]
+  case_counts: Record<string, number>
+  total_enabled_cases: number
+  coverage_percent: number
+  gate_ready: boolean
+}
+
 export interface EvaluationFeedbackCandidate {
   feedback_id: number
   review_id?: number | null

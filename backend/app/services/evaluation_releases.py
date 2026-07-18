@@ -10,8 +10,10 @@ from app.models import (
     AgentEvaluationRelease,
     AgentPromptVersion,
     EvaluationRun,
+    EvaluationSuiteRevision,
 )
 from app.services.agent_versions import VERSION_FIELDS, activate_version, rollback_to_version
+from app.services.evaluation_coverage import coverage_failure_message, evaluation_suite_coverage
 
 
 class EvaluationReleaseConflict(RuntimeError):
@@ -24,6 +26,14 @@ def _json_object(value: str) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
 def _candidate_snapshot(run: EvaluationRun) -> dict[str, Any]:
@@ -55,6 +65,12 @@ def _validate_release_evidence(
         or baseline.suite_revision_id != run.suite_revision_id
     ):
         raise EvaluationReleaseConflict("Production baseline evidence is no longer valid")
+    revision = db.get(EvaluationSuiteRevision, run.suite_revision_id) if run.suite_revision_id else None
+    if not revision:
+        raise EvaluationReleaseConflict("Evaluation suite revision evidence is no longer available")
+    coverage = evaluation_suite_coverage(db, _json_list(revision.cases_snapshot_json))
+    if not coverage["gate_ready"]:
+        raise EvaluationReleaseConflict(coverage_failure_message(coverage))
     agent = db.scalar(
         select(Agent).where(Agent.id == run.candidate_agent_id).with_for_update()
     )

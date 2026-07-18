@@ -461,6 +461,21 @@ async function mockApi(page: Page) {
       updated_at: '2026-07-18T08:00:00Z'
     }
   ]
+  const evaluationCoverage = {
+    required_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
+    covered_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
+    missing_roles: [],
+    case_counts: {
+      product_manager: 1,
+      architect: 1,
+      test_engineer: 1,
+      operations_analyst: 1,
+      project_manager: 1
+    },
+    total_enabled_cases: 5,
+    coverage_percent: 1,
+    gate_ready: true
+  }
   let evaluationFeedback = [
     {
       feedback_id: 41,
@@ -1057,7 +1072,8 @@ async function mockApi(page: Page) {
       const created = { ...baseProject, id: 2, ...input }
       projects = [created, ...projects]
       body = created
-    } else if (method === 'GET' && path === '/evaluations/cases') body = evaluationCases
+    } else if (method === 'GET' && path === '/evaluations/coverage') body = evaluationCoverage
+    else if (method === 'GET' && path === '/evaluations/cases') body = evaluationCases
     else if (method === 'POST' && path === '/evaluations/cases') {
       const input = request.postDataJSON() as Omit<(typeof evaluationCases)[number], 'id' | 'created_at' | 'updated_at'>
       const created = {
@@ -1396,6 +1412,34 @@ test('manages versioned Agent evaluations and completes an async regression run'
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('blocks evaluation runs when core Agent roles lack regression coverage', async ({ page }) => {
+  await page.route('**/api/v1/evaluations/coverage', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        required_roles: ['product_manager', 'architect', 'test_engineer', 'operations_analyst', 'project_manager'],
+        covered_roles: ['product_manager', 'architect'],
+        missing_roles: ['test_engineer', 'operations_analyst', 'project_manager'],
+        case_counts: { product_manager: 1, architect: 1, test_engineer: 0, operations_analyst: 0, project_manager: 0 },
+        total_enabled_cases: 2,
+        coverage_percent: 0.4,
+        gate_ready: false
+      })
+    })
+  })
+  await page.goto('/evaluations')
+
+  const warning = page.getByRole('alert', { name: '多 Agent 评测覆盖不完整' })
+  await expect(warning).toContainText('测试工程师')
+  await expect(warning).toContainText('运营分析师')
+  await expect(warning).toContainText('项目经理')
+  await expect(page.getByRole('button', { name: '运行团队评测' })).toBeDisabled()
+  await warning.getByRole('button', { name: '补齐评测用例' }).click()
+  await expect(page.getByRole('tab', { name: '用例库' })).toHaveAttribute('aria-selected', 'true')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('triages negative production feedback into the evaluation dataset', async ({ page }) => {

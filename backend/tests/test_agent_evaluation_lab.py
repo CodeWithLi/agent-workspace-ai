@@ -112,6 +112,54 @@ def test_enqueue_is_idempotent_and_freezes_suite_and_agent(db: Session) -> None:
         enqueue_evaluation_run(db, request_id="evaluation-request-1", user_id=user.id + 99)
 
 
+def test_team_run_requires_cases_for_every_configured_core_agent(db: Session) -> None:
+    user, _, _ = seed_evaluation(db)
+    product_agent = Agent(
+        name="Evaluation Product Manager",
+        role=AgentRole.product_manager,
+        description="Evaluated product manager",
+        system_prompt="product-v1",
+        model="test-model",
+        tools="",
+        current_version=1,
+    )
+    db.add(product_agent)
+    db.commit()
+
+    with pytest.raises(ValueError, match="product_manager"):
+        enqueue_evaluation_run(
+            db,
+            request_id="evaluation-missing-role-coverage",
+            user_id=user.id,
+        )
+
+    db.add(
+        EvaluationCase(
+            name="Product acceptance",
+            agent_role=AgentRole.product_manager.value,
+            input_text="Define an acceptance-ready requirement",
+            expected_keywords_json=json.dumps(["acceptance"]),
+            forbidden_keywords_json="[]",
+            rubric="Define testable acceptance criteria.",
+            minimum_score=0.8,
+            weight=1,
+            enabled=True,
+        )
+    )
+    db.flush()
+    run, created = enqueue_evaluation_run(
+        db,
+        request_id="evaluation-complete-role-coverage",
+        user_id=user.id,
+    )
+
+    assert created is True
+    assert set(json.loads(run.agent_snapshot_json)) == {
+        AgentRole.architect.value,
+        AgentRole.product_manager.value,
+    }
+
+
 @pytest.mark.asyncio
 async def test_worker_uses_frozen_snapshot_and_completes_gate(
     db: Session, monkeypatch: pytest.MonkeyPatch
@@ -136,6 +184,39 @@ async def test_worker_uses_frozen_snapshot_and_completes_gate(
     assert result.answer.startswith("candidate-v1")
     assert json.loads(result.agent_snapshot_json)["version"] == 1
     assert result.score_source == "deterministic_fallback"
+
+
+@pytest.mark.asyncio
+async def test_worker_rechecks_team_coverage_before_passing_gate(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, _, _ = seed_evaluation(db)
+    run, _ = enqueue_evaluation_run(
+        db,
+        request_id="evaluation-coverage-changed-during-run",
+        user_id=user.id,
+    )
+    db.commit()
+    db.add(
+        Agent(
+            name="Late Product Manager",
+            role=AgentRole.product_manager,
+            description="Added after evaluation enqueue",
+            system_prompt="product-v1",
+            model="test-model",
+            tools="",
+            current_version=1,
+        )
+    )
+    db.commit()
+    monkeypatch.setattr("app.evaluation.get_llm", lambda: FakeGateway())
+
+    completed = await execute_next(db)
+
+    assert completed.id == run.id
+    assert completed.status == "COMPLETED"
+    assert completed.gate_passed is False
+    assert "product_manager" in " ".join(json.loads(completed.gate_failures_json))
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from app.schemas import (
     EvaluationCaseCreate,
     EvaluationCaseOut,
     EvaluationCaseUpdate,
+    EvaluationCoverageOut,
     EvaluationFeedbackCandidateOut,
     EvaluationFeedbackDismissRequest,
     EvaluationFeedbackPromoteRequest,
@@ -52,6 +53,7 @@ from app.services.evaluation_feedback import (
     promote_feedback_to_case,
     reviewed_feedback_candidate,
 )
+from app.services.evaluation_coverage import evaluation_suite_coverage
 
 
 router = APIRouter()
@@ -244,6 +246,14 @@ def list_evaluation_cases(
     if enabled_only:
         stmt = stmt.where(EvaluationCase.enabled.is_(True))
     return [case_out(item) for item in db.scalars(stmt.order_by(EvaluationCase.id))]
+
+
+@router.get("/coverage", response_model=EvaluationCoverageOut)
+def get_evaluation_coverage(
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationCoverageOut:
+    return EvaluationCoverageOut(**evaluation_suite_coverage(db))
 
 
 @router.post("/cases", response_model=EvaluationCaseOut, status_code=status.HTTP_201_CREATED)

@@ -31,6 +31,7 @@ from app.models import (
     User,
     UserRole,
 )
+from app.services.evaluation_coverage import coverage_failure_message, evaluation_suite_coverage
 
 
 settings = get_settings()
@@ -198,6 +199,9 @@ def enqueue_evaluation_run(
     if not cases:
         raise ValueError("At least one enabled evaluation case is required")
     cases_snapshot = [evaluation_case_snapshot(case) for case in cases]
+    coverage = evaluation_suite_coverage(db, cases_snapshot)
+    if not coverage["gate_ready"]:
+        raise ValueError(coverage_failure_message(coverage))
     revision = _suite_revision(db, cases_snapshot, user_id)
 
     baseline = None
@@ -654,6 +658,11 @@ def _finalize_evaluation_run(
         judge_fallbacks = [result for result in results if result.score_source == "judge_fallback"]
         if judge_fallbacks:
             failures.append(f"{len(judge_fallbacks)} cases could not complete the configured LLM Judge")
+        revision = db.get(EvaluationSuiteRevision, run.suite_revision_id) if run.suite_revision_id else None
+        revision_cases = _json_loads(revision.cases_snapshot_json, []) if revision else []
+        coverage = evaluation_suite_coverage(db, revision_cases)
+        if not coverage["gate_ready"]:
+            failures.append(coverage_failure_message(coverage))
         run.gate_failures_json = json.dumps(failures, ensure_ascii=False)
         run.gate_passed = not failures
         now = utc_now()

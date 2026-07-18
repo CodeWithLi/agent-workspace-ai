@@ -1148,6 +1148,16 @@ class EvaluationCaseOut(BaseModel):
     updated_at: datetime
 
 
+class EvaluationCoverageOut(BaseModel):
+    required_roles: list[str]
+    covered_roles: list[str]
+    missing_roles: list[str]
+    case_counts: dict[str, int]
+    total_enabled_cases: int
+    coverage_percent: float
+    gate_ready: bool
+
+
 class EvaluationFeedbackPromoteRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 

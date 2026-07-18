@@ -78,6 +78,20 @@
       </div>
     </section>
 
+    <section
+      v-if="coverage && !coverage.gate_ready"
+      class="coverage-warning"
+      role="alert"
+      aria-label="多 Agent 评测覆盖不完整"
+    >
+      <WarningFilled class="coverage-warning-icon" aria-hidden="true" />
+      <div>
+        <strong>多 Agent 评测覆盖不完整</strong>
+        <span>缺少 {{ coverage.missing_roles.map(roleLabel).join('、') }} 的启用用例，团队评测与 Challenger 发布已阻断。</span>
+      </div>
+      <el-button :icon="Plus" @click="activeView = 'cases'">补齐评测用例</el-button>
+    </section>
+
     <div class="metric-band" aria-label="最近评测摘要">
       <article class="metric-tile">
         <span>发布门禁</span>
@@ -95,9 +109,9 @@
         <small>{{ latestRun?.baseline_run_id ? `基线 #${latestRun.baseline_run_id}` : '未选择基线' }}</small>
       </article>
       <article class="metric-tile">
-        <span>测试集版本</span>
-        <strong>{{ latestRun?.suite_revision ? `v${latestRun.suite_revision}` : '—' }}</strong>
-        <small>{{ enabledCases.length }} 个启用用例</small>
+        <span>核心角色覆盖</span>
+        <strong>{{ coverage ? `${coverage.covered_roles.length}/${coverage.required_roles.length}` : '—' }}</strong>
+        <small>{{ latestRun?.suite_revision ? `测试集 v${latestRun.suite_revision}` : '尚无测试集版本' }} · {{ enabledCases.length }} 个启用用例</small>
       </article>
     </div>
 
@@ -561,7 +575,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Close, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay } from '@element-plus/icons-vue'
+import { Close, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
@@ -573,6 +587,7 @@ import type {
   AgentEvaluationRelease,
   AgentVersion,
   EvaluationCase,
+  EvaluationCoverage,
   EvaluationFeedbackCandidate,
   EvaluationRun,
   EvaluationRunDetail
@@ -603,6 +618,7 @@ const runModeOptions = [
 const route = useRoute()
 const agents = ref<Agent[]>([])
 const cases = ref<EvaluationCase[]>([])
+const coverage = ref<EvaluationCoverage | null>(null)
 const feedback = ref<EvaluationFeedbackCandidate[]>([])
 const runs = ref<EvaluationRun[]>([])
 const loading = ref(false)
@@ -670,7 +686,7 @@ const availableBaselineRuns = computed(() => {
   )))
 })
 const canCreateRun = computed(() => {
-  if (!enabledCases.value.length || hasActiveRun.value) return false
+  if (!coverage.value?.gate_ready || !enabledCases.value.length || hasActiveRun.value) return false
   if (runMode.value === 'TEAM') return true
   return Boolean(candidateAgentId.value && candidateVersionId.value && baselineRunId.value)
 })
@@ -829,12 +845,13 @@ function releaseStatusMessage(run: EvaluationRun) {
   if (run.release?.status === 'PUBLISHED') return `候选版本 v${run.release.candidate_version} 已发布`
   if (run.release?.status === 'ROLLED_BACK') return `发布已回滚至恢复版本 v${run.release.rollback_version}`
   if (!run.gate_passed) return '门禁未通过，禁止发布'
+  if (!coverage.value?.gate_ready) return '评测覆盖不完整，需补齐用例并重新评测'
   if (!canPublishRelease(run)) return '生产版本已变化，需重新评测'
   return '评测通过，可安全发布'
 }
 
 function canPublishRelease(run: EvaluationRun) {
-  if (run.status !== 'COMPLETED' || run.gate_passed !== true || run.release) return false
+  if (!coverage.value?.gate_ready || run.status !== 'COMPLETED' || run.gate_passed !== true || run.release) return false
   const agent = agents.value.find((item) => item.id === run.candidate_agent_id)
   return Boolean(agent && agent.current_version === run.expected_current_version)
 }
@@ -907,12 +924,18 @@ async function loadFeedback() {
   }
 }
 
+async function loadCoverage() {
+  const { data } = await api.get<EvaluationCoverage>('/evaluations/coverage')
+  coverage.value = data
+}
+
 async function loadAll() {
   loading.value = true
   try {
-    const [agentsResponse, casesResponse, feedbackResponse, runsResponse] = await Promise.all([
+    const [agentsResponse, casesResponse, coverageResponse, feedbackResponse, runsResponse] = await Promise.all([
       api.get<Agent[]>('/agents'),
       api.get<EvaluationCase[]>('/evaluations/cases'),
+      api.get<EvaluationCoverage>('/evaluations/coverage'),
       api.get<EvaluationFeedbackCandidate[]>('/evaluations/feedback', {
         params: { status: feedbackStatus.value }
       }),
@@ -920,6 +943,7 @@ async function loadAll() {
     ])
     agents.value = agentsResponse.data
     cases.value = casesResponse.data
+    coverage.value = coverageResponse.data
     feedback.value = feedbackResponse.data
     runs.value = runsResponse.data
     const queryAgentId = Number(route.query.agent || 0)
@@ -1118,6 +1142,7 @@ async function saveCase() {
     cases.value = editingCaseId.value
       ? cases.value.map((item) => item.id === data.id ? data : item)
       : [...cases.value, data]
+    await loadCoverage()
     caseDialog.value = false
     ElMessage.success(editingCaseId.value ? '评测用例已更新' : '评测用例已创建')
   } finally {
@@ -1130,6 +1155,7 @@ async function archiveCase(value: unknown) {
   if (!await confirmDestructiveAction(`归档后不会进入新的评测运行，历史证据仍会保留。确认归档“${item.name}”吗？`, '归档评测用例')) return
   await api.delete(`/evaluations/cases/${item.id}`)
   cases.value = cases.value.map((current) => current.id === item.id ? { ...current, enabled: false } : current)
+  await loadCoverage()
   ElMessage.success('评测用例已归档')
 }
 
@@ -1165,6 +1191,7 @@ async function promoteFeedback() {
     feedbackRequestIds.delete(`promote:${item.feedback_id}`)
     const casesResponse = await api.get<EvaluationCase[]>('/evaluations/cases')
     cases.value = casesResponse.data
+    await loadCoverage()
     promoteDialog.value = false
     ElMessage.success('反馈已转为评测用例')
   } finally {
@@ -1213,6 +1240,13 @@ onBeforeUnmount(() => {
 .launch-label { color: var(--color-secondary-text); font-size: 12px; font-weight: 650; }
 .launch-action { margin-left: auto; }
 .launch-action .el-button { min-height: 40px; margin: 0; }
+.coverage-warning { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-bottom: 18px; padding: 13px 16px; border: 1px solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border)); border-radius: 8px; background: color-mix(in srgb, var(--color-warning) 8%, var(--color-surface)); }
+.coverage-warning-icon { width: 20px; height: 20px; color: var(--color-warning); }
+.coverage-warning div { min-width: 0; }
+.coverage-warning strong, .coverage-warning span { display: block; }
+.coverage-warning strong { color: var(--color-foreground); font-size: 14px; }
+.coverage-warning span { margin-top: 2px; color: var(--color-secondary-text); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.coverage-warning .el-button { margin: 0; }
 .metric-band { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
 .metric-tile { min-width: 0; padding: 16px 18px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
 .metric-tile span, .metric-tile small { display: block; color: var(--color-muted-text); }
@@ -1339,6 +1373,8 @@ onBeforeUnmount(() => {
   .launch-field, .mode-field, .baseline-field { width: 100%; min-width: 0; }
   .launch-action { width: 100%; }
   .launch-action .el-button { width: 100%; min-height: 44px; }
+  .coverage-warning { grid-template-columns: auto minmax(0, 1fr); padding: 13px 14px; }
+  .coverage-warning .el-button { grid-column: 1 / -1; width: 100%; min-height: 44px; }
   .metric-band { gap: 8px; }
   .metric-tile { padding: 13px 14px; }
   .metric-tile strong { font-size: 20px; }
