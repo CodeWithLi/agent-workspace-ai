@@ -48,13 +48,13 @@
 
 规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次，并选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并重新校验已保存快照；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志，防止恢复或客户端绕过门禁。
 
-专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
+专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每波结束原子持久化当前执行轮次内的成功 Handoff 和消息；即使同波另一分支失败，成功结果仍会成为耐久检查点，worker 重试按角色和执行轮次恢复并只补跑缺失分支。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
 
-除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、交接、质量分数和人工修订状态。计划和波次事件 payload 只保留版本号、来源版本、波次、角色、依赖角色、分支数、轮次和反馈字符数，Handoff 与反馈正文不会进入事件或审计详情。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
+除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、质量分数和人工修订状态。计划和波次事件 payload 只保留版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、修订轮次、worker 尝试和反馈字符数，Handoff、错误与反馈正文不会进入追踪或审计详情。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
 
 ## 运行追踪与成本归属
 
-`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、`NODE_STARTED/NODE_COMPLETED` 节点、`BRANCH_STARTED/BRANCH_COMPLETED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
+`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、`NODE_STARTED/NODE_COMPLETED` 节点、以角色、修订轮次和 `workflow_attempt` 配对的 `BRANCH_STARTED/BRANCH_COMPLETED|BRANCH_FAILED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。失败分支独立闭合为 `FAILED`，未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
 
 模型调用先按 `workflow_id` 关联，再使用 Agent 角色和调用完成时间归属到最具体的并行分支；无法匹配分支时才归属外层节点，因此同一调用不会在分支与父节点重复累计。运行详情分别展示总耗时、排队、Agent 计算、人工等待和剩余协调开销。汇总中的运行数、状态、Token、成本和趋势是数据库聚合；P95、Agent 性能与节点瓶颈为显式标记截断的最近样本分析。
 
@@ -89,7 +89,7 @@ SLO 健康度只使用已结束的成功或失败运行，按当前追踪权限�
 
 ### 操作员安全干预
 
-`POST /api/v1/workflow/{id}/pause` 不会中断正在进行的模型调用，也不会留下半个节点状态。暂停请求与节点提交都锁定同一 `workflow_runs` 行：如果请求先提交，`begin_node/complete_node` 在最近边界发现请求；如果节点先提交，请求会在下一节点开始前被发现。`complete_node` 总是先原子持久化 `state_json`、`current_node` 和 `NODE_COMPLETED`，再抛出受控暂停信号，worker 随后释放租约并转为 `PAUSED`。
+`POST /api/v1/workflow/{id}/pause` 不会中断正在进行的模型调用，也不会留下半个节点状态。暂停请求与提交都锁定同一 `workflow_runs` 行：如果请求先提交，普通节点在最近节点边界暂停，专业分支则先完成当前拓扑波次并提交成功 Handoff；如果节点或波次先提交，请求会在下一边界被发现。`complete_node` 原子持久化节点状态和 `NODE_COMPLETED`，`checkpoint_node` 原子持久化专业波次状态及其事件；两者都在提交后抛出受控暂停信号，worker 随后释放租约并转为 `PAUSED`。取消状态会在提交前检查并优先终止，不会让暂停覆盖取消。
 
 暂停请求使用 `pause_request_id` 幂等，保存请求人、时间和最长 1000 字的原因。恢复时必须提供最长 4000 字的指令；平台把原因、指令和恢复节点追加到最近 10 条 `interventions`，并将该结构化上下文传给需求、产品、架构、规划、专业分支、质量门禁、项目计划、测试和报告 Agent。追踪事件只公开干预类型和字符数，不返回原因或指令正文。
 

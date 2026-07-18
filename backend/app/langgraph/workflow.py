@@ -259,6 +259,27 @@ def complete_node(
     return output
 
 
+def checkpoint_node(
+    db: Session,
+    workflow: WorkflowRun,
+    node: str,
+    state: WorkspaceGraphState,
+    output: dict[str, Any],
+    expected_lease_token: str | None = None,
+) -> dict[str, Any]:
+    locked = lock_workflow_lease(db, workflow, expected_lease_token)
+    if locked.status == WorkflowStatus.cancelling:
+        raise WorkflowCancelled("Workflow cancellation requested")
+    persisted = {key: value for key, value in {**state, **output}.items() if key in STATE_FIELDS}
+    locked.current_node = node
+    locked.state_json = json.dumps(persisted, ensure_ascii=False)
+    locked.locked_at = datetime.now(timezone.utc)
+    db.commit()
+    if locked.pause_requested_at is not None:
+        raise WorkflowPauseRequested("Workflow paused after committing a wave checkpoint")
+    return output
+
+
 def build_workspace_graph(db: Session, workflow: WorkflowRun):
     expected_lease_token = workflow.lease_token
     persisted_state = json.loads(workflow.state_json or "{}")
@@ -460,10 +481,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             if requested_roles
             else {assignment.role for assignment in plan.assignments}
         )
-        revision_round = int(state.get("revision_round", 0))
+        revision_round = int(state.get("revision_round", 0)) + int(state.get("manual_revision_count", 0))
         revision_feedback = state.get("revision_feedback", "")
         working_handoffs = dict(previous_handoffs)
-        completed_waves: list[tuple[int, list[AgentHandoff]]] = []
+        messages = list(state.get("messages", []))
+        workflow_attempt = int(workflow.attempt_count)
 
         async def run_assignment(assignment) -> AgentHandoff:
             previous = previous_handoffs.get(assignment.role)
@@ -511,7 +533,32 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             )
 
         for wave_number, wave in enumerate(execution_waves, start=1):
-            assignments = [assignment for assignment in wave if assignment.role in execution_roles]
+            planned_assignments = [assignment for assignment in wave if assignment.role in execution_roles]
+            restored_assignments = [
+                assignment
+                for assignment in planned_assignments
+                if assignment.role in working_handoffs
+                and working_handoffs[assignment.role].revision_round == revision_round
+            ]
+            restored_roles = {assignment.role for assignment in restored_assignments}
+            assignments = [
+                assignment for assignment in planned_assignments if assignment.role not in restored_roles
+            ]
+            if restored_assignments:
+                record_workflow_event(
+                    db,
+                    workflow,
+                    "WAVE_RESTORED",
+                    f"Restored completed specialist work in wave {wave_number}",
+                    node="specialists",
+                    payload={
+                        "wave": wave_number,
+                        "roles": [assignment.role for assignment in restored_assignments],
+                        "completed_count": len(restored_assignments),
+                        "revision_round": revision_round,
+                        "workflow_attempt": workflow_attempt,
+                    },
+                )
             if not assignments:
                 continue
             roles = [assignment.role for assignment in assignments]
@@ -527,6 +574,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "branch_count": len(assignments),
                     "dependency_count": sum(len(assignment.depends_on) for assignment in assignments),
                     "revision_round": revision_round,
+                    "workflow_attempt": workflow_attempt,
                 },
             )
             for assignment in assignments:
@@ -543,22 +591,29 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "dependency_count": len(assignment.depends_on),
                         "wave": wave_number,
                         "revision_round": revision_round,
+                        "workflow_attempt": workflow_attempt,
                     },
                 )
             db.commit()
-            wave_handoffs = await asyncio.gather(*(run_assignment(assignment) for assignment in assignments))
-            completed_waves.append((wave_number, wave_handoffs))
+            results = await asyncio.gather(
+                *(run_assignment(assignment) for assignment in assignments),
+                return_exceptions=True,
+            )
+            cancellation = next(
+                (result for result in results if isinstance(result, asyncio.CancelledError)),
+                None,
+            )
+            if cancellation:
+                raise cancellation
+            wave_handoffs = [result for result in results if isinstance(result, AgentHandoff)]
+            failures = [
+                (assignment, result)
+                for assignment, result in zip(assignments, results, strict=True)
+                if isinstance(result, Exception)
+            ]
             working_handoffs.update({handoff.role: handoff for handoff in wave_handoffs})
-
-        merged_handoffs = [
-            working_handoffs[assignment.role]
-            for assignment in plan.assignments
-        ]
-        messages = list(state.get("messages", []))
-        assignments_by_role = {assignment.role: assignment for assignment in plan.assignments}
-        for wave_number, wave_handoffs in completed_waves:
             for handoff in wave_handoffs:
-                assignment = assignments_by_role[handoff.role]
+                assignment = next(item for item in assignments if item.role == handoff.role)
                 messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
                 record_workflow_event(
                     db,
@@ -573,22 +628,70 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "dependency_count": len(assignment.depends_on),
                         "wave": wave_number,
                         "revision_round": handoff.revision_round,
+                        "workflow_attempt": workflow_attempt,
                         "output_chars": len(handoff.content),
+                    },
+                )
+            for assignment, failure in failures:
+                record_workflow_event(
+                    db,
+                    workflow,
+                    "BRANCH_FAILED",
+                    f"Failed specialist branch {assignment.role}",
+                    node="specialists",
+                    payload={
+                        "role": assignment.role,
+                        "depends_on": assignment.depends_on,
+                        "dependency_count": len(assignment.depends_on),
+                        "wave": wave_number,
+                        "revision_round": revision_round,
+                        "workflow_attempt": workflow_attempt,
+                        "error": str(failure)[:2000],
                     },
                 )
             record_workflow_event(
                 db,
                 workflow,
-                "WAVE_COMPLETED",
-                f"Completed specialist execution wave {wave_number}",
+                "WAVE_CHECKPOINTED" if failures else "WAVE_COMPLETED",
+                (
+                    f"Checkpointed partial specialist execution wave {wave_number}"
+                    if failures
+                    else f"Completed specialist execution wave {wave_number}"
+                ),
                 node="specialists",
                 payload={
                     "wave": wave_number,
                     "roles": [handoff.role for handoff in wave_handoffs],
-                    "branch_count": len(wave_handoffs),
+                    "branch_count": len(assignments),
+                    "completed_count": len(wave_handoffs),
+                    "failed_count": len(failures),
                     "revision_round": revision_round,
+                    "workflow_attempt": workflow_attempt,
                 },
             )
+            checkpoint_node(
+                db,
+                workflow,
+                "specialists",
+                state,
+                {
+                    "specialist_handoffs": [
+                        working_handoffs[assignment.role].model_dump(mode="json")
+                        for assignment in plan.assignments
+                        if assignment.role in working_handoffs
+                    ],
+                    "messages": messages,
+                },
+                expected_lease_token,
+            )
+            if failures:
+                failure = failures[0][1]
+                raise RuntimeError(str(failure)) from failure
+
+        merged_handoffs = [
+            working_handoffs[assignment.role]
+            for assignment in plan.assignments
+        ]
         return complete_node(db, workflow, "specialists", state, {
             "specialist_handoffs": [handoff.model_dump(mode="json") for handoff in merged_handoffs],
             "messages": messages,

@@ -11,6 +11,7 @@ from app.agent.service import ensure_default_agents
 from app.langgraph.workflow import (
     WorkflowPauseRequested,
     build_workspace_graph,
+    checkpoint_node,
     complete_node,
     execute_workspace_graph,
     initial_state,
@@ -19,6 +20,7 @@ from app.langgraph.workflow import (
     snapshot_agent_configs,
 )
 from app.models import Agent, AgentRole, Project, Report, Task, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.services.workflows import process_workflow
 
 
 def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) -> None:
@@ -62,6 +64,67 @@ def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) 
         select(func.count(WorkflowEvent.id)).where(
             WorkflowEvent.workflow_id == workflow.id,
             WorkflowEvent.event_type == "NODE_COMPLETED",
+        )
+    ) == 1
+
+
+def test_specialist_checkpoint_persists_before_operator_pause(db: Session) -> None:
+    user = User(email="wave-pause@example.com", name="Wave Pause", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Wave Pause Project", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.running,
+        current_node="specialists",
+        state_json="{}",
+        lease_token="wave-pause-lease",
+        pause_requested_at=datetime.now(timezone.utc),
+        pause_reason="检查第一波交接",
+    )
+    db.add(workflow)
+    db.commit()
+    handoff = {
+        "role": "knowledge_admin",
+        "objective": "整理可追溯知识证据",
+        "deliverable": "知识证据清单",
+        "content": "已完成第一波知识证据整理。",
+        "revision_round": 0,
+    }
+    record = WorkflowEvent(
+        workflow_id=workflow.id,
+        node="specialists",
+        event_type="WAVE_COMPLETED",
+        message="Completed specialist execution wave 1",
+        payload_json=json.dumps({"wave": 1}),
+    )
+    db.add(record)
+
+    with pytest.raises(WorkflowPauseRequested):
+        checkpoint_node(
+            db,
+            workflow,
+            "specialists",
+            {"specialist_handoffs": [], "messages": [], "interventions": []},
+            {
+                "specialist_handoffs": [handoff],
+                "messages": [{"role": "specialist_knowledge_admin", "content": handoff["content"]}],
+            },
+            expected_lease_token="wave-pause-lease",
+        )
+
+    db.expire_all()
+    persisted = db.get(WorkflowRun, workflow.id)
+    persisted_state = json.loads(persisted.state_json)
+    assert persisted.current_node == "specialists"
+    assert persisted_state["specialist_handoffs"] == [handoff]
+    assert db.scalar(
+        select(func.count(WorkflowEvent.id)).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "WAVE_COMPLETED",
         )
     ) == 1
 
@@ -382,6 +445,134 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         ["test_engineer"],
         ["notification_secretary"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_specialist_wave_checkpoint_survives_retry_without_repeating_completed_agents(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="wave-recovery@example.com", name="Wave Recovery", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Wave Recovery", description="Resume completed specialist waves", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    plan = {
+        "objective": "按可恢复波次完成多 Agent 交付",
+        "rationale": "独立证据先并行生成，下游只消费已提交 Handoff",
+        "assignments": [
+            {
+                "role": "operations_analyst",
+                "objective": "定义灰度、监控和回滚策略",
+                "deliverable": "发布运行手册",
+                "depends_on": [],
+            },
+            {
+                "role": "knowledge_admin",
+                "objective": "整理知识来源、证据和权限边界",
+                "deliverable": "知识证据清单",
+                "depends_on": [],
+            },
+            {
+                "role": "test_engineer",
+                "objective": "基于知识证据验证核心路径",
+                "deliverable": "测试与验收清单",
+                "depends_on": ["knowledge_admin"],
+            },
+            {
+                "role": "notification_secretary",
+                "objective": "依据测试与运营结论设计可靠触达",
+                "deliverable": "通知触达方案",
+                "depends_on": ["test_engineer", "operations_analyst"],
+            },
+        ],
+        "success_criteria": ["已完成分支不会重复执行", "下游结论具有直接上游证据"],
+    }
+    state = initial_state(project, "验证可恢复的依赖波次")
+    state.update(
+        {
+            "requirements": {"summary": "可恢复执行"},
+            "architecture": {"style": "dependency-dag"},
+            "execution_plan": plan,
+            "plan_version": 1,
+            "plan_approved": True,
+        }
+    )
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.queued,
+        current_node="specialists",
+        state_json=json.dumps(state, ensure_ascii=False),
+        pause_before_report=True,
+        max_attempts=2,
+    )
+    db.add(workflow)
+    db.commit()
+    specialist_calls: dict[str, int] = {}
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "专业交接 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            specialist_calls[role] = specialist_calls.get(role, 0) + 1
+            if role == "test_engineer" and specialist_calls[role] == 1:
+                raise RuntimeError("transient test specialist failure")
+            return (
+                f"{role} 已给出明确范围、关键决策、依赖关系、失败信号、监控指标、边界场景、"
+                "灰度策略、回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 96,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "恢复后的依赖交接达到门禁。",
+                },
+                ensure_ascii=False,
+            )
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    first_attempt = await process_workflow(db, workflow.id)
+    first_state = json.loads(first_attempt.state_json)
+    assert first_attempt.status == WorkflowStatus.queued
+    assert first_attempt.current_node == "specialists"
+    assert {item["role"] for item in first_state["specialist_handoffs"]} == {
+        "operations_analyst",
+        "knowledge_admin",
+    }
+    assert specialist_calls == {
+        "operations_analyst": 1,
+        "knowledge_admin": 1,
+        "test_engineer": 1,
+    }
+
+    completed = await process_workflow(db, workflow.id)
+    completed_state = json.loads(completed.state_json)
+    assert completed.status == WorkflowStatus.paused
+    assert completed.current_node == "report"
+    assert specialist_calls == {
+        "operations_analyst": 1,
+        "knowledge_admin": 1,
+        "test_engineer": 2,
+        "notification_secretary": 1,
+    }
+    assert len(completed_state["specialist_handoffs"]) == 4
+    event_types = list(
+        db.scalars(
+            select(WorkflowEvent.event_type)
+            .where(WorkflowEvent.workflow_id == workflow.id)
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert event_types.count("WAVE_RESTORED") == 1
+    assert event_types.count("WAVE_CHECKPOINTED") == 1
+    assert event_types.count("BRANCH_FAILED") == 1
 
 
 @pytest.mark.asyncio

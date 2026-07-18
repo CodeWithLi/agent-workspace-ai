@@ -762,6 +762,67 @@ def test_trace_detail_pairs_spans_assigns_usage_and_redacts_payloads(db: Session
     assert branch_event.payload == {"role": "architect", "revision_round": 0}
 
 
+def test_trace_detail_closes_failed_branch_attempts_independently(db: Session) -> None:
+    data = _seed_trace_data(db)
+    workflow = data["completed"]
+    base = workflow.started_at + timedelta(minutes=2)
+    db.add_all(
+        [
+            _event(
+                workflow,
+                "BRANCH_STARTED",
+                base,
+                node="specialists",
+                payload={"role": "operations_analyst", "revision_round": 1, "workflow_attempt": 1},
+            ),
+            _event(
+                workflow,
+                "BRANCH_STARTED",
+                base + timedelta(seconds=30),
+                node="specialists",
+                payload={"role": "operations_analyst", "revision_round": 1, "workflow_attempt": 2},
+            ),
+            _event(
+                workflow,
+                "BRANCH_FAILED",
+                base + timedelta(seconds=50),
+                node="specialists",
+                payload={
+                    "role": "operations_analyst",
+                    "revision_round": 1,
+                    "workflow_attempt": 2,
+                    "error": "secret provider failure",
+                },
+            ),
+        ]
+    )
+    db.commit()
+
+    detail = get_trace_detail(db, data["alice"], workflow.id)
+    failed_branch = next(
+        span
+        for span in detail.spans
+        if span.kind == "branch"
+        and span.agent_role == "operations_analyst"
+        and span.status == "FAILED"
+    )
+    assert failed_branch.duration_ms == 20_000
+    assert failed_branch.payload == {
+        "revision_round": 1,
+        "role": "operations_analyst",
+        "workflow_attempt": 2,
+    }
+    stale_branch = next(
+        span
+        for span in detail.spans
+        if span.kind == "branch"
+        and span.agent_role == "operations_analyst"
+        and span.status == "INCOMPLETE"
+    )
+    assert stale_branch.payload["workflow_attempt"] == 1
+    assert "secret provider failure" not in detail.model_dump_json()
+
+
 def test_trace_detail_is_tenant_scoped_while_admin_can_inspect_all(db: Session) -> None:
     data = _seed_trace_data(db)
 

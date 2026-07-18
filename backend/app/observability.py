@@ -118,9 +118,11 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "approval_required",
     "approval_gate",
     "branch_count",
+    "completed_count",
     "decision",
     "dependency_count",
     "depends_on",
+    "failed_count",
     "next_node",
     "output_chars",
     "plan_version",
@@ -134,6 +136,7 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "source_plan_version",
     "wave",
     "wave_count",
+    "workflow_attempt",
 }
 
 
@@ -270,7 +273,7 @@ def _pair_event_spans(
     spans: list[_SpanDraft] = []
     node_attempts: dict[str, int] = defaultdict(int)
     open_nodes: dict[str, deque[tuple[WorkflowEvent, int]]] = defaultdict(deque)
-    open_branches: dict[tuple[str, int], deque[WorkflowEvent]] = defaultdict(deque)
+    open_branches: dict[tuple[str, int, int], deque[WorkflowEvent]] = defaultdict(deque)
     open_pause: WorkflowEvent | None = None
 
     if workflow.created_at:
@@ -318,11 +321,13 @@ def _pair_event_spans(
         elif event.event_type == "BRANCH_STARTED":
             role = str(payload.get("role") or "specialist")
             revision_round = int(payload.get("revision_round") or 0)
-            open_branches[(role, revision_round)].append(event)
-        elif event.event_type == "BRANCH_COMPLETED":
+            workflow_attempt = int(payload.get("workflow_attempt") or 0)
+            open_branches[(role, revision_round, workflow_attempt)].append(event)
+        elif event.event_type in {"BRANCH_COMPLETED", "BRANCH_FAILED"}:
             role = str(payload.get("role") or "specialist")
             revision_round = int(payload.get("revision_round") or 0)
-            key = (role, revision_round)
+            workflow_attempt = int(payload.get("workflow_attempt") or 0)
+            key = (role, revision_round, workflow_attempt)
             if open_branches[key]:
                 started = open_branches[key].popleft()
                 spans.append(
@@ -332,7 +337,7 @@ def _pair_event_spans(
                         node="specialists",
                         label=ROLE_LABELS.get(role, role),
                         agent_role=role,
-                        status="COMPLETED",
+                        status="FAILED" if event.event_type == "BRANCH_FAILED" else "COMPLETED",
                         attempt=revision_round + 1,
                         started_at=started.created_at,
                         finished_at=event.created_at,
@@ -386,7 +391,7 @@ def _pair_event_spans(
                     duration_ms=_duration_ms(started.created_at, open_end),
                 )
             )
-    for (role, revision_round), started_events in open_branches.items():
+    for (role, revision_round, _workflow_attempt), started_events in open_branches.items():
         while started_events:
             started = started_events.popleft()
             spans.append(
