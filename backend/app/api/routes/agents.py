@@ -49,10 +49,13 @@ from app.tools.project_tools import task_create
 from app.tools.registry import allowed_tools_for_role
 from app.services.agent_runs import complete_agent_run, fail_agent_run
 from app.services.billing import InsufficientTokensError, apply_token_change
-from app.services.agent_versions import activate_version, create_version, rollback_to_version
+from app.services.agent_versions import create_version
 
 router = APIRouter()
 settings = get_settings()
+EVALUATION_RELEASE_REQUIRED = (
+    "Direct Agent activation is disabled; create a draft and publish it through a passed evaluation run"
+)
 
 
 def create_agent_run(
@@ -129,7 +132,7 @@ def list_agent_tools(
     return list(db.scalars(select(AgentTool).where(AgentTool.agent_id == agent_id).order_by(AgentTool.name)))
 
 
-@router.patch("/{agent_id}", response_model=AgentOut)
+@router.patch("/{agent_id}", response_model=AgentOut, deprecated=True)
 def update_agent(
     agent_id: int,
     payload: AgentUpdate,
@@ -143,14 +146,17 @@ def update_agent(
     values = payload.model_dump()
     changed = [field for field, value in values.items() if getattr(agent, field) != value]
     if changed:
-        create_version(
+        record_audit(
             db,
-            agent,
-            values,
+            "agent.direct_update_blocked",
             current_admin.id,
-            status="PUBLISHED",
-            release_note="Published from agent settings",
+            resource_type="agent",
+            resource_id=agent.id,
+            details={"changed_fields": changed},
+            request=request,
         )
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=EVALUATION_RELEASE_REQUIRED)
     record_audit(
         db,
         "agent.update",
@@ -209,7 +215,11 @@ def create_agent_version(
     return version
 
 
-@router.post("/{agent_id}/versions/{version_id}/publish", response_model=AgentVersionOut)
+@router.post(
+    "/{agent_id}/versions/{version_id}/publish",
+    response_model=AgentVersionOut,
+    deprecated=True,
+)
 def publish_agent_version(
     agent_id: int,
     version_id: int,
@@ -221,10 +231,9 @@ def publish_agent_version(
     version = db.get(AgentPromptVersion, version_id)
     if not agent or not version or version.agent_id != agent.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent version not found")
-    activate_version(db, agent, version)
     record_audit(
         db,
-        "agent.version_publish",
+        "agent.direct_publish_blocked",
         current_admin.id,
         resource_type="agent_version",
         resource_id=version.id,
@@ -232,11 +241,14 @@ def publish_agent_version(
         request=request,
     )
     db.commit()
-    db.refresh(version)
-    return version
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=EVALUATION_RELEASE_REQUIRED)
 
 
-@router.post("/{agent_id}/versions/{target_version}/rollback", response_model=AgentOut)
+@router.post(
+    "/{agent_id}/versions/{target_version}/rollback",
+    response_model=AgentOut,
+    deprecated=True,
+)
 def rollback_agent_version(
     agent_id: int,
     target_version: int,
@@ -253,19 +265,17 @@ def rollback_agent_version(
     )
     if not agent or not target:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent version not found")
-    created = rollback_to_version(db, agent, target, current_admin.id)
     record_audit(
         db,
-        "agent.version_rollback",
+        "agent.direct_rollback_blocked",
         current_admin.id,
         resource_type="agent_version",
-        resource_id=created.id,
-        details={"agent_id": agent.id, "target_version": target_version, "new_version": created.version},
+        resource_id=target.id,
+        details={"agent_id": agent.id, "target_version": target_version},
         request=request,
     )
     db.commit()
-    db.refresh(agent)
-    return agent
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=EVALUATION_RELEASE_REQUIRED)
 
 
 @router.patch("/{agent_id}/tools/{tool_id}", response_model=AgentToolOut)

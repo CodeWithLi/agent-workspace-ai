@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -15,7 +16,8 @@ from app.api.routes.agents import (
 from app.core.llm import LLMGateway
 from app.core.llm_usage import bind_llm_usage, calculate_cost_micros
 from app.evaluation import score_answer
-from app.models import Agent, AgentPromptVersion, Conversation, LLMUsage, Message, MessageFeedback, User, UserRole
+from app.main import app
+from app.models import Agent, AgentPromptVersion, AuditLog, Conversation, LLMUsage, Message, MessageFeedback, User, UserRole
 from app.schemas import AgentUpdate, AgentVersionCreate, MessageFeedbackRequest
 
 
@@ -43,7 +45,7 @@ def request():
     )
 
 
-def test_agent_versions_publish_and_rollback(db: Session) -> None:
+def test_direct_agent_activation_paths_require_evaluation(db: Session) -> None:
     ensure_default_agents(db)
     admin = admin_user(db)
     agent = db.scalar(select(Agent).order_by(Agent.id))
@@ -59,20 +61,17 @@ def test_agent_versions_publish_and_rollback(db: Session) -> None:
         human_approval_required=agent.human_approval_required,
         concurrency_limit=agent.concurrency_limit,
     )
-    updated = update_agent(agent.id, payload, request(), db, admin)
-    assert updated.current_version == 2
-    assert db.scalar(
-        select(AgentPromptVersion.status).where(
-            AgentPromptVersion.agent_id == agent.id,
-            AgentPromptVersion.version == 2,
-        )
-    ) == "PUBLISHED"
+    with pytest.raises(HTTPException) as update_error:
+        update_agent(agent.id, payload, request(), db, admin)
+    assert update_error.value.status_code == 409
+    assert "evaluation" in str(update_error.value.detail).lower()
+    assert db.get(Agent, agent.id).current_version == 1
 
     draft = create_agent_version(
         agent.id,
         AgentVersionCreate(
             description=agent.description,
-            system_prompt="Draft prompt v3",
+            system_prompt="Draft prompt v2",
             model=agent.model,
             memory_enable=True,
             knowledge_access=True,
@@ -84,15 +83,35 @@ def test_agent_versions_publish_and_rollback(db: Session) -> None:
         admin,
         db,
     )
-    assert draft.version == 3
+    assert draft.version == 2
     assert draft.status == "DRAFT"
-    published = publish_agent_version(agent.id, draft.id, request(), admin, db)
-    assert published.status == "PUBLISHED"
-    assert db.get(Agent, agent.id).system_prompt == "Draft prompt v3"
+    with pytest.raises(HTTPException) as publish_error:
+        publish_agent_version(agent.id, draft.id, request(), admin, db)
+    assert publish_error.value.status_code == 409
+    assert "evaluation" in str(publish_error.value.detail).lower()
 
-    rolled_back = rollback_agent_version(agent.id, 1, request(), admin, db)
-    assert rolled_back.current_version == 4
-    assert rolled_back.system_prompt != "Draft prompt v3"
+    with pytest.raises(HTTPException) as rollback_error:
+        rollback_agent_version(agent.id, 1, request(), admin, db)
+    assert rollback_error.value.status_code == 409
+    assert "evaluation" in str(rollback_error.value.detail).lower()
+    db.expire_all()
+    assert db.get(Agent, agent.id).current_version == 1
+    assert db.get(Agent, agent.id).system_prompt != "Draft prompt v2"
+    assert db.get(AgentPromptVersion, draft.id).status == "DRAFT"
+    assert db.scalar(select(func.count(AgentPromptVersion.id)).where(AgentPromptVersion.agent_id == agent.id)) == 2
+    for action in (
+        "agent.direct_update_blocked",
+        "agent.direct_publish_blocked",
+        "agent.direct_rollback_blocked",
+    ):
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.action == action)) == 1
+
+
+def test_direct_agent_activation_routes_are_deprecated() -> None:
+    operations = app.openapi()["paths"]
+    assert operations["/api/v1/agents/{agent_id}"]["patch"]["deprecated"] is True
+    assert operations["/api/v1/agents/{agent_id}/versions/{version_id}/publish"]["post"]["deprecated"] is True
+    assert operations["/api/v1/agents/{agent_id}/versions/{target_version}/rollback"]["post"]["deprecated"] is True
 
 
 def test_message_feedback_is_upserted(db: Session) -> None:

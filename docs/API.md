@@ -32,10 +32,10 @@
 
 - `GET /agents`
 - `GET /agents/{agent_id}/tools`
-- `PATCH /agents/{agent_id}`：管理员配置 Prompt、模型、Memory、知识库访问和审批策略。
+- `PATCH /agents/{agent_id}`：已弃用；有配置变更时返回 `409`，客户端应创建草稿并进入评测发布。
 - `GET|POST /agents/{agent_id}/versions`
-- `POST /agents/{agent_id}/versions/{version_id}/publish`
-- `POST /agents/{agent_id}/versions/{version}/rollback`
+- `POST /agents/{agent_id}/versions/{version_id}/publish`：已弃用并返回 `409`，不能绕过评测门禁。
+- `POST /agents/{agent_id}/versions/{version}/rollback`：已弃用并返回 `409`，回滚应创建候选草稿后评测，或使用评测发布记录的 rollback API。
 - `PATCH /agents/{agent_id}/tools/{tool_id}`：仅管理员。
 - `GET /agents/actions`：查看本人待审批/已决工具动作，管理员可查看全部。
 - `POST /agents/actions/{action_id}/approve`
