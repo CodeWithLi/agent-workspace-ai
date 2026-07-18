@@ -1,0 +1,809 @@
+<template>
+  <section class="page evaluation-page">
+    <div class="page-head evaluation-head">
+      <div>
+        <span class="page-kicker">Agent 发布质量</span>
+        <h1>Agent 评测实验室</h1>
+        <p>对当前多 Agent 团队执行版本化回归评测，保留逐案例证据与发布门禁结论。</p>
+      </div>
+      <div class="run-controls">
+        <el-select
+          v-model="baselineRunId"
+          clearable
+          class="baseline-select"
+          aria-label="选择评测基线"
+          placeholder="无基线运行"
+        >
+          <el-option
+            v-for="run in baselineRuns"
+            :key="run.id"
+            :label="`#${run.id} · ${(run.average_score * 100).toFixed(1)}% · ${formatDate(run.created_at)}`"
+            :value="run.id"
+          />
+        </el-select>
+        <el-button
+          type="primary"
+          :icon="VideoPlay"
+          :loading="creatingRun"
+          :disabled="!enabledCases.length || hasActiveRun"
+          @click="createRun"
+        >
+          运行团队评测
+        </el-button>
+      </div>
+    </div>
+
+    <div class="metric-band" aria-label="最近评测摘要">
+      <article class="metric-tile">
+        <span>发布门禁</span>
+        <strong :class="gateClass(latestRun)">{{ gateLabel(latestRun) }}</strong>
+        <small>{{ latestRun ? `运行 #${latestRun.id}` : '尚无评测记录' }}</small>
+      </article>
+      <article class="metric-tile">
+        <span>综合得分</span>
+        <strong>{{ latestRun ? percent(latestRun.average_score) : '—' }}</strong>
+        <small>{{ latestRun ? `${latestRun.passed_cases}/${latestRun.total_cases} 通过` : '等待首次运行' }}</small>
+      </article>
+      <article class="metric-tile">
+        <span>相对基线</span>
+        <strong :class="deltaClass(latestRun?.score_delta)">{{ formatDelta(latestRun?.score_delta) }}</strong>
+        <small>{{ latestRun?.baseline_run_id ? `基线 #${latestRun.baseline_run_id}` : '未选择基线' }}</small>
+      </article>
+      <article class="metric-tile">
+        <span>测试集版本</span>
+        <strong>{{ latestRun?.suite_revision ? `v${latestRun.suite_revision}` : '—' }}</strong>
+        <small>{{ enabledCases.length }} 个启用用例</small>
+      </article>
+    </div>
+
+    <div v-if="activeRun" class="active-run-band" role="status" aria-live="polite">
+      <div class="active-run-copy">
+        <span class="live-indicator" />
+        <div>
+          <strong>运行 #{{ activeRun.id }} · {{ statusLabel(activeRun.status) }}</strong>
+          <span>{{ activeRun.completed_cases }}/{{ activeRun.total_cases }} 个案例已完成</span>
+        </div>
+      </div>
+      <el-progress :percentage="activeRun.progress_percent" :stroke-width="8" />
+      <el-button v-if="canCancel(activeRun)" :icon="Close" @click="cancelRun(activeRun)">取消</el-button>
+    </div>
+
+    <el-tabs v-model="activeView" class="evaluation-tabs">
+      <el-tab-pane label="运行历史" name="runs">
+        <div class="view-toolbar">
+          <div class="toolbar-copy">
+            <strong>回归运行</strong>
+            <span>{{ filteredRuns.length }} 条记录</span>
+          </div>
+          <div class="toolbar-filters">
+            <el-input
+              v-model="runQuery"
+              :prefix-icon="Search"
+              clearable
+              aria-label="搜索评测运行"
+              placeholder="搜索运行或 Agent"
+            />
+            <el-select v-model="statusFilter" clearable aria-label="按运行状态筛选" placeholder="全部状态">
+              <el-option v-for="option in statusOptions" :key="option" :label="statusLabel(option)" :value="option" />
+            </el-select>
+            <el-button :icon="Refresh" circle aria-label="刷新评测运行" title="刷新" @click="loadAll" />
+          </div>
+        </div>
+
+        <div class="desktop-run-table">
+          <el-table v-loading="loading" :data="filteredRuns" class="data-table" row-key="id">
+            <el-table-column prop="id" label="运行" min-width="130" sortable>
+              <template #default="{ row }">
+                <button class="run-link" @click="openRun(row)">#{{ row.id }}</button>
+                <span class="run-revision">测试集 v{{ row.suite_revision || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="120">
+              <template #default="{ row }">
+                <el-tag :type="statusType(row.status)" size="small" effect="plain">{{ statusLabel(row.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="Agent 快照" min-width="220">
+              <template #default="{ row }">
+                <div class="agent-version-list">
+                  <span v-for="agent in row.agent_snapshots.slice(0, 3)" :key="agent.id">
+                    {{ roleLabel(agent.role) }} v{{ agent.version }}
+                  </span>
+                  <small v-if="row.agent_snapshots.length > 3">+{{ row.agent_snapshots.length - 3 }}</small>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="通过" min-width="110">
+              <template #default="{ row }">{{ row.passed_cases }}/{{ row.total_cases }}</template>
+            </el-table-column>
+            <el-table-column prop="average_score" label="得分" min-width="110" sortable>
+              <template #default="{ row }"><strong class="table-score">{{ percent(row.average_score) }}</strong></template>
+            </el-table-column>
+            <el-table-column prop="score_delta" label="变化" min-width="110" sortable>
+              <template #default="{ row }"><span :class="deltaClass(row.score_delta)">{{ formatDelta(row.score_delta) }}</span></template>
+            </el-table-column>
+            <el-table-column label="门禁" min-width="110">
+              <template #default="{ row }"><span :class="gateClass(row)">{{ gateLabel(row) }}</span></template>
+            </el-table-column>
+            <el-table-column prop="created_at" label="时间" min-width="170" sortable>
+              <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="116" align="right" fixed="right">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openRun(row)">详情</el-button>
+                <el-button v-if="row.retryable" link @click="retryRun(row)">重试</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-loading="loading" class="mobile-run-list">
+          <article v-for="run in filteredRuns" :key="run.id" class="run-card">
+            <button class="run-card-main" @click="openRun(run)">
+              <span><strong>#{{ run.id }}</strong><small>测试集 v{{ run.suite_revision || '—' }}</small></span>
+              <el-tag :type="statusType(run.status)" size="small" effect="plain">{{ statusLabel(run.status) }}</el-tag>
+            </button>
+            <dl>
+              <div><dt>得分</dt><dd>{{ percent(run.average_score) }}</dd></div>
+              <div><dt>通过</dt><dd>{{ run.passed_cases }}/{{ run.total_cases }}</dd></div>
+              <div><dt>变化</dt><dd :class="deltaClass(run.score_delta)">{{ formatDelta(run.score_delta) }}</dd></div>
+            </dl>
+            <div class="run-card-foot">
+              <span>{{ formatDate(run.created_at) }}</span>
+              <el-button v-if="run.retryable" link @click="retryRun(run)">重试</el-button>
+            </div>
+          </article>
+        </div>
+        <el-empty v-if="!loading && !filteredRuns.length" description="没有符合条件的评测运行" />
+      </el-tab-pane>
+
+      <el-tab-pane label="用例库" name="cases">
+        <div class="view-toolbar">
+          <div class="toolbar-copy">
+            <strong>团队测试集</strong>
+            <span>{{ enabledCases.length }} 个启用，{{ cases.length - enabledCases.length }} 个归档</span>
+          </div>
+          <div class="toolbar-filters">
+            <el-input
+              v-model="caseQuery"
+              :prefix-icon="Search"
+              clearable
+              aria-label="搜索评测用例"
+              placeholder="搜索用例、角色或关键词"
+            />
+            <el-button type="primary" :icon="Plus" @click="openCaseDialog()">新建用例</el-button>
+          </div>
+        </div>
+
+        <div class="desktop-case-table">
+          <el-table v-loading="loading" :data="filteredCases" class="data-table" row-key="id">
+            <el-table-column prop="name" label="用例" min-width="220" sortable>
+              <template #default="{ row }">
+                <strong class="case-name">{{ row.name }}</strong>
+                <span class="case-input">{{ row.input_text }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="agent_role" label="Agent" min-width="150" sortable>
+              <template #default="{ row }">{{ roleLabel(row.agent_role) }}</template>
+            </el-table-column>
+            <el-table-column label="期望证据" min-width="230">
+              <template #default="{ row }">
+                <div class="keyword-list">
+                  <el-tag v-for="keyword in row.expected_keywords.slice(0, 3)" :key="keyword" size="small" effect="plain">{{ keyword }}</el-tag>
+                  <small v-if="row.expected_keywords.length > 3">+{{ row.expected_keywords.length - 3 }}</small>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="阈值 / 权重" min-width="130">
+              <template #default="{ row }">{{ percent(row.minimum_score) }} / {{ row.weight }}</template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="100">
+              <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'" size="small" effect="plain">{{ row.enabled ? '启用' : '归档' }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="操作" width="128" align="right">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openCaseDialog(row)">编辑</el-button>
+                <el-button v-if="row.enabled" link type="danger" @click="archiveCase(row)">归档</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-loading="loading" class="mobile-case-list">
+          <article v-for="item in filteredCases" :key="item.id" class="case-card">
+            <div class="case-card-head"><strong>{{ item.name }}</strong><el-tag :type="item.enabled ? 'success' : 'info'" size="small" effect="plain">{{ item.enabled ? '启用' : '归档' }}</el-tag></div>
+            <span>{{ roleLabel(item.agent_role) }}</span>
+            <p>{{ item.input_text }}</p>
+            <div class="keyword-list"><el-tag v-for="keyword in item.expected_keywords" :key="keyword" size="small" effect="plain">{{ keyword }}</el-tag></div>
+            <div class="case-card-actions">
+              <el-button @click="openCaseDialog(item)">编辑</el-button>
+              <el-button v-if="item.enabled" type="danger" plain @click="archiveCase(item)">归档</el-button>
+            </div>
+          </article>
+        </div>
+        <el-empty v-if="!loading && !filteredCases.length" description="没有符合条件的评测用例" />
+      </el-tab-pane>
+    </el-tabs>
+
+    <el-drawer
+      v-model="detailDrawer"
+      :title="detailRun ? `评测运行 #${detailRun.id}` : '评测详情'"
+      size="min(820px, 100vw)"
+      class="evaluation-detail-drawer"
+    >
+      <div v-if="detailRun" v-loading="detailLoading" class="run-detail">
+        <div class="detail-summary">
+          <div><span>状态</span><strong>{{ statusLabel(detailRun.status) }}</strong></div>
+          <div><span>综合得分</span><strong>{{ percent(detailRun.average_score) }}</strong></div>
+          <div><span>相对基线</span><strong :class="deltaClass(detailRun.score_delta)">{{ formatDelta(detailRun.score_delta) }}</strong></div>
+          <div><span>门禁</span><strong :class="gateClass(detailRun)">{{ gateLabel(detailRun) }}</strong></div>
+        </div>
+
+        <el-progress
+          v-if="isActive(detailRun)"
+          :percentage="detailRun.progress_percent"
+          :format="() => `${detailRun?.completed_cases || 0}/${detailRun?.total_cases || 0}`"
+        />
+
+        <section class="detail-section">
+          <div class="section-heading"><h2>维度对比</h2><span>候选与可比较基线</span></div>
+          <div class="dimension-table" role="table" aria-label="评测维度分数对比">
+            <div v-for="dimension in dimensions" :key="dimension.key" class="dimension-row" role="row">
+              <span class="dimension-label" role="rowheader">{{ dimension.label }}</span>
+              <div class="dimension-bars" role="cell">
+                <div class="score-bar candidate-bar"><span :style="{ width: `${dimensionScore(detailRun, dimension.key) * 100}%` }" /></div>
+                <div class="score-bar baseline-bar"><span :style="{ width: `${baselineDimensionScore(detailRun, dimension.key) * 100}%` }" /></div>
+              </div>
+              <span class="dimension-values" role="cell">
+                {{ percent(dimensionScore(detailRun, dimension.key)) }}
+                <small>{{ hasBaselineDimension(detailRun, dimension.key) ? percent(baselineDimensionScore(detailRun, dimension.key)) : '—' }}</small>
+              </span>
+            </div>
+          </div>
+          <div class="dimension-legend" aria-label="图例"><span class="candidate-key" />候选<span class="baseline-key" />基线</div>
+        </section>
+
+        <el-alert
+          v-if="detailRun.gate_failures.length"
+          type="error"
+          :closable="false"
+          show-icon
+          title="发布门禁未通过"
+        >
+          <ul class="gate-failures"><li v-for="failure in detailRun.gate_failures" :key="failure">{{ failure }}</li></ul>
+        </el-alert>
+
+        <section class="detail-section">
+          <div class="section-heading"><h2>案例证据</h2><span>{{ detailRun.results.length }} 个已完成</span></div>
+          <el-collapse class="result-collapse">
+            <el-collapse-item v-for="result in detailRun.results" :key="result.id" :name="result.id">
+              <template #title>
+                <div class="result-title">
+                  <span><strong>{{ result.case_name }}</strong><small>{{ roleLabel(result.agent_role) }} · v{{ result.agent_version || '—' }}</small></span>
+                  <span class="result-title-score" :class="result.passed ? 'gate-pass' : 'gate-fail'">{{ percent(result.score) }}</span>
+                  <el-tag v-if="result.regressed" type="danger" size="small" effect="plain">回退</el-tag>
+                  <el-tag v-else :type="result.passed ? 'success' : 'danger'" size="small" effect="plain">{{ result.passed ? '通过' : '未通过' }}</el-tag>
+                </div>
+              </template>
+              <div class="result-body">
+                <div class="result-meta"><span>{{ result.model }}</span><span>{{ result.latency_ms }} ms</span><span>{{ scoreSourceLabel(result.score_source) }}</span></div>
+                <p class="case-prompt"><strong>输入</strong>{{ result.input_text }}</p>
+                <div class="answer-compare">
+                  <div><strong>候选回答</strong><p>{{ result.answer || result.error || '无回答' }}</p></div>
+                  <div v-if="result.baseline_score !== null && result.baseline_score !== undefined"><strong>基线回答</strong><p>{{ result.baseline_answer || '无回答' }}</p></div>
+                </div>
+                <div class="evidence-block">
+                  <div><strong>命中</strong><span v-if="!result.matched_keywords.length">无</span><el-tag v-for="item in result.matched_keywords" :key="item" type="success" size="small" effect="plain">{{ item }}</el-tag></div>
+                  <div><strong>缺失</strong><span v-if="!result.missing_keywords.length">无</span><el-tag v-for="item in result.missing_keywords" :key="item" type="warning" size="small" effect="plain">{{ item }}</el-tag></div>
+                  <div v-if="result.forbidden_hits.length"><strong>禁用词命中</strong><el-tag v-for="item in result.forbidden_hits" :key="item" type="danger" size="small" effect="plain">{{ item }}</el-tag></div>
+                </div>
+                <p v-if="result.judge_reason" class="judge-reason"><strong>Judge 依据</strong>{{ result.judge_reason }}</p>
+                <el-alert v-if="result.error || result.judge_error" type="warning" :closable="false" :title="result.error || result.judge_error" />
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+          <el-empty v-if="!detailRun.results.length" description="评测结果尚未产生" :image-size="72" />
+        </section>
+
+        <div class="detail-actions">
+          <el-button v-if="canCancel(detailRun)" :icon="Close" @click="cancelRun(detailRun)">取消运行</el-button>
+          <el-button v-if="detailRun.retryable" type="primary" :icon="RefreshRight" @click="retryRun(detailRun)">重试运行</el-button>
+        </div>
+      </div>
+    </el-drawer>
+
+    <el-dialog
+      v-model="caseDialog"
+      :title="editingCaseId ? '编辑评测用例' : '新建评测用例'"
+      width="min(720px, calc(100vw - 24px))"
+      top="4vh"
+      class="evaluation-case-dialog"
+    >
+      <el-form label-position="top">
+        <el-row :gutter="14">
+          <el-col :xs="24" :md="14"><el-form-item label="用例名称" required><el-input v-model.trim="caseForm.name" maxlength="200" /></el-form-item></el-col>
+          <el-col :xs="24" :md="10"><el-form-item label="目标 Agent" required><el-select v-model="caseForm.agent_role" class="full"><el-option v-for="agent in agents" :key="agent.role" :label="agent.name" :value="agent.role" /></el-select></el-form-item></el-col>
+        </el-row>
+        <el-form-item label="测试输入" required><el-input v-model.trim="caseForm.input_text" type="textarea" :rows="4" maxlength="20000" show-word-limit /></el-form-item>
+        <el-form-item label="期望证据关键词" required><el-input v-model.trim="caseForm.expected_keywords" placeholder="例如：幂等、回滚、审计" /></el-form-item>
+        <el-form-item label="禁用词"><el-input v-model.trim="caseForm.forbidden_keywords" placeholder="例如：关闭鉴权、明文密钥" /></el-form-item>
+        <el-form-item label="评分 Rubric"><el-input v-model.trim="caseForm.rubric" type="textarea" :rows="3" maxlength="10000" /></el-form-item>
+        <div class="case-rule-grid">
+          <el-form-item label="最低通过分"><el-input-number v-model="caseForm.minimum_score" :min="0" :max="1" :step="0.05" :precision="2" /></el-form-item>
+          <el-form-item label="用例权重"><el-input-number v-model="caseForm.weight" :min="0.1" :max="100" :step="0.5" :precision="1" /></el-form-item>
+          <el-form-item label="状态"><el-switch v-model="caseForm.enabled" active-text="启用" inactive-text="归档" /></el-form-item>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="caseDialog = false">取消</el-button>
+        <el-button type="primary" :loading="savingCase" :disabled="!validCaseForm" @click="saveCase">保存用例</el-button>
+      </template>
+    </el-dialog>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { Close, Plus, Refresh, RefreshRight, Search, VideoPlay } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import 'element-plus/es/components/message/style/css.mjs'
+import { api } from '../api/client'
+import type { Agent, EvaluationCase, EvaluationRun, EvaluationRunDetail } from '../api/types'
+import { confirmDestructiveAction } from '../utils/confirm'
+
+const ACTIVE_STATUSES = new Set(['QUEUED', 'RUNNING', 'CANCELLING'])
+const statusOptions = ['QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED']
+const dimensions = [
+  { key: 'requirements', label: '需求覆盖' },
+  { key: 'correctness', label: '正确性' },
+  { key: 'relevance', label: '相关性' },
+  { key: 'completeness', label: '完整性' },
+  { key: 'safety', label: '安全性' }
+]
+
+const agents = ref<Agent[]>([])
+const cases = ref<EvaluationCase[]>([])
+const runs = ref<EvaluationRun[]>([])
+const loading = ref(false)
+const creatingRun = ref(false)
+const savingCase = ref(false)
+const activeView = ref('runs')
+const baselineRunId = ref<number | null>(null)
+const runQuery = ref('')
+const caseQuery = ref('')
+const statusFilter = ref('')
+const detailDrawer = ref(false)
+const detailLoading = ref(false)
+const detailRun = ref<EvaluationRunDetail | null>(null)
+const caseDialog = ref(false)
+const editingCaseId = ref<number | null>(null)
+const caseForm = reactive({
+  name: '',
+  agent_role: '',
+  input_text: '',
+  expected_keywords: '',
+  forbidden_keywords: '',
+  rubric: '',
+  minimum_score: 0.8,
+  weight: 1,
+  enabled: true
+})
+let pollTimer: ReturnType<typeof window.setInterval> | null = null
+let pollBusy = false
+
+const enabledCases = computed(() => cases.value.filter((item) => item.enabled))
+const latestRun = computed(() => runs.value[0] || null)
+const activeRun = computed(() => runs.value.find((run) => isActive(run)) || null)
+const hasActiveRun = computed(() => Boolean(activeRun.value))
+const baselineRuns = computed(() => runs.value.filter((run) => run.status === 'COMPLETED' && run.suite_revision))
+const filteredRuns = computed(() => {
+  const query = runQuery.value.trim().toLocaleLowerCase()
+  return runs.value.filter((run) => {
+    const matchesStatus = !statusFilter.value || run.status === statusFilter.value
+    const haystack = [run.id, run.suite_revision, run.status, ...run.agent_snapshots.flatMap((agent) => [agent.name, agent.role, agent.model])]
+      .join(' ')
+      .toLocaleLowerCase()
+    return matchesStatus && (!query || haystack.includes(query))
+  })
+})
+const filteredCases = computed(() => {
+  const query = caseQuery.value.trim().toLocaleLowerCase()
+  if (!query) return cases.value
+  return cases.value.filter((item) => [item.name, item.agent_role, item.input_text, ...item.expected_keywords, ...item.forbidden_keywords]
+    .join(' ')
+    .toLocaleLowerCase()
+    .includes(query))
+})
+const validCaseForm = computed(() => Boolean(
+  caseForm.name.trim()
+  && caseForm.agent_role
+  && caseForm.input_text.trim()
+  && splitTerms(caseForm.expected_keywords).length
+))
+
+function splitTerms(value: string) {
+  return [...new Set(value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean))]
+}
+
+function requestId() {
+  return globalThis.crypto?.randomUUID?.() || `evaluation-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function isActive(run: EvaluationRun) {
+  return ACTIVE_STATUSES.has(run.status)
+}
+
+function canCancel(run: EvaluationRun) {
+  return run.status === 'QUEUED' || run.status === 'RUNNING'
+}
+
+function percent(value?: number | null) {
+  return typeof value === 'number' ? `${(value * 100).toFixed(1)}%` : '—'
+}
+
+function formatDelta(value?: number | null) {
+  if (typeof value !== 'number') return '—'
+  const points = value * 100
+  return `${points > 0 ? '+' : ''}${points.toFixed(1)} pt`
+}
+
+function deltaClass(value?: number | null) {
+  if (typeof value !== 'number' || value === 0) return 'delta-neutral'
+  return value > 0 ? 'delta-positive' : 'delta-negative'
+}
+
+function gateLabel(value?: unknown) {
+  const run = value as EvaluationRun | null | undefined
+  if (!run) return '待评测'
+  if (run.gate_passed === null || run.gate_passed === undefined) return isActive(run) ? '评测中' : '待评测'
+  return run.gate_passed ? '可发布' : '已阻断'
+}
+
+function gateClass(value?: unknown) {
+  const run = value as EvaluationRun | null | undefined
+  if (!run || run.gate_passed === null || run.gate_passed === undefined) return 'gate-pending'
+  return run.gate_passed ? 'gate-pass' : 'gate-fail'
+}
+
+function statusLabel(status: string) {
+  return ({ QUEUED: '等待执行', RUNNING: '执行中', CANCELLING: '取消中', COMPLETED: '已完成', FAILED: '失败', CANCELLED: '已取消' } as Record<string, string>)[status] || status
+}
+
+function statusType(status: string) {
+  if (status === 'COMPLETED') return 'success'
+  if (status === 'FAILED') return 'danger'
+  if (status === 'RUNNING' || status === 'QUEUED') return 'warning'
+  return 'info'
+}
+
+function roleLabel(role: string) {
+  return ({
+    product_manager: '产品经理',
+    project_manager: '项目经理',
+    architect: '架构师',
+    test_engineer: '测试工程师',
+    meeting_summarizer: '会议纪要员',
+    knowledge_admin: '知识库管理员',
+    notification_secretary: '通知秘书',
+    operations_analyst: '运营分析师'
+  } as Record<string, string>)[role] || role
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function dimensionScore(run: EvaluationRun, key: string) {
+  return Number(run.dimension_averages[key] || 0)
+}
+
+function baselineDimensionScore(run: EvaluationRun, key: string) {
+  return Number(run.baseline_dimension_averages[key] || 0)
+}
+
+function hasBaselineDimension(run: EvaluationRun, key: string) {
+  return Object.prototype.hasOwnProperty.call(run.baseline_dimension_averages, key)
+}
+
+function scoreSourceLabel(source: string) {
+  if (source === 'llm_judge') return 'LLM Judge'
+  if (source === 'judge_fallback') return 'Judge 降级'
+  return source === 'execution_error' ? '执行错误' : '确定性评分'
+}
+
+async function loadAll() {
+  loading.value = true
+  try {
+    const [agentsResponse, casesResponse, runsResponse] = await Promise.all([
+      api.get<Agent[]>('/agents'),
+      api.get<EvaluationCase[]>('/evaluations/cases'),
+      api.get<EvaluationRun[]>('/evaluations/runs')
+    ])
+    agents.value = agentsResponse.data
+    cases.value = casesResponse.data
+    runs.value = runsResponse.data
+    if (!baselineRunId.value) baselineRunId.value = baselineRuns.value[0]?.id || null
+    syncPolling()
+  } finally {
+    loading.value = false
+  }
+}
+
+async function refreshRuns() {
+  if (pollBusy) return
+  pollBusy = true
+  try {
+    const { data } = await api.get<EvaluationRun[]>('/evaluations/runs')
+    runs.value = data
+    if (detailRun.value && isActive(detailRun.value)) await loadRunDetail(detailRun.value.id, false)
+    syncPolling()
+  } finally {
+    pollBusy = false
+  }
+}
+
+function syncPolling() {
+  if (hasActiveRun.value && !pollTimer) pollTimer = window.setInterval(refreshRuns, 1500)
+  if (!hasActiveRun.value && pollTimer) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+async function createRun() {
+  creatingRun.value = true
+  try {
+    const { data } = await api.post<EvaluationRun>('/evaluations/runs', {
+      request_id: requestId(),
+      baseline_run_id: baselineRunId.value || null
+    })
+    runs.value = [data, ...runs.value.filter((run) => run.id !== data.id)]
+    activeView.value = 'runs'
+    ElMessage.success(`团队评测 #${data.id} 已进入队列`)
+    syncPolling()
+  } finally {
+    creatingRun.value = false
+  }
+}
+
+async function loadRunDetail(id: number, showLoading = true) {
+  if (showLoading) detailLoading.value = true
+  try {
+    const { data } = await api.get<EvaluationRunDetail>(`/evaluations/runs/${id}`)
+    detailRun.value = data
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+async function openRun(value: unknown) {
+  const run = value as EvaluationRun
+  detailDrawer.value = true
+  await loadRunDetail(run.id)
+}
+
+async function cancelRun(value: unknown) {
+  const run = value as EvaluationRun
+  if (!await confirmDestructiveAction(`确认取消评测运行 #${run.id} 吗？已完成的案例证据会保留。`, '取消评测运行')) return
+  const { data } = await api.post<EvaluationRun>(`/evaluations/runs/${run.id}/cancel`)
+  runs.value = runs.value.map((item) => item.id === data.id ? data : item)
+  if (detailRun.value?.id === data.id) await loadRunDetail(data.id)
+  ElMessage.success(`评测运行 #${run.id} 已请求取消`)
+  syncPolling()
+}
+
+async function retryRun(value: unknown) {
+  const run = value as EvaluationRun
+  const { data } = await api.post<EvaluationRun>(`/evaluations/runs/${run.id}/retry`)
+  runs.value = runs.value.map((item) => item.id === data.id ? data : item)
+  if (detailRun.value?.id === data.id) await loadRunDetail(data.id)
+  ElMessage.success(`评测运行 #${run.id} 已重新入队`)
+  syncPolling()
+}
+
+function openCaseDialog(value?: unknown) {
+  const item = value as EvaluationCase | undefined
+  editingCaseId.value = item?.id || null
+  Object.assign(caseForm, item ? {
+    name: item.name,
+    agent_role: item.agent_role,
+    input_text: item.input_text,
+    expected_keywords: item.expected_keywords.join('，'),
+    forbidden_keywords: item.forbidden_keywords.join('，'),
+    rubric: item.rubric,
+    minimum_score: item.minimum_score,
+    weight: item.weight,
+    enabled: item.enabled
+  } : {
+    name: '',
+    agent_role: agents.value[0]?.role || '',
+    input_text: '',
+    expected_keywords: '',
+    forbidden_keywords: '',
+    rubric: '',
+    minimum_score: 0.8,
+    weight: 1,
+    enabled: true
+  })
+  caseDialog.value = true
+}
+
+function casePayload() {
+  return {
+    name: caseForm.name,
+    agent_role: caseForm.agent_role,
+    input_text: caseForm.input_text,
+    expected_keywords: splitTerms(caseForm.expected_keywords),
+    forbidden_keywords: splitTerms(caseForm.forbidden_keywords),
+    rubric: caseForm.rubric,
+    minimum_score: caseForm.minimum_score,
+    weight: caseForm.weight,
+    enabled: caseForm.enabled
+  }
+}
+
+async function saveCase() {
+  savingCase.value = true
+  try {
+    const { data } = editingCaseId.value
+      ? await api.patch<EvaluationCase>(`/evaluations/cases/${editingCaseId.value}`, casePayload())
+      : await api.post<EvaluationCase>('/evaluations/cases', casePayload())
+    cases.value = editingCaseId.value
+      ? cases.value.map((item) => item.id === data.id ? data : item)
+      : [...cases.value, data]
+    caseDialog.value = false
+    ElMessage.success(editingCaseId.value ? '评测用例已更新' : '评测用例已创建')
+  } finally {
+    savingCase.value = false
+  }
+}
+
+async function archiveCase(value: unknown) {
+  const item = value as EvaluationCase
+  if (!await confirmDestructiveAction(`归档后不会进入新的评测运行，历史证据仍会保留。确认归档“${item.name}”吗？`, '归档评测用例')) return
+  await api.delete(`/evaluations/cases/${item.id}`)
+  cases.value = cases.value.map((current) => current.id === item.id ? { ...current, enabled: false } : current)
+  ElMessage.success('评测用例已归档')
+}
+
+onMounted(loadAll)
+onBeforeUnmount(() => {
+  if (pollTimer) window.clearInterval(pollTimer)
+})
+</script>
+
+<style scoped>
+.evaluation-page { max-width: 1480px; }
+.evaluation-head { align-items: flex-end; }
+.run-controls { display: flex; align-items: center; gap: 10px; }
+.baseline-select { width: 270px; }
+.metric-band { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+.metric-tile { min-width: 0; padding: 16px 18px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
+.metric-tile span, .metric-tile small { display: block; color: var(--color-muted-text); }
+.metric-tile span { font-size: 12px; font-weight: 650; }
+.metric-tile strong { display: block; margin: 6px 0 2px; color: var(--color-foreground); font-size: 24px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.metric-tile small { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.active-run-band { display: grid; grid-template-columns: minmax(220px, .65fr) minmax(240px, 1fr) auto; align-items: center; gap: 20px; margin-bottom: 12px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--color-primary) 28%, var(--color-border)); border-radius: 8px; background: var(--color-primary-soft); }
+.active-run-copy { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.active-run-copy div { min-width: 0; }
+.active-run-copy strong, .active-run-copy span { display: block; }
+.active-run-copy strong { color: var(--color-primary-hover); font-size: 14px; }
+.active-run-copy span { color: #475569; font-size: 12px; }
+.live-indicator { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--color-primary); box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-primary) 14%, transparent); }
+.evaluation-tabs { min-width: 0; }
+.view-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+.toolbar-copy strong, .toolbar-copy span { display: block; }
+.toolbar-copy strong { color: var(--color-foreground); font-size: 16px; }
+.toolbar-copy span { color: var(--color-muted-text); font-size: 12px; }
+.toolbar-filters { display: flex; align-items: center; gap: 8px; }
+.toolbar-filters .el-input { width: 250px; }
+.toolbar-filters .el-select { width: 150px; }
+.run-link { display: block; padding: 0; border: 0; background: transparent; color: var(--color-primary); font: inherit; font-weight: 750; cursor: pointer; }
+.run-link:hover { text-decoration: underline; }
+.run-revision, .case-input { display: block; overflow: hidden; color: var(--color-muted-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-version-list { display: flex; flex-wrap: wrap; gap: 4px 8px; color: var(--color-secondary-text); font-size: 12px; }
+.agent-version-list small { color: var(--color-muted-text); }
+.table-score { font-variant-numeric: tabular-nums; }
+.gate-pass, .delta-positive { color: var(--color-success) !important; }
+.gate-fail, .delta-negative { color: var(--color-danger) !important; }
+.gate-pending, .delta-neutral { color: var(--color-muted-text) !important; }
+.case-name { display: block; color: var(--color-foreground); }
+.case-input { max-width: 360px; margin-top: 2px; }
+.keyword-list { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.keyword-list small { color: var(--color-muted-text); }
+.mobile-run-list, .mobile-case-list { display: none; }
+.run-detail { min-height: 180px; }
+.detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin-bottom: 18px; overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-border); }
+.detail-summary div { min-width: 0; padding: 12px; background: var(--color-surface); }
+.detail-summary span, .detail-summary strong { display: block; }
+.detail-summary span { color: var(--color-muted-text); font-size: 11px; }
+.detail-summary strong { margin-top: 3px; overflow: hidden; color: var(--color-foreground); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.detail-section { margin-top: 24px; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+.section-heading h2 { margin: 0; color: var(--color-foreground); font-size: 16px; }
+.section-heading span { color: var(--color-muted-text); font-size: 12px; }
+.dimension-table { border-top: 1px solid var(--color-border); }
+.dimension-row { display: grid; grid-template-columns: 86px minmax(160px, 1fr) 104px; align-items: center; gap: 12px; min-height: 48px; border-bottom: 1px solid var(--color-border); }
+.dimension-label { color: var(--color-secondary-text); font-size: 13px; font-weight: 650; }
+.dimension-bars { display: grid; gap: 5px; }
+.score-bar { height: 6px; overflow: hidden; border-radius: 3px; background: var(--color-border); }
+.score-bar span { display: block; height: 100%; border-radius: inherit; }
+.candidate-bar span { background: var(--color-primary); }
+.baseline-bar span { background: var(--color-muted-text); }
+.dimension-values { text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+.dimension-values small { margin-left: 8px; color: var(--color-muted-text); }
+.dimension-legend { display: flex; justify-content: flex-end; align-items: center; gap: 6px; margin-top: 8px; color: var(--color-muted-text); font-size: 11px; }
+.dimension-legend span { width: 16px; height: 4px; margin-left: 8px; border-radius: 2px; }
+.candidate-key { background: var(--color-primary); }
+.baseline-key { background: var(--color-muted-text); }
+.gate-failures { margin: 8px 0 0; padding-left: 20px; }
+.result-title { display: grid; grid-template-columns: minmax(0, 1fr) 72px auto; align-items: center; gap: 10px; width: 100%; padding-right: 12px; }
+.result-title > span:first-child { min-width: 0; }
+.result-title strong, .result-title small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-title small { color: var(--color-muted-text); font-size: 11px; font-weight: 400; }
+.result-title-score { text-align: right; font-weight: 750; font-variant-numeric: tabular-nums; }
+.result-body { padding: 4px 2px 16px; }
+.result-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 12px; color: var(--color-muted-text); font-size: 11px; }
+.case-prompt { display: grid; grid-template-columns: 68px 1fr; gap: 10px; margin: 0 0 14px; color: var(--color-secondary-text); line-height: 1.6; }
+.answer-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.answer-compare > div { min-width: 0; padding: 12px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-background); }
+.answer-compare strong { color: var(--color-secondary-text); font-size: 12px; }
+.answer-compare p { margin: 8px 0 0; color: var(--color-foreground); line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.evidence-block { display: grid; gap: 8px; margin-top: 14px; }
+.evidence-block > div { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.evidence-block strong { width: 72px; color: var(--color-secondary-text); font-size: 12px; }
+.evidence-block span { color: var(--color-muted-text); font-size: 12px; }
+.judge-reason { display: grid; grid-template-columns: 72px 1fr; gap: 5px; margin: 14px 0 0; color: var(--color-secondary-text); line-height: 1.6; }
+.detail-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--color-border); }
+.case-rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+
+@media (max-width: 980px) {
+  .metric-band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .active-run-band { grid-template-columns: 1fr auto; }
+  .active-run-band .el-progress { grid-column: 1 / -1; grid-row: 2; }
+  .view-toolbar { align-items: flex-start; flex-direction: column; }
+  .toolbar-filters { width: 100%; }
+  .toolbar-filters .el-input { flex: 1; width: auto; }
+}
+
+@media (max-width: 640px) {
+  .evaluation-head { align-items: stretch; }
+  .run-controls { align-items: stretch; flex-direction: column; width: 100%; }
+  .baseline-select { width: 100%; }
+  .run-controls .el-button { min-height: 44px; margin: 0; }
+  .metric-band { gap: 8px; }
+  .metric-tile { padding: 13px 14px; }
+  .metric-tile strong { font-size: 20px; }
+  .active-run-band { grid-template-columns: 1fr; gap: 12px; }
+  .active-run-band .el-progress { grid-column: auto; grid-row: auto; }
+  .active-run-band .el-button { min-height: 44px; }
+  .toolbar-filters { display: grid; grid-template-columns: 1fr auto; }
+  .toolbar-filters .el-input { grid-column: 1 / -1; width: 100%; }
+  .toolbar-filters .el-select { width: 100%; }
+  .toolbar-filters .el-button { min-width: 44px; min-height: 44px; }
+  .desktop-run-table, .desktop-case-table { display: none; }
+  .mobile-run-list, .mobile-case-list { display: grid; gap: 10px; }
+  .run-card, .case-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
+  .run-card-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+  .run-card-main span span, .run-card-main strong, .run-card-main small { display: block; }
+  .run-card-main small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
+  .run-card dl { display: grid; grid-template-columns: repeat(3, 1fr); margin: 12px 0; padding: 10px 0; border-block: 1px solid var(--color-border); }
+  .run-card dl div { min-width: 0; }
+  .run-card dt { color: var(--color-muted-text); font-size: 11px; }
+  .run-card dd { margin: 3px 0 0; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .run-card-foot { display: flex; align-items: center; justify-content: space-between; color: var(--color-muted-text); font-size: 11px; }
+  .case-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .case-card > span { display: block; margin-top: 3px; color: var(--color-primary); font-size: 12px; }
+  .case-card p { display: -webkit-box; margin: 10px 0; overflow: hidden; color: var(--color-secondary-text); line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+  .case-card-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+  .case-card-actions .el-button { min-height: 44px; margin: 0; }
+  :deep(.el-input__inner), :deep(.el-textarea__inner) { font-size: 16px; }
+  .detail-summary { grid-template-columns: repeat(2, 1fr); }
+  .dimension-row { grid-template-columns: 72px minmax(90px, 1fr) 86px; gap: 8px; }
+  .result-title { grid-template-columns: minmax(0, 1fr) 58px; }
+  .result-title .el-tag { display: none; }
+  .answer-compare { grid-template-columns: 1fr; }
+  .case-prompt, .judge-reason { grid-template-columns: 1fr; }
+  .case-rule-grid { grid-template-columns: 1fr 1fr; }
+}
+</style>

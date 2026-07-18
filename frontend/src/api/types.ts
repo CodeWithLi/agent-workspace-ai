@@ -345,18 +345,84 @@ export interface EvaluationCase {
   agent_role: string
   input_text: string
   expected_keywords: string[]
+  forbidden_keywords: string[]
+  rubric: string
+  minimum_score: number
+  weight: number
   enabled: boolean
   created_at: string
+  updated_at: string
+}
+
+export interface EvaluationAgentSnapshot {
+  id: number
+  name: string
+  role: string
+  version: number
+  model: string
 }
 
 export interface EvaluationRun {
   id: number
+  request_id?: string | null
   status: string
+  suite_revision?: number | null
+  baseline_run_id?: number | null
   total_cases: number
+  completed_cases: number
+  progress_percent: number
   passed_cases: number
   average_score: number
+  baseline_average_score?: number | null
+  score_delta?: number | null
+  gate_passed?: boolean | null
+  gate_failures: string[]
+  dimension_averages: Record<string, number>
+  baseline_dimension_averages: Record<string, number>
+  agent_snapshots: EvaluationAgentSnapshot[]
+  error: string
+  attempt_count: number
+  max_attempts: number
+  retryable: boolean
   created_at: string
+  started_at?: string | null
   finished_at?: string | null
+}
+
+export interface EvaluationResult {
+  id: number
+  case_id: number
+  case_name: string
+  agent_role: string
+  agent_name: string
+  agent_version?: number | null
+  model: string
+  input_text: string
+  expected_keywords: string[]
+  forbidden_keywords: string[]
+  rubric: string
+  answer: string
+  score: number
+  baseline_answer: string
+  baseline_score?: number | null
+  score_delta?: number | null
+  dimensions: Record<string, number>
+  baseline_dimensions: Record<string, number>
+  score_source: string
+  latency_ms: number
+  regressed: boolean
+  passed: boolean
+  matched_keywords: string[]
+  missing_keywords: string[]
+  forbidden_hits: string[]
+  judge_reason: string
+  judge_error: string
+  error: string
+  created_at: string
+}
+
+export interface EvaluationRunDetail extends EvaluationRun {
+  results: EvaluationResult[]
 }
 
 export interface RechargeOrder {

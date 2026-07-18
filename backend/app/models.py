@@ -915,40 +915,102 @@ class LLMUsage(Base):
 
 class EvaluationCase(Base):
     __tablename__ = "evaluation_cases"
+    __table_args__ = (
+        CheckConstraint("minimum_score >= 0 AND minimum_score <= 1", name="ck_evaluation_case_minimum_score"),
+        CheckConstraint("weight > 0", name="ck_evaluation_case_weight"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(200))
     agent_role: Mapped[str] = mapped_column(String(50), index=True)
     input_text: Mapped[str] = mapped_column(Text)
     expected_keywords_json: Mapped[str] = mapped_column(Text, default="[]")
+    forbidden_keywords_json: Mapped[str] = mapped_column(Text, default="[]")
+    rubric: Mapped[str] = mapped_column(Text, default="")
+    minimum_score: Mapped[float] = mapped_column(Float, default=0.8)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class EvaluationSuiteRevision(Base):
+    __tablename__ = "evaluation_suite_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    cases_snapshot_json: Mapped[str] = mapped_column(Text, default="[]")
     created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class EvaluationRun(Base):
     __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        CheckConstraint("completed_cases >= 0", name="ck_evaluation_run_completed_cases"),
+        CheckConstraint("attempt_count >= 0", name="ck_evaluation_run_attempt_count"),
+        CheckConstraint("max_attempts > 0", name="ck_evaluation_run_max_attempts"),
+        Index("ix_evaluation_runs_queue", "status", "next_attempt_at", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    status: Mapped[str] = mapped_column(String(30), default="RUNNING", index=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    request_payload_hash: Mapped[str] = mapped_column(String(64), default="")
+    suite_revision_id: Mapped[int | None] = mapped_column(
+        ForeignKey("evaluation_suite_revisions.id", ondelete="SET NULL"), index=True
+    )
+    baseline_run_id: Mapped[int | None] = mapped_column(ForeignKey("evaluation_runs.id", ondelete="SET NULL"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
     total_cases: Mapped[int] = mapped_column(Integer, default=0)
+    completed_cases: Mapped[int] = mapped_column(Integer, default=0)
     passed_cases: Mapped[int] = mapped_column(Integer, default=0)
     average_score: Mapped[float] = mapped_column(Float, default=0.0)
+    baseline_average_score: Mapped[float | None] = mapped_column(Float)
+    score_delta: Mapped[float | None] = mapped_column(Float)
+    gate_passed: Mapped[bool | None] = mapped_column(Boolean)
+    gate_failures_json: Mapped[str] = mapped_column(Text, default="[]")
+    dimension_averages_json: Mapped[str] = mapped_column(Text, default="{}")
+    baseline_dimension_averages_json: Mapped[str] = mapped_column(Text, default="{}")
+    agent_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str] = mapped_column(Text, default="")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=2)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
     created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EvaluationResult(Base):
     __tablename__ = "evaluation_results"
-    __table_args__ = (UniqueConstraint("run_id", "case_id", name="uq_evaluation_run_case"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "case_id", name="uq_evaluation_run_case"),
+        CheckConstraint("latency_ms >= 0", name="ck_evaluation_result_latency_ms"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("evaluation_runs.id", ondelete="CASCADE"), index=True)
     case_id: Mapped[int] = mapped_column(ForeignKey("evaluation_cases.id", ondelete="CASCADE"), index=True)
     agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"))
+    baseline_result_id: Mapped[int | None] = mapped_column(ForeignKey("evaluation_results.id", ondelete="SET NULL"))
+    case_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    agent_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
     answer: Mapped[str] = mapped_column(Text, default="")
     score: Mapped[float] = mapped_column(Float, default=0.0)
+    baseline_answer: Mapped[str] = mapped_column(Text, default="")
+    baseline_score: Mapped[float | None] = mapped_column(Float)
+    score_delta: Mapped[float | None] = mapped_column(Float)
+    dimension_scores_json: Mapped[str] = mapped_column(Text, default="{}")
+    baseline_dimension_scores_json: Mapped[str] = mapped_column(Text, default="{}")
+    score_source: Mapped[str] = mapped_column(String(30), default="deterministic_fallback")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    regressed: Mapped[bool] = mapped_column(Boolean, default=False)
     passed: Mapped[bool] = mapped_column(Boolean, default=False)
     details_json: Mapped[str] = mapped_column(Text, default="{}")
     error: Mapped[str] = mapped_column(Text, default="")

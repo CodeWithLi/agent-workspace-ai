@@ -208,6 +208,112 @@ const discussionAgents = [
   current_version: 1
 }))
 
+function mockEvaluationRun(id: number, status = 'COMPLETED') {
+  const completed = status === 'COMPLETED'
+  return {
+    id,
+    request_id: `evaluation-${id}`,
+    status,
+    suite_revision: 3,
+    baseline_run_id: id === 81 ? 80 : id === 82 ? 81 : null,
+    total_cases: 2,
+    completed_cases: completed ? 2 : 0,
+    progress_percent: completed ? 100 : 0,
+    passed_cases: completed ? 2 : 0,
+    average_score: completed ? (id === 80 ? 0.84 : id === 81 ? 0.92 : 0.95) : 0,
+    baseline_average_score: id === 80 ? null : id === 81 ? 0.84 : 0.92,
+    score_delta: id === 80 ? null : id === 81 ? 0.08 : 0.03,
+    gate_passed: completed ? true : null,
+    gate_failures: [],
+    dimension_averages: completed
+      ? { requirements: 1, correctness: 0.9, relevance: 0.94, completeness: 0.86, safety: 1 }
+      : {},
+    baseline_dimension_averages: id === 80
+      ? {}
+      : { requirements: 0.8, correctness: 0.82, relevance: 0.84, completeness: 0.78, safety: 1 },
+    agent_snapshots: [
+      { id: 1, name: 'AI产品经理', role: 'product_manager', version: 2, model: 'test-model' },
+      { id: 2, name: 'AI架构师', role: 'architect', version: 3, model: 'test-model' }
+    ],
+    error: '',
+    attempt_count: 1,
+    max_attempts: 2,
+    retryable: false,
+    created_by_user_id: 1,
+    created_at: `2026-07-18T0${id === 80 ? 8 : id === 81 ? 9 : 10}:00:00Z`,
+    started_at: `2026-07-18T0${id === 80 ? 8 : id === 81 ? 9 : 10}:00:01Z`,
+    finished_at: completed ? `2026-07-18T0${id === 80 ? 8 : id === 81 ? 9 : 10}:01:00Z` : null
+  }
+}
+
+function mockEvaluationResults(runId: number) {
+  const improved = runId !== 80
+  return [
+    {
+      id: runId * 10 + 1,
+      case_id: 1,
+      case_name: '需求完整性',
+      agent_role: 'product_manager',
+      agent_name: 'AI产品经理',
+      agent_version: 2,
+      model: 'test-model',
+      input_text: '输出一份可验收的需求定义',
+      expected_keywords: ['验收标准', '目标用户'],
+      forbidden_keywords: ['跳过验收'],
+      rubric: '必须包含目标用户与可验证标准。',
+      answer: '已定义目标用户与验收标准。',
+      score: improved ? 0.94 : 0.82,
+      baseline_answer: improved ? '已整理基础需求。' : '',
+      baseline_score: improved ? 0.82 : null,
+      score_delta: improved ? 0.12 : null,
+      dimensions: { requirements: 1, correctness: 0.92, relevance: 0.96, completeness: 0.86, safety: 1 },
+      baseline_dimensions: improved ? { requirements: 0.5, correctness: 0.82, relevance: 0.84, completeness: 0.76, safety: 1 } : {},
+      score_source: 'llm_judge',
+      latency_ms: 1240,
+      regressed: false,
+      passed: true,
+      matched_keywords: ['验收标准', '目标用户'],
+      missing_keywords: [],
+      forbidden_hits: [],
+      judge_reason: '回答覆盖了两项必需证据。',
+      judge_error: '',
+      error: '',
+      created_at: '2026-07-18T09:00:30Z'
+    },
+    {
+      id: runId * 10 + 2,
+      case_id: 2,
+      case_name: '架构安全性',
+      agent_role: 'architect',
+      agent_name: 'AI架构师',
+      agent_version: 3,
+      model: 'test-model',
+      input_text: '设计具备审计与回滚能力的架构',
+      expected_keywords: ['审计', '回滚'],
+      forbidden_keywords: ['关闭鉴权'],
+      rubric: '安全控制不可被绕过。',
+      answer: '方案包含全链路审计和版本回滚。',
+      score: improved ? 0.9 : 0.86,
+      baseline_answer: improved ? '方案包含基础审计。' : '',
+      baseline_score: improved ? 0.86 : null,
+      score_delta: improved ? 0.04 : null,
+      dimensions: { requirements: 1, correctness: 0.88, relevance: 0.92, completeness: 0.84, safety: 1 },
+      baseline_dimensions: improved ? { requirements: 0.5, correctness: 0.84, relevance: 0.84, completeness: 0.8, safety: 1 } : {},
+      score_source: 'llm_judge',
+      latency_ms: 1380,
+      regressed: false,
+      passed: true,
+      matched_keywords: ['审计', '回滚'],
+      missing_keywords: [],
+      forbidden_hits: [],
+      judge_reason: '安全控制与恢复路径完整。',
+      judge_error: '',
+      error: '',
+      created_at: '2026-07-18T09:00:40Z'
+    }
+  ]
+}
+
 function discussionEventStream() {
   const stages = ['product', 'architecture', 'quality', 'operations', 'final']
   const contents = ['明确目标与范围', '给出技术架构', '补充测试与验收', '制定灰度发布策略', '# 最终交付方案\n\n按三个里程碑实施。']
@@ -318,6 +424,38 @@ async function mockApi(page: Page) {
     updated_at: '2026-07-17T00:00:00Z'
   }))
   let mockPrototypes = [prototypeDetail()]
+  let evaluationCases = [
+    {
+      id: 1,
+      name: '需求完整性',
+      agent_role: 'product_manager',
+      input_text: '输出一份可验收的需求定义',
+      expected_keywords: ['验收标准', '目标用户'],
+      forbidden_keywords: ['跳过验收'],
+      rubric: '必须包含目标用户与可验证标准。',
+      minimum_score: 0.8,
+      weight: 1.5,
+      enabled: true,
+      created_at: '2026-07-18T08:00:00Z',
+      updated_at: '2026-07-18T08:00:00Z'
+    },
+    {
+      id: 2,
+      name: '架构安全性',
+      agent_role: 'architect',
+      input_text: '设计具备审计与回滚能力的架构',
+      expected_keywords: ['审计', '回滚'],
+      forbidden_keywords: ['关闭鉴权'],
+      rubric: '安全控制不可被绕过。',
+      minimum_score: 0.85,
+      weight: 2,
+      enabled: true,
+      created_at: '2026-07-18T08:00:00Z',
+      updated_at: '2026-07-18T08:00:00Z'
+    }
+  ]
+  let evaluationRuns = [mockEvaluationRun(81), mockEvaluationRun(80)]
+  let evaluationPolls = 0
   type MockGenerationJob = {
     job_id: number
     operation: 'CREATE' | 'REGENERATE'
@@ -670,7 +808,55 @@ async function mockApi(page: Page) {
       const created = { ...baseProject, id: 2, ...input }
       projects = [created, ...projects]
       body = created
-    } else if (method === 'GET' && path === '/agents') body = discussionAgents
+    } else if (method === 'GET' && path === '/evaluations/cases') body = evaluationCases
+    else if (method === 'POST' && path === '/evaluations/cases') {
+      const input = request.postDataJSON() as Omit<(typeof evaluationCases)[number], 'id' | 'created_at' | 'updated_at'>
+      const created = {
+        id: Math.max(...evaluationCases.map((item) => item.id)) + 1,
+        ...input,
+        created_at: '2026-07-18T10:00:00Z',
+        updated_at: '2026-07-18T10:00:00Z'
+      }
+      evaluationCases = [...evaluationCases, created]
+      body = created
+    }
+    else if (method === 'PATCH' && /^\/evaluations\/cases\/\d+$/.test(path)) {
+      const id = Number(path.split('/').pop())
+      const input = request.postDataJSON() as Partial<(typeof evaluationCases)[number]>
+      evaluationCases = evaluationCases.map((item) => item.id === id ? { ...item, ...input, updated_at: '2026-07-18T10:00:00Z' } : item)
+      body = evaluationCases.find((item) => item.id === id)
+    }
+    else if (method === 'DELETE' && /^\/evaluations\/cases\/\d+$/.test(path)) {
+      const id = Number(path.split('/').pop())
+      evaluationCases = evaluationCases.map((item) => item.id === id ? { ...item, enabled: false } : item)
+      return route.fulfill({ status: 204 })
+    }
+    else if (method === 'GET' && /^\/evaluations\/runs\/\d+$/.test(path)) {
+      const id = Number(path.split('/').pop())
+      const run = evaluationRuns.find((item) => item.id === id)
+      body = run ? { ...run, results: mockEvaluationResults(id) } : { detail: 'Evaluation run not found' }
+    }
+    else if (method === 'GET' && path === '/evaluations/runs') {
+      const queued = evaluationRuns.find((item) => item.id === 82 && item.status !== 'COMPLETED')
+      if (queued && evaluationPolls++ >= 0) {
+        evaluationRuns = evaluationRuns.map((item) => item.id === 82 ? mockEvaluationRun(82) : item)
+      }
+      body = evaluationRuns
+    }
+    else if (method === 'POST' && path === '/evaluations/runs') {
+      const queued = mockEvaluationRun(82, 'QUEUED')
+      evaluationPolls = 0
+      evaluationRuns = [queued, ...evaluationRuns.filter((item) => item.id !== 82)]
+      body = queued
+    }
+    else if (method === 'POST' && /^\/evaluations\/runs\/\d+\/(cancel|retry)$/.test(path)) {
+      const parts = path.split('/')
+      const id = Number(parts[3])
+      const nextStatus = parts[4] === 'retry' ? 'QUEUED' : 'CANCELLED'
+      evaluationRuns = evaluationRuns.map((item) => item.id === id ? mockEvaluationRun(id, nextStatus) : item)
+      body = evaluationRuns.find((item) => item.id === id)
+    }
+    else if (method === 'GET' && path === '/agents') body = discussionAgents
     else if (method === 'GET' && path === '/agents/conversations') body = []
     else if (method === 'POST' && path === '/agents/discussion/stream') {
       await new Promise((resolve) => setTimeout(resolve, 300))
@@ -773,6 +959,65 @@ test('runs a five-agent discussion and renders the final plan', async ({ page },
   await expect(page.getByRole('button', { name: 'AI Token 钱包' })).toContainText('950')
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('manages versioned Agent evaluations and completes an async regression run', async ({ page }) => {
+  await page.goto('/evaluations')
+
+  await expect(page.getByRole('heading', { name: 'Agent 评测实验室' })).toBeVisible()
+  await expect(page.getByText('92.0%', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('+8.0 pt', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('可发布', { exact: true }).first()).toBeVisible()
+
+  const firstRun = page.locator('.desktop-run-table:visible .run-link, .mobile-run-list:visible .run-card-main').first()
+  await firstRun.click()
+  await expect(page.getByText('评测运行 #81', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '维度对比' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '案例证据' })).toBeVisible()
+  await page.locator('.result-collapse .el-collapse-item__header').first().click()
+  const judgeEvidence = page.locator('.judge-reason').filter({ hasText: '回答覆盖了两项必需证据。' })
+  await judgeEvidence.scrollIntoViewIfNeeded()
+  await expect(judgeEvidence).toContainText('回答覆盖了两项必需证据。')
+  await page.keyboard.press('Escape')
+
+  await page.getByRole('tab', { name: '用例库' }).click()
+  await page.getByRole('button', { name: '新建用例' }).click()
+  const caseDialog = page.getByRole('dialog', { name: '新建评测用例' })
+  await caseDialog.getByLabel('用例名称').fill('多 Agent 交接完整性')
+  await caseDialog.getByLabel('测试输入').fill('输出产品、架构与测试之间的交接清单')
+  await caseDialog.getByLabel('期望证据关键词').fill('负责人，验收证据，回滚')
+  await caseDialog.getByLabel('禁用词').fill('跳过评审')
+  await caseDialog.getByLabel('评分 Rubric').fill('必须明确角色、证据与失败恢复责任。')
+  await caseDialog.getByRole('button', { name: '保存用例' }).click()
+  const visibleCaseList = page.locator('.desktop-case-table:visible, .mobile-case-list:visible')
+  await expect(visibleCaseList).toHaveCount(1)
+  await expect(visibleCaseList.getByText('多 Agent 交接完整性', { exact: true })).toBeVisible()
+
+  await page.getByRole('tab', { name: '运行历史' }).click()
+  await page.getByRole('button', { name: '运行团队评测' }).click()
+  await expect(page.getByText('团队评测 #82 已进入队列', { exact: true })).toBeVisible()
+  await expect(page.getByText(/运行 #82 · 等待执行/)).toBeVisible()
+  await expect(page.getByText('运行 #82', { exact: true })).toBeVisible({ timeout: 8_000 })
+  await expect(page.getByText('95.0%', { exact: true }).first()).toBeVisible({ timeout: 8_000 })
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
+  expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('keeps the evaluation lab usable at 375px and mobile landscape', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile-chromium', 'Mobile viewport regression')
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.setViewportSize({ width: 375, height: 812 })
+  await page.goto('/evaluations')
+
+  await expect(page.getByRole('heading', { name: 'Agent 评测实验室' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '运行团队评测' })).toHaveCSS('min-height', '44px')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.setViewportSize({ width: 844, height: 390 })
+  await expect(page.getByRole('heading', { name: 'Agent 评测实验室' })).toBeVisible()
+  await expect(page.locator('.desktop-run-table:visible, .mobile-run-list:visible')).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('shows Saga compensation failure and completes manual recovery', async ({ page }) => {

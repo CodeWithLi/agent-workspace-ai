@@ -26,7 +26,9 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 - `token_transactions`、`recharge_orders`：余额变更账本与模拟充值单；余额通过条件更新防止并发透支。
 - `system_setting_overrides`：加密密钥和非敏感运行时配置覆盖；修改记录写入审计日志。
 - `llm_usage`：供应商 token、模型、耗时、usage 来源和估算成本。
-- `evaluation_cases`、`evaluation_runs`、`evaluation_results`：回归数据集、运行汇总和逐用例结果。
+- `evaluation_cases`：跨 Agent 角色的评测用例、证据规则、Rubric、阈值和权重；删除操作采用归档以保留历史。
+- `evaluation_suite_revisions`：按内容指纹去重的不可变测试集快照。
+- `evaluation_runs`、`evaluation_results`：持久化异步运行、冻结 Agent 版本、租约进度、基线门禁、逐案例多维分数与证据。
 - `audit_logs`：认证、权限、Agent 工具、文档和工作流关键动作。
 
 ## 迁移

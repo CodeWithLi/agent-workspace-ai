@@ -743,7 +743,15 @@ class EvaluationCaseCreate(BaseModel):
     agent_role: AgentRole
     input_text: str = Field(min_length=1, max_length=20000)
     expected_keywords: list[str] = Field(default_factory=list)
+    forbidden_keywords: list[str] = Field(default_factory=list)
+    rubric: str = Field(default="", max_length=10000)
+    minimum_score: float = Field(default=0.8, ge=0, le=1)
+    weight: float = Field(default=1.0, gt=0, le=100)
     enabled: bool = True
+
+
+class EvaluationCaseUpdate(EvaluationCaseCreate):
+    pass
 
 
 class EvaluationCaseOut(BaseModel):
@@ -752,21 +760,90 @@ class EvaluationCaseOut(BaseModel):
     agent_role: str
     input_text: str
     expected_keywords: list[str]
+    forbidden_keywords: list[str]
+    rubric: str
+    minimum_score: float
+    weight: float
     enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class EvaluationRunCreate(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64)
+    baseline_run_id: int | None = Field(default=None, ge=1)
+
+
+class EvaluationAgentSnapshotOut(BaseModel):
+    id: int
+    name: str
+    role: str
+    version: int
+    model: str
+
+
+class EvaluationResultOut(BaseModel):
+    id: int
+    case_id: int
+    case_name: str
+    agent_role: str
+    agent_name: str
+    agent_version: int | None
+    model: str
+    input_text: str
+    expected_keywords: list[str]
+    forbidden_keywords: list[str]
+    rubric: str
+    answer: str
+    score: float
+    baseline_answer: str
+    baseline_score: float | None
+    score_delta: float | None
+    dimensions: dict[str, float]
+    baseline_dimensions: dict[str, float]
+    score_source: str
+    latency_ms: int
+    regressed: bool
+    passed: bool
+    matched_keywords: list[str]
+    missing_keywords: list[str]
+    forbidden_hits: list[str]
+    judge_reason: str
+    judge_error: str
+    error: str
     created_at: datetime
 
 
 class EvaluationRunOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
+    request_id: str | None
     status: str
+    suite_revision: int | None
+    baseline_run_id: int | None
     total_cases: int
+    completed_cases: int
+    progress_percent: int
     passed_cases: int
     average_score: float
+    baseline_average_score: float | None
+    score_delta: float | None
+    gate_passed: bool | None
+    gate_failures: list[str]
+    dimension_averages: dict[str, float]
+    baseline_dimension_averages: dict[str, float]
+    agent_snapshots: list[EvaluationAgentSnapshotOut]
+    error: str
+    attempt_count: int
+    max_attempts: int
+    retryable: bool
     created_by_user_id: int | None
     created_at: datetime
+    started_at: datetime | None
     finished_at: datetime | None
+
+
+class EvaluationRunDetailOut(EvaluationRunOut):
+    results: list[EvaluationResultOut]
 
 
 class TokenTransactionOut(BaseModel):

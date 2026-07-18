@@ -62,6 +62,10 @@
           <el-icon><Setting /></el-icon>
           <span>系统设置</span>
         </el-menu-item>
+        <el-menu-item v-if="auth.user?.role === 'admin'" index="/evaluations">
+          <el-icon><DataAnalysis /></el-icon>
+          <span>Agent 评测</span>
+        </el-menu-item>
         <el-menu-item v-if="auth.user?.role === 'admin'" index="/users">
           <el-icon><User /></el-icon>
           <span>用户与权限</span>
@@ -114,7 +118,7 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, Document, Files, Folder, List, MagicStick, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
+import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, DataAnalysis, Document, Files, Folder, List, MagicStick, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'

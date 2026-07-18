@@ -8,7 +8,7 @@
       </div>
       <div class="inline-actions">
         <span class="page-count">{{ agents.length }} 名员工</span>
-        <el-button v-if="auth.user?.role === 'admin'" :icon="DataAnalysis" @click="openEvaluation">回归评测</el-button>
+        <el-button v-if="auth.user?.role === 'admin'" :icon="DataAnalysis" @click="router.push('/evaluations')">回归评测</el-button>
       </div>
     </div>
 
@@ -94,39 +94,18 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="evaluationDialog" title="Agent 回归评测" width="min(860px, calc(100vw - 32px))" top="5vh">
-      <el-form label-position="top" class="evaluation-form">
-        <el-row :gutter="14">
-          <el-col :xs="24" :md="12"><el-form-item label="用例名称"><el-input v-model="evaluationForm.name" /></el-form-item></el-col>
-          <el-col :xs="24" :md="12"><el-form-item label="Agent"><el-select v-model="evaluationForm.agent_role" class="full"><el-option v-for="agent in agents" :key="agent.role" :label="agent.name" :value="agent.role" /></el-select></el-form-item></el-col>
-        </el-row>
-        <el-form-item label="输入"><el-input v-model="evaluationForm.input_text" type="textarea" :rows="3" /></el-form-item>
-        <el-form-item label="预期关键词"><el-input v-model="evaluationForm.keywords" placeholder="使用逗号分隔" /></el-form-item>
-        <el-button :icon="Plus" :disabled="!validEvaluationCase" @click="createEvaluationCase">添加用例</el-button>
-      </el-form>
-      <el-table :data="evaluationCases" class="data-table tool-table">
-        <el-table-column prop="name" label="用例" min-width="150" />
-        <el-table-column prop="agent_role" label="Agent" min-width="130" />
-        <el-table-column label="预期关键词" min-width="220"><template #default="{ row }">{{ row.expected_keywords.join('、') }}</template></el-table-column>
-        <el-table-column label="操作" width="80" align="right"><template #default="{ row }"><el-button link type="danger" @click="deleteEvaluationCase(row.id)">删除</el-button></template></el-table-column>
-      </el-table>
-      <template #footer>
-        <span v-if="latestEvaluationRun" class="evaluation-result">最近：{{ latestEvaluationRun.passed_cases }}/{{ latestEvaluationRun.total_cases }}，得分 {{ (latestEvaluationRun.average_score * 100).toFixed(1) }}%</span>
-        <el-button @click="evaluationDialog = false">关闭</el-button>
-        <el-button type="primary" :icon="DataAnalysis" :loading="runningEvaluation" :disabled="!evaluationCases.length" @click="runEvaluation">运行评测</el-button>
-      </template>
-    </el-dialog>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Cpu, DataAnalysis, Plus, Setting } from '@element-plus/icons-vue'
+import { Cpu, DataAnalysis, Setting } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
-import type { Agent, AgentTool, AgentVersion, EvaluationCase, EvaluationRun } from '../api/types'
+import type { Agent, AgentTool, AgentVersion } from '../api/types'
 import { confirmDestructiveAction } from '../utils/confirm'
 
 interface ConfigTool extends AgentTool {
@@ -135,6 +114,7 @@ interface ConfigTool extends AgentTool {
 
 const agents = ref<Agent[]>([])
 const auth = useAuthStore()
+const router = useRouter()
 const configDialog = ref(false)
 const activeTab = ref('profile')
 const activeAgent = ref<Agent | null>(null)
@@ -143,11 +123,6 @@ const agentVersions = ref<AgentVersion[]>([])
 const saving = ref(false)
 const savingDraft = ref(false)
 const releaseNote = ref('')
-const evaluationDialog = ref(false)
-const evaluationCases = ref<EvaluationCase[]>([])
-const latestEvaluationRun = ref<EvaluationRun | null>(null)
-const runningEvaluation = ref(false)
-const evaluationForm = reactive({ name: '', agent_role: '', input_text: '', keywords: '' })
 const form = reactive({
   description: '',
   system_prompt: '',
@@ -158,9 +133,6 @@ const form = reactive({
   concurrency_limit: 4
 })
 const validForm = computed(() => Boolean(form.description.trim() && form.system_prompt.trim() && form.model.trim()))
-const validEvaluationCase = computed(() => Boolean(
-  evaluationForm.name.trim() && evaluationForm.agent_role && evaluationForm.input_text.trim() && evaluationForm.keywords.trim()
-))
 
 function tools(agent: Agent) {
   return agent.tools.split(',').map((item) => item.trim()).filter(Boolean)
@@ -242,48 +214,6 @@ async function rollbackVersion(version: number) {
   await api.post(`/agents/${activeAgent.value.id}/versions/${version}/rollback`)
   await Promise.all([loadAgents(), loadVersions()])
   ElMessage.success(`已从 v${version} 创建回滚版本`)
-}
-
-async function openEvaluation() {
-  const [casesResponse, runsResponse] = await Promise.all([
-    api.get<EvaluationCase[]>('/evaluations/cases'),
-    api.get<EvaluationRun[]>('/evaluations/runs')
-  ])
-  evaluationCases.value = casesResponse.data
-  latestEvaluationRun.value = runsResponse.data[0] || null
-  evaluationForm.agent_role = agents.value[0]?.role || ''
-  evaluationDialog.value = true
-}
-
-async function createEvaluationCase() {
-  const { data } = await api.post<EvaluationCase>('/evaluations/cases', {
-    name: evaluationForm.name,
-    agent_role: evaluationForm.agent_role,
-    input_text: evaluationForm.input_text,
-    expected_keywords: evaluationForm.keywords.split(',').map((item) => item.trim()).filter(Boolean),
-    enabled: true
-  })
-  evaluationCases.value.push(data)
-  evaluationForm.name = ''
-  evaluationForm.input_text = ''
-  evaluationForm.keywords = ''
-}
-
-async function deleteEvaluationCase(id: number) {
-  if (!await confirmDestructiveAction('删除后无法恢复，确认删除这条评测用例吗？', '删除评测用例')) return
-  await api.delete(`/evaluations/cases/${id}`)
-  evaluationCases.value = evaluationCases.value.filter((item) => item.id !== id)
-}
-
-async function runEvaluation() {
-  runningEvaluation.value = true
-  try {
-    const { data } = await api.post<EvaluationRun>('/evaluations/run')
-    latestEvaluationRun.value = data
-    ElMessage.success(`评测完成：${data.passed_cases}/${data.total_cases}`)
-  } finally {
-    runningEvaluation.value = false
-  }
 }
 
 async function saveAgent() {

@@ -17,6 +17,7 @@ from app.core.logging import configure_logging
 from app.core.llm import LLMGatewayError
 from app.services.notifications import notification_dispatcher
 from app.services.prototype_generations import prototype_generation_dispatcher
+from app.evaluation import evaluation_dispatcher
 from app.admin import router as admin_router
 from app.services.agent_run_reaper import agent_run_reaper
 from app.services.workflows import workflow_dispatcher
@@ -27,6 +28,7 @@ from app.core.metrics import (
     HTTP_DURATION,
     HTTP_IN_PROGRESS,
     HTTP_REQUESTS,
+    EVALUATION_QUEUE,
     KNOWLEDGE_QUEUE,
     NOTIFICATION_QUEUE,
     PROTOTYPE_GENERATION_QUEUE,
@@ -37,6 +39,7 @@ from app.core.metrics import (
 from app.core.request_context import request_id_context
 from app.models import (
     KnowledgeDocument,
+    EvaluationRun,
     Notification,
     PrototypeGenerationJob,
     WorkflowRun,
@@ -62,6 +65,7 @@ async def lifespan(_: FastAPI):
     await agent_run_reaper.start()
     await workflow_dispatcher.start()
     await prototype_generation_dispatcher.start()
+    await evaluation_dispatcher.start()
     await runtime_config_refresher.start()
     await knowledge_dispatcher.start()
     try:
@@ -69,6 +73,7 @@ async def lifespan(_: FastAPI):
     finally:
         await knowledge_dispatcher.stop()
         await runtime_config_refresher.stop()
+        await evaluation_dispatcher.stop()
         await prototype_generation_dispatcher.stop()
         await workflow_dispatcher.stop()
         await notification_dispatcher.stop()
@@ -179,6 +184,10 @@ def metrics() -> Response:
         ):
             label = status_value.value if hasattr(status_value, "value") else str(status_value)
             PROTOTYPE_GENERATION_QUEUE.labels(status=label).set(count)
+        for status_value, count in db.execute(
+            select(EvaluationRun.status, func.count()).group_by(EvaluationRun.status)
+        ):
+            EVALUATION_QUEUE.labels(status=str(status_value)).set(count)
         for status_value, count in db.execute(
             select(WorkflowSagaStep.status, func.count()).group_by(WorkflowSagaStep.status)
         ):

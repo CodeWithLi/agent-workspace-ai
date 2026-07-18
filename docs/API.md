@@ -48,8 +48,10 @@
 - `GET /agents/conversations/{conversation_id}/messages`
 - `POST /agents/messages/{message_id}/feedback`
 - `POST /agents/messages/{message_id}/regenerate`
-- `GET|POST /evaluations/cases`、`DELETE /evaluations/cases/{id}`
-- `POST /evaluations/run`、`GET /evaluations/runs`
+- `GET|POST /evaluations/cases`、`PATCH|DELETE /evaluations/cases/{id}`
+- `POST /evaluations/runs`、`GET /evaluations/runs`、`GET /evaluations/runs/{id}`
+- `POST /evaluations/runs/{id}/cancel`、`POST /evaluations/runs/{id}/retry`
+- `POST /evaluations/run` 保留为兼容入口；新客户端应使用带 `request_id` 的异步 `/evaluations/runs`。
 
 SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `conversation_id`、`agent_id` 和 `agent_name`。
 

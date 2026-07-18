@@ -51,6 +51,8 @@ jobs:
       NOTIFICATION_WORKER_ENABLED: "false"
       PROTOTYPE_GENERATION_WORKER_ENABLED: "false"
       PROTOTYPE_GENERATION_PG_INTEGRATION: "1"
+      EVALUATION_WORKER_ENABLED: "false"
+      EVALUATION_PG_INTEGRATION: "1"
     defaults:
       run:
         working-directory: backend

@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     embedding_cost_per_million: float = Field(default=0.0, ge=0, le=10000)
     evaluation_case_min_score: float = Field(default=0.8, ge=0, le=1)
     evaluation_min_average: float = Field(default=0.8, ge=0, le=1)
+    evaluation_average_regression_tolerance: float = Field(default=0.02, ge=0, le=1)
+    evaluation_case_regression_tolerance: float = Field(default=0.10, ge=0, le=1)
+    evaluation_judge_model: str | None = None
+    evaluation_worker_enabled: bool = True
+    evaluation_poll_seconds: int = Field(default=1, ge=1, le=60)
+    evaluation_lease_seconds: int = Field(default=300, ge=60, le=3600)
+    evaluation_max_attempts: int = Field(default=2, ge=1, le=10)
+    evaluation_retry_base_seconds: int = Field(default=5, ge=1, le=300)
     embedding_model: str = "embedding-3"
     embedding_api_key: str | None = None
     embedding_base_url: str | None = None

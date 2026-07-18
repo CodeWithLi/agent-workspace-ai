@@ -36,6 +36,17 @@ PROTOTYPE_GENERATION_DURATION = Histogram(
     ("operation", "status"),
     buckets=(1, 5, 15, 30, 60, 90, 120, 180, 300, 600, 1200),
 )
+EVALUATION_QUEUE = Gauge(
+    "agent_workspace_evaluation_queue",
+    "Agent evaluation runs by status",
+    ("status",),
+)
+EVALUATION_DURATION = Histogram(
+    "agent_workspace_evaluation_duration_seconds",
+    "Agent evaluation duration by terminal status",
+    ("status",),
+    buckets=(1, 5, 15, 30, 60, 90, 120, 180, 300, 600, 1200),
+)
 SAGA_STEPS = Counter(
     "agent_workspace_saga_step_transitions_total",
     "Durable Saga step state transitions",
