@@ -1,10 +1,16 @@
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from app.agent.orchestration import (
     AgentHandoff,
+    MultiAgentExecutionPlan,
     build_fallback_plan,
+    build_execution_waves,
     build_task_blueprints,
     evaluate_handoffs,
+    expand_revision_roles,
     merge_reviewer_decision,
     parse_execution_plan,
 )
@@ -52,7 +58,80 @@ def test_execution_plan_parser_accepts_valid_json_and_falls_back_safely() -> Non
 
     assert parsed.objective == "交付可灰度发布的会员增长能力"
     assert [item.role for item in parsed.assignments] == ["test_engineer", "operations_analyst"]
+    assert [item.depends_on for item in parsed.assignments] == [[], []]
     assert [item.role for item in fallback.assignments][:2] == ["test_engineer", "operations_analyst"]
+
+
+def test_execution_plan_builds_dependency_waves_and_rejects_invalid_graphs() -> None:
+    plan_data = {
+        "objective": "按依赖顺序生成可验证的跨专业交付",
+        "rationale": "知识证据先于测试，测试与运营结论先于通知策略",
+        "assignments": [
+            {
+                "role": "test_engineer",
+                "objective": "基于知识证据验证边界场景",
+                "deliverable": "测试与验收清单",
+                "depends_on": ["knowledge_admin"],
+            },
+            {
+                "role": "operations_analyst",
+                "objective": "独立验证灰度、监控和回滚策略",
+                "deliverable": "发布运行手册",
+            },
+            {
+                "role": "knowledge_admin",
+                "objective": "整理可追溯知识证据和权限边界",
+                "deliverable": "知识证据清单",
+            },
+            {
+                "role": "notification_secretary",
+                "objective": "基于验收与运营结论设计可靠触达",
+                "deliverable": "通知触达方案",
+                "depends_on": ["test_engineer", "operations_analyst"],
+            },
+        ],
+        "success_criteria": ["全部依赖可追溯", "每个交付均通过验收"],
+    }
+
+    plan = MultiAgentExecutionPlan.model_validate(plan_data)
+    waves = build_execution_waves(plan)
+
+    assert [[assignment.role for assignment in wave] for wave in waves] == [
+        ["operations_analyst", "knowledge_admin"],
+        ["test_engineer"],
+        ["notification_secretary"],
+    ]
+    assert expand_revision_roles(plan, {"knowledge_admin"}) == {
+        "knowledge_admin",
+        "test_engineer",
+        "notification_secretary",
+    }
+    assert expand_revision_roles(plan, {"notification_secretary"}) == {"notification_secretary"}
+
+    for invalid_assignments in (
+        [
+            *plan_data["assignments"][:3],
+            {**plan_data["assignments"][3], "depends_on": ["notification_secretary"]},
+        ],
+        [
+            {**plan_data["assignments"][0], "depends_on": ["notification_secretary"]},
+            *plan_data["assignments"][1:3],
+            {**plan_data["assignments"][3], "depends_on": ["test_engineer"]},
+        ],
+        [
+            {**plan_data["assignments"][0], "depends_on": ["operations_analyst", "operations_analyst"]},
+            *plan_data["assignments"][1:],
+        ],
+    ):
+        with pytest.raises(ValidationError):
+            MultiAgentExecutionPlan.model_validate({**plan_data, "assignments": invalid_assignments})
+
+    unknown_dependency = [
+        {**plan_data["assignments"][0], "depends_on": ["notification_secretary"]},
+        *plan_data["assignments"][1:3],
+    ]
+    with pytest.raises(ValidationError):
+        MultiAgentExecutionPlan.model_validate({**plan_data, "assignments": unknown_dependency})
 
 
 def test_quality_gate_requires_complete_substantive_handoffs() -> None:

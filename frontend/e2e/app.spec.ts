@@ -2385,10 +2385,10 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   const decisions: Array<Record<string, unknown>> = []
   const initialPlan = {
     objective: '先验证可恢复交付，再启动专业 Agent',
-    rationale: '测试与运营需要独立审查，且所有结论必须可追溯。',
+    rationale: '测试先确认验收证据，运营再基于测试结论设计灰度和恢复。',
     assignments: [
-      { role: 'test_engineer', objective: '验证边界场景与验收证据', deliverable: '可复现验收清单' },
-      { role: 'operations_analyst', objective: '验证灰度发布与故障恢复', deliverable: '发布与回滚手册' }
+      { role: 'test_engineer', objective: '验证边界场景与验收证据', deliverable: '可复现验收清单', depends_on: [] },
+      { role: 'operations_analyst', objective: '基于测试结论验证灰度发布与故障恢复', deliverable: '发布与回滚手册', depends_on: ['test_engineer'] }
     ],
     success_criteria: ['核心路径具备可复现证据', '失败场景具备负责人和回滚条件']
   }
@@ -2505,10 +2505,22 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await page.goto('/projects/2')
   await page.getByRole('button', { name: '运行多 Agent 工作流', exact: true }).click()
   await expect.poll(() => runPayload.require_plan_approval).toBe(true)
+  const workflowReloaded = page.waitForResponse((response) => (
+    response.request().method() === 'GET'
+    && /\/api\/v1\/workflow\?project_id=2$/.test(response.url())
+  ))
   await page.reload()
+  await workflowReloaded
 
   await expect(page.getByText('执行计划 v1 等待批准', { exact: true })).toBeVisible()
-  await expect(page.getByText('测试与运营需要独立审查，且所有结论必须可追溯。', { exact: true })).toBeVisible()
+  await expect(page.getByText('测试先确认验收证据，运营再基于测试结论设计灰度和恢复。', { exact: true })).toBeVisible()
+  await expect(page.getByText('2 个分支 · 2 波', { exact: true })).toBeVisible()
+  const firstWave = page.getByLabel('执行计划第 1 波')
+  const secondWave = page.getByLabel('执行计划第 2 波')
+  await expect(firstWave.getByText('测试工程师', { exact: true })).toBeVisible()
+  await expect(secondWave.getByText('运营分析师', { exact: true })).toBeVisible()
+  await expect(secondWave.getByText('依赖', { exact: true })).toBeVisible()
+  await expect(secondWave.getByText('测试工程师', { exact: true })).toBeVisible()
   await expect(page.getByText('核心路径具备可复现证据', { exact: true })).toBeVisible()
   await expect(page.getByText('失败场景具备负责人和回滚条件', { exact: true })).toBeVisible()
   const reviseButton = page.getByRole('button', { name: '要求重新规划', exact: true })

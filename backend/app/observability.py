@@ -119,6 +119,8 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "approval_gate",
     "branch_count",
     "decision",
+    "dependency_count",
+    "depends_on",
     "next_node",
     "output_chars",
     "plan_version",
@@ -130,6 +132,8 @@ PUBLIC_EVENT_PAYLOAD_FIELDS = {
     "score",
     "success_criteria_count",
     "source_plan_version",
+    "wave",
+    "wave_count",
 }
 
 

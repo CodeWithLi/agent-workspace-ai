@@ -23,6 +23,7 @@ class SpecialistAssignment(BaseModel):
     role: SpecialistRole
     objective: str = Field(min_length=4, max_length=500)
     deliverable: str = Field(min_length=2, max_length=200)
+    depends_on: list[SpecialistRole] = Field(default_factory=list, max_length=3)
 
 
 class MultiAgentExecutionPlan(BaseModel):
@@ -32,11 +33,65 @@ class MultiAgentExecutionPlan(BaseModel):
     success_criteria: list[str] = Field(min_length=2, max_length=10)
 
     @model_validator(mode="after")
-    def validate_unique_assignments(self) -> "MultiAgentExecutionPlan":
+    def validate_assignment_graph(self) -> "MultiAgentExecutionPlan":
         roles = [assignment.role for assignment in self.assignments]
         if len(roles) != len(set(roles)):
             raise ValueError("specialist assignment roles must be unique")
+        role_set = set(roles)
+        dependencies: dict[SpecialistRole, set[SpecialistRole]] = {}
+        for assignment in self.assignments:
+            if len(assignment.depends_on) != len(set(assignment.depends_on)):
+                raise ValueError(f"dependencies for {assignment.role} must be unique")
+            if assignment.role in assignment.depends_on:
+                raise ValueError(f"specialist assignment {assignment.role} cannot depend on itself")
+            unknown = set(assignment.depends_on) - role_set
+            if unknown:
+                raise ValueError(
+                    f"dependencies for {assignment.role} are not assigned: {', '.join(sorted(unknown))}"
+                )
+            dependencies[assignment.role] = set(assignment.depends_on)
+
+        resolved: set[SpecialistRole] = set()
+        remaining = set(roles)
+        while remaining:
+            ready = {role for role in remaining if dependencies[role] <= resolved}
+            if not ready:
+                raise ValueError("specialist assignment dependencies must form an acyclic graph")
+            resolved.update(ready)
+            remaining.difference_update(ready)
         return self
+
+
+def build_execution_waves(plan: MultiAgentExecutionPlan) -> list[list[SpecialistAssignment]]:
+    remaining = list(plan.assignments)
+    resolved: set[SpecialistRole] = set()
+    waves: list[list[SpecialistAssignment]] = []
+    while remaining:
+        wave = [assignment for assignment in remaining if set(assignment.depends_on) <= resolved]
+        if not wave:
+            raise ValueError("specialist assignment dependencies must form an acyclic graph")
+        waves.append(wave)
+        wave_roles = {assignment.role for assignment in wave}
+        resolved.update(wave_roles)
+        remaining = [assignment for assignment in remaining if assignment.role not in wave_roles]
+    return waves
+
+
+def expand_revision_roles(
+    plan: MultiAgentExecutionPlan,
+    requested_roles: set[str],
+) -> set[SpecialistRole]:
+    expanded: set[SpecialistRole] = {
+        assignment.role for assignment in plan.assignments if assignment.role in requested_roles
+    }
+    changed = True
+    while changed:
+        changed = False
+        for assignment in plan.assignments:
+            if assignment.role not in expanded and any(role in expanded for role in assignment.depends_on):
+                expanded.add(assignment.role)
+                changed = True
+    return expanded
 
 
 class AgentHandoff(BaseModel):
@@ -79,11 +134,37 @@ def _json_candidates(text: str) -> list[str]:
 
 def build_fallback_plan(user_input: str) -> MultiAgentExecutionPlan:
     normalized = user_input.lower()
+    includes_knowledge = any(
+        keyword in normalized
+        for keyword in (
+            "rag",
+            "知识",
+            "文档",
+            "搜索",
+            "检索",
+            "数据治理",
+            "embedding",
+        )
+    )
+    includes_notification = any(
+        keyword in normalized
+        for keyword in (
+            "通知",
+            "邮件",
+            "短信",
+            "提醒",
+            "调度",
+            "定时",
+            "notification",
+            "email",
+        )
+    )
     assignments = [
         SpecialistAssignment(
             role="test_engineer",
             objective="审查核心用户路径、边界状态、安全风险和可验证验收标准",
             deliverable="测试策略、边界场景与验收门禁",
+            depends_on=["knowledge_admin"] if includes_knowledge else [],
         ),
         SpecialistAssignment(
             role="operations_analyst",
@@ -91,26 +172,7 @@ def build_fallback_plan(user_input: str) -> MultiAgentExecutionPlan:
             deliverable="发布运行手册与风险缓解方案",
         ),
     ]
-    knowledge_keywords = (
-        "rag",
-        "知识",
-        "文档",
-        "搜索",
-        "检索",
-        "数据治理",
-        "embedding",
-    )
-    notification_keywords = (
-        "通知",
-        "邮件",
-        "短信",
-        "提醒",
-        "调度",
-        "定时",
-        "notification",
-        "email",
-    )
-    if any(keyword in normalized for keyword in knowledge_keywords):
+    if includes_knowledge:
         assignments.append(
             SpecialistAssignment(
                 role="knowledge_admin",
@@ -118,17 +180,18 @@ def build_fallback_plan(user_input: str) -> MultiAgentExecutionPlan:
                 deliverable="知识与检索治理方案",
             )
         )
-    if any(keyword in normalized for keyword in notification_keywords):
+    if includes_notification:
         assignments.append(
             SpecialistAssignment(
                 role="notification_secretary",
                 objective="审查触达时机、收件人规则、幂等发送、失败重试和用户退订边界",
                 deliverable="通知触达与失败恢复方案",
+                depends_on=["operations_analyst"],
             )
         )
     return MultiAgentExecutionPlan(
         objective=f"形成可实施、可验收、可发布的项目交付方案：{user_input[:500]}",
-        rationale="质量和交付风险需要由独立专业角色并行审查，再由项目经理统一集成。",
+        rationale="独立专业角色按依赖波次并行审查质量与交付风险，再由项目经理统一集成。",
         assignments=assignments,
         success_criteria=[
             "需求、架构、任务和验收证据可以相互追溯",
@@ -179,9 +242,9 @@ def evaluate_handoffs(
             "weight": 20,
         },
         {
-            "name": "parallel_breadth",
+            "name": "specialist_breadth",
             "passed": len(expected_roles) >= 2,
-            "detail": f"{len(expected_roles)} independent specialist branches",
+            "detail": f"{len(expected_roles)} specialist branches across {len(build_execution_waves(plan))} execution waves",
             "weight": 20,
         },
     ]

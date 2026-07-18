@@ -36,9 +36,9 @@
 1. Requirement Agent
 2. Product Agent
 3. Architect Agent
-4. Planning Agent：生成经过结构校验的动态执行计划。
+4. Planning Agent：生成经过结构校验的动态执行 DAG。
 5. Plan Review：可选人工门禁，批准后才允许启动并行分支，或携带反馈退回 Planner 重做。
-6. Specialist Branches：根据已批准计划并行执行 2 至 4 个专业分支并生成结构化 Handoff。
+6. Specialist Branches：根据已批准 DAG 按拓扑波次执行 2 至 4 个专业分支，同波并行并生成结构化 Handoff。
 7. Quality Gate：合并确定性检查和测试 Agent 评审，最多触发一轮自动修订。
 8. Project Manager Agent
 9. Tester Agent
@@ -46,9 +46,11 @@
 
 工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时冻结各角色的 Prompt、模型、并发限制和 Prompt 版本；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
 
-规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，无效模型输出使用确定性默认计划。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本并选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并重新校验已保存快照；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志，防止恢复或客户端绕过门禁。专业分支通过 `asyncio.gather` 并行执行；质量门禁检查角色覆盖、交付内容、成功标准和并行广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，人工反馈只重跑指定分支。
+规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次，并选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并重新校验已保存快照；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志，防止恢复或客户端绕过门禁。
 
-除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、交接、质量分数和人工修订状态。计划事件 payload 只保留版本号、来源版本、分支数、轮次和反馈字符数，反馈正文不会进入事件或审计详情。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
+专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
+
+除通用 `NODE_STARTED/NODE_COMPLETED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、交接、质量分数和人工修订状态。计划和波次事件 payload 只保留版本号、来源版本、波次、角色、依赖角色、分支数、轮次和反馈字符数，Handoff 与反馈正文不会进入事件或审计详情。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
 
 ## 运行追踪与成本归属
 

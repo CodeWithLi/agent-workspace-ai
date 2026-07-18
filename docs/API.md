@@ -115,7 +115,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
 
-`POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。每次重规划都会追加带版本号、反馈和时间戳的不可变快照；批准或继续修订历史版本时，服务端重新校验对应快照。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点持久化快照，自动重试耗尽或取消后幂等退款。
+`POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。计划中的每个 assignment 可使用 `depends_on` 引用同一计划内的前置角色；服务端拒绝重复、自依赖、未知依赖和环，缺少该字段的旧计划按无依赖处理。同一拓扑波次内并行执行，后续波次接收直接上游 Handoff。每次重规划都会追加带版本号、反馈和时间戳的不可变快照；批准或继续修订历史版本时，服务端重新校验对应快照。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点持久化快照，自动重试耗尽或取消后幂等退款。
 
 追踪接口中，管理员可汇总和查看全平台工作流；普通成员只查看本人发起且当前仍有项目读取权限的工作流。指定无权访问的 `project_id`、跨租户运行或无权限的对比对象统一返回 `404`。基线对比要求两个不同运行属于同一项目且均已结束，否则返回 `400`。总运行数、状态、Token、成本和每日趋势使用完整数据库聚合；P95、Agent 分布、节点瓶颈和 SLO 健康度使用有上限的最近样本，截断时 `window.analysis_truncated=true`。异常检测使用同项目较旧运行的中位数绝对偏差（MAD）构造动态上界，并同时报告失败和静态 SLO 超限。追踪、健康和对比响应不返回 `state_json`、Prompt、人工反馈或产物正文，事件 payload 只公开角色、轮次、下一节点、质量分数等允许的运行元数据。
 

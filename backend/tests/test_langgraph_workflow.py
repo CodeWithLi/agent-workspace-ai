@@ -269,6 +269,122 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
 
 
 @pytest.mark.asyncio
+async def test_specialists_execute_dependency_waves_and_forward_upstream_handoffs(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="dependency-waves@example.com", name="Dependency Waves", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Dependency Waves", description="Dependency-aware orchestration", owner_id=user.id)
+    db.add(project)
+    db.commit()
+    active_roles: set[str] = set()
+    max_parallel = 0
+    specialist_contexts: dict[str, dict] = {}
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        nonlocal max_parallel
+        if "动态编排器" in system_prompt:
+            return json.dumps(
+                {
+                    "objective": "按依赖波次完成可追溯交付",
+                    "rationale": "知识证据先于测试，测试与运营结论共同约束通知策略",
+                    "assignments": [
+                        {
+                            "role": "test_engineer",
+                            "objective": "基于知识证据验证核心路径和边界场景",
+                            "deliverable": "测试与验收清单",
+                            "depends_on": ["knowledge_admin"],
+                        },
+                        {
+                            "role": "operations_analyst",
+                            "objective": "独立验证灰度、监控和故障恢复",
+                            "deliverable": "发布运行手册",
+                        },
+                        {
+                            "role": "knowledge_admin",
+                            "objective": "整理知识来源、证据和权限边界",
+                            "deliverable": "知识证据清单",
+                        },
+                        {
+                            "role": "notification_secretary",
+                            "objective": "依据验收和运营结论设计可靠触达",
+                            "deliverable": "通知触达方案",
+                            "depends_on": ["test_engineer", "operations_analyst"],
+                        },
+                    ],
+                    "success_criteria": ["所有依赖均可追溯", "所有交付均有可复现证据"],
+                },
+                ensure_ascii=False,
+            )
+        if "专业交接 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            specialist_contexts[role] = context
+            active_roles.add(role)
+            max_parallel = max(max_parallel, len(active_roles))
+            await asyncio.sleep(0.01)
+            active_roles.remove(role)
+            return (
+                f"{role} 已给出明确范围、关键决策、依赖关系、失败信号、监控指标、边界场景、"
+                "灰度策略、回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 96,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "依赖交接达到发布门禁。",
+                },
+                ensure_ascii=False,
+            )
+        if "报告生成器" in system_prompt:
+            return "# 最终报告\n\n依赖波次执行完成。"
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    workflow = await run_workspace_graph(
+        db,
+        project,
+        user.id,
+        "构建依赖感知的多 Agent 交付流程",
+        pause_before_report=True,
+    )
+    state = json.loads(workflow.state_json)
+
+    assert workflow.current_node == "report"
+    assert max_parallel == 2
+    assert specialist_contexts["knowledge_admin"]["upstream_handoffs"] == []
+    assert [item["role"] for item in specialist_contexts["test_engineer"]["upstream_handoffs"]] == [
+        "knowledge_admin"
+    ]
+    assert [item["role"] for item in specialist_contexts["notification_secretary"]["upstream_handoffs"]] == [
+        "test_engineer",
+        "operations_analyst",
+    ]
+    assert len(state["specialist_handoffs"]) == 4
+    wave_events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(
+                WorkflowEvent.workflow_id == workflow.id,
+                WorkflowEvent.event_type == "WAVE_STARTED",
+            )
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert [json.loads(event.payload_json)["roles"] for event in wave_events] == [
+        ["operations_analyst", "knowledge_admin"],
+        ["test_engineer"],
+        ["notification_secretary"],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_quality_gate_bounds_automatic_revision_then_accepts_human_direction(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,

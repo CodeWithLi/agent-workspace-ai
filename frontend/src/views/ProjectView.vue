@@ -141,7 +141,7 @@
           <div class="orchestration-tags">
             <el-tag type="info">v{{ displayedPlanVersion }}</el-tag>
             <el-tag v-if="executionPlanApprovalLabel" :type="executionPlanApprovalType">{{ executionPlanApprovalLabel }}</el-tag>
-            <el-tag type="primary">{{ executionPlan.assignments.length }} 个并行分支</el-tag>
+            <el-tag type="primary">{{ executionPlanTopologyLabel }}</el-tag>
           </div>
         </div>
         <div v-if="workflowPlanReview && selectedPlanRevision" class="plan-version-diff">
@@ -154,12 +154,27 @@
           <strong>本轮成功标准</strong>
           <ul><li v-for="criterion in executionPlan.success_criteria" :key="criterion">{{ criterion }}</li></ul>
         </div>
-        <div class="orchestration-branches">
-          <div v-for="assignment in executionPlan.assignments" :key="assignment.role" class="orchestration-branch-row">
-            <span class="branch-role">{{ specialistRoleLabel(assignment.role) }}</span>
-            <div><strong>{{ assignment.deliverable }}</strong><small>{{ assignment.objective }}</small></div>
-            <el-tag :type="handoffFor(assignment.role) ? 'success' : 'info'" size="small">{{ handoffFor(assignment.role) ? `已交接 · R${handoffFor(assignment.role)?.revision_round}` : '等待执行' }}</el-tag>
-          </div>
+        <div class="orchestration-waves">
+          <section v-for="wave in executionPlanWaves" :key="wave.number" class="orchestration-wave" :aria-label="`执行计划第 ${wave.number} 波`">
+            <div class="orchestration-wave-heading">
+              <strong>第 {{ wave.number }} 波</strong>
+              <span>{{ wave.assignments.length > 1 ? `${wave.assignments.length} 个 Agent 并行` : '单 Agent 执行' }}</span>
+            </div>
+            <div class="orchestration-branches">
+              <div v-for="assignment in wave.assignments" :key="assignment.role" class="orchestration-branch-row">
+                <span class="branch-role">{{ specialistRoleLabel(assignment.role) }}</span>
+                <div class="orchestration-branch-copy">
+                  <strong>{{ assignment.deliverable }}</strong>
+                  <small class="branch-objective">{{ assignment.objective }}</small>
+                  <small v-if="assignment.depends_on?.length" class="branch-dependencies">
+                    <span class="branch-dependency-label">依赖</span>
+                    <span class="branch-dependency-roles">{{ assignment.depends_on.map(specialistRoleLabel).join('、') }}</span>
+                  </small>
+                </div>
+                <el-tag :type="handoffFor(assignment.role) ? 'success' : 'info'" size="small">{{ handoffFor(assignment.role) ? `已交接 · R${handoffFor(assignment.role)?.revision_round}` : '等待执行' }}</el-tag>
+              </div>
+            </div>
+          </section>
         </div>
         <el-collapse v-if="specialistHandoffs.length" class="handoff-details">
           <el-collapse-item v-for="handoff in specialistHandoffs" :key="handoff.role" :name="handoff.role" :title="`${specialistRoleLabel(handoff.role)} Handoff · ${handoff.deliverable}`">
@@ -326,6 +341,7 @@ interface WorkflowAssignment {
   role: string
   objective: string
   deliverable: string
+  depends_on?: string[]
 }
 
 interface WorkflowExecutionPlan {
@@ -426,7 +442,7 @@ const workflowApprovalTitle = computed(() => {
 })
 const workflowApprovalDescription = computed(() => {
   if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
-  if (workflowPlanReview.value) return '核对角色、交付物和成功标准。批准后才会并行启动专业 Agent；需要调整时请填写具体意见。'
+  if (workflowPlanReview.value) return '核对角色、依赖、交付物和成功标准。批准后将按依赖波次启动专业 Agent；需要调整时请填写具体意见。'
   return workflowCurrentNode.value === 'quality_review'
     ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。'
     : '确认当前需求、架构、任务和测试产物后继续生成最终报告。'
@@ -514,7 +530,11 @@ const planVersionChanges = computed(() => {
   const updatedRoles = [...currentByRole.keys()].filter((role) => {
     const prior = previousByRole.get(role)
     const next = currentByRole.get(role)
-    return prior && next && (prior.objective !== next.objective || prior.deliverable !== next.deliverable)
+    return prior && next && (
+      prior.objective !== next.objective
+      || prior.deliverable !== next.deliverable
+      || JSON.stringify(prior.depends_on || []) !== JSON.stringify(next.depends_on || [])
+    )
   })
   if (updatedRoles.length) changes.push(`更新分支：${updatedRoles.map(specialistRoleLabel).join('、')}`)
   const addedCriteria = current.success_criteria.filter((criterion) => !previous.success_criteria.includes(criterion))
@@ -527,6 +547,29 @@ const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
   if (workflowPlanReview.value && selectedPlanRevision.value) return selectedPlanRevision.value.plan
   const plan = workflowState.value?.execution_plan
   return plan && Array.isArray(plan.assignments) ? plan as WorkflowExecutionPlan : null
+})
+const executionPlanWaves = computed(() => {
+  const plan = executionPlan.value
+  if (!plan) return []
+  let remaining = [...plan.assignments]
+  const resolved = new Set<string>()
+  const waves: Array<{ number: number; assignments: WorkflowAssignment[] }> = []
+  while (remaining.length) {
+    const assignments = remaining.filter((assignment) => (
+      (assignment.depends_on || []).every((role) => resolved.has(role))
+    ))
+    if (!assignments.length) return [{ number: 1, assignments: plan.assignments }]
+    waves.push({ number: waves.length + 1, assignments })
+    const waveRoles = new Set(assignments.map((assignment) => assignment.role))
+    assignments.forEach((assignment) => resolved.add(assignment.role))
+    remaining = remaining.filter((assignment) => !waveRoles.has(assignment.role))
+  }
+  return waves
+})
+const executionPlanTopologyLabel = computed(() => {
+  const branchCount = executionPlan.value?.assignments.length || 0
+  const waveCount = executionPlanWaves.value.length
+  return waveCount > 1 ? `${branchCount} 个分支 · ${waveCount} 波` : `${branchCount} 个并行分支`
 })
 const executionPlanApprovalLabel = computed(() => {
   if (!workflowState.value?.require_plan_approval) return ''
@@ -644,6 +687,8 @@ function workflowEventLabel(eventType: string) {
     PLAN_CREATED: '计划已生成',
     PLAN_APPROVED: '计划已批准',
     PLAN_REVISION_REQUESTED: '要求重新规划',
+    WAVE_STARTED: '执行波次已启动',
+    WAVE_COMPLETED: '执行波次已完成',
     BRANCH_STARTED: '分支已启动',
     BRANCH_COMPLETED: '分支已交接',
     QUALITY_GATE_PASSED: '质量门禁通过',
@@ -1340,8 +1385,36 @@ onBeforeUnmount(disposeWorkflowEventStream)
   line-height: 1.55;
 }
 
-.orchestration-branches {
+.orchestration-waves {
   border-top: 1px solid var(--color-border);
+}
+
+.orchestration-wave + .orchestration-wave {
+  border-top: 1px solid var(--color-border);
+}
+
+.orchestration-wave-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  padding: 7px 8px;
+  background: #f6f8fa;
+}
+
+.orchestration-wave-heading strong {
+  color: var(--color-primary);
+  font-size: 12px;
+}
+
+.orchestration-wave-heading span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.orchestration-branches {
+  min-width: 0;
 }
 
 .orchestration-branch-row {
@@ -1360,7 +1433,7 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-weight: 700;
 }
 
-.orchestration-branch-row > div {
+.orchestration-branch-copy {
   display: grid;
   min-width: 0;
   gap: 3px;
@@ -1370,12 +1443,24 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-size: 13px;
 }
 
-.orchestration-branch-row small {
-  overflow: hidden;
+.branch-objective,
+.branch-dependencies {
   color: var(--color-muted-text);
   font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.branch-dependencies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  color: var(--color-secondary-text);
+}
+
+.branch-dependency-label {
+  color: var(--color-muted-text);
+  font-weight: 600;
 }
 
 .handoff-details {
@@ -1565,8 +1650,8 @@ onBeforeUnmount(disposeWorkflowEventStream)
     grid-column: 1 / -1;
   }
 
-  .orchestration-branch-row small {
-    white-space: normal;
+  .orchestration-wave-heading {
+    align-items: flex-start;
   }
 }
 </style>

@@ -15,8 +15,10 @@ from app.agent.concurrency import acquire_agent_slot
 from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
+    build_execution_waves,
     build_task_blueprints,
     evaluate_handoffs,
+    expand_revision_roles,
     merge_reviewer_decision,
     parse_execution_plan,
 )
@@ -364,8 +366,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             (
                 "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
                 "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
-                "role、objective、deliverable。role 仅允许 test_engineer、operations_analyst、"
+                "role、objective、deliverable、depends_on。depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
+                "role 仅允许 test_engineer、operations_analyst、"
                 "knowledge_admin、notification_secretary。"
+                "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
                 "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
             ),
             json.dumps(
@@ -397,6 +401,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             default=0,
         ) + 1
         plan_snapshot = plan.model_dump(mode="json")
+        execution_waves = build_execution_waves(plan)
         plan_revisions = [
             *revisions,
             {
@@ -418,6 +423,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "revision_count": int(state.get("plan_revision_count", 0)),
                 "approval_required": approval_required,
                 "plan_version": plan_version,
+                "wave_count": len(execution_waves),
+                "dependency_count": sum(len(assignment.depends_on) for assignment in plan.assignments),
             },
         )
         return complete_node(db, workflow, "planning", state, {
@@ -438,6 +445,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             raise RuntimeError("Execution plan must be approved before specialist branches start")
         begin_node(db, workflow, "specialists", expected_lease_token)
         plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
+        execution_waves = build_execution_waves(plan)
         previous_handoffs = {
             handoff.role: handoff
             for handoff in (
@@ -447,30 +455,32 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         }
         quality_gate = state.get("quality_gate", {})
         requested_roles = set(quality_gate.get("revision_roles") or [])
-        assignments = [
-            assignment
-            for assignment in plan.assignments
-            if not requested_roles or assignment.role in requested_roles
-        ]
+        execution_roles = (
+            expand_revision_roles(plan, requested_roles)
+            if requested_roles
+            else {assignment.role for assignment in plan.assignments}
+        )
         revision_round = int(state.get("revision_round", 0))
         revision_feedback = state.get("revision_feedback", "")
-        for assignment in assignments:
-            record_workflow_event(
-                db,
-                workflow,
-                "BRANCH_STARTED",
-                f"Started specialist branch {assignment.role}",
-                node="specialists",
-                payload={
-                    "role": assignment.role,
-                    "deliverable": assignment.deliverable,
-                    "revision_round": revision_round,
-                },
-            )
-        db.commit()
+        working_handoffs = dict(previous_handoffs)
+        completed_waves: list[tuple[int, list[AgentHandoff]]] = []
 
         async def run_assignment(assignment) -> AgentHandoff:
             previous = previous_handoffs.get(assignment.role)
+            missing_dependencies = [role for role in assignment.depends_on if role not in working_handoffs]
+            if missing_dependencies:
+                raise RuntimeError(
+                    f"Missing upstream handoffs for {assignment.role}: {', '.join(missing_dependencies)}"
+                )
+            upstream_handoffs = [
+                {
+                    "role": working_handoffs[role].role,
+                    "deliverable": working_handoffs[role].deliverable,
+                    "content": working_handoffs[role].content[:12000],
+                    "revision_round": working_handoffs[role].revision_round,
+                }
+                for role in assignment.depends_on
+            ]
             content = await invoke_agent(
                 AgentRole(assignment.role),
                 (
@@ -484,6 +494,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "success_criteria": plan.success_criteria,
                         "requirements": without_analysis(state["requirements"]),
                         "architecture": state["architecture"],
+                        "upstream_handoffs": upstream_handoffs,
                         "revision_feedback": revision_feedback,
                         "previous_handoff": previous.content if previous else "",
                     }),
@@ -499,27 +510,83 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 revision_round=revision_round,
             )
 
-        generated = await asyncio.gather(*(run_assignment(assignment) for assignment in assignments))
-        generated_by_role = {handoff.role: handoff for handoff in generated}
-        merged_handoffs = [
-            generated_by_role.get(assignment.role)
-            or previous_handoffs[assignment.role]
-            for assignment in plan.assignments
-        ]
-        messages = list(state.get("messages", []))
-        for handoff in generated:
-            messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
+        for wave_number, wave in enumerate(execution_waves, start=1):
+            assignments = [assignment for assignment in wave if assignment.role in execution_roles]
+            if not assignments:
+                continue
+            roles = [assignment.role for assignment in assignments]
             record_workflow_event(
                 db,
                 workflow,
-                "BRANCH_COMPLETED",
-                f"Completed specialist branch {handoff.role}",
+                "WAVE_STARTED",
+                f"Started specialist execution wave {wave_number}",
                 node="specialists",
                 payload={
-                    "role": handoff.role,
-                    "deliverable": handoff.deliverable,
-                    "revision_round": handoff.revision_round,
-                    "output_chars": len(handoff.content),
+                    "wave": wave_number,
+                    "roles": roles,
+                    "branch_count": len(assignments),
+                    "dependency_count": sum(len(assignment.depends_on) for assignment in assignments),
+                    "revision_round": revision_round,
+                },
+            )
+            for assignment in assignments:
+                record_workflow_event(
+                    db,
+                    workflow,
+                    "BRANCH_STARTED",
+                    f"Started specialist branch {assignment.role}",
+                    node="specialists",
+                    payload={
+                        "role": assignment.role,
+                        "deliverable": assignment.deliverable,
+                        "depends_on": assignment.depends_on,
+                        "dependency_count": len(assignment.depends_on),
+                        "wave": wave_number,
+                        "revision_round": revision_round,
+                    },
+                )
+            db.commit()
+            wave_handoffs = await asyncio.gather(*(run_assignment(assignment) for assignment in assignments))
+            completed_waves.append((wave_number, wave_handoffs))
+            working_handoffs.update({handoff.role: handoff for handoff in wave_handoffs})
+
+        merged_handoffs = [
+            working_handoffs[assignment.role]
+            for assignment in plan.assignments
+        ]
+        messages = list(state.get("messages", []))
+        assignments_by_role = {assignment.role: assignment for assignment in plan.assignments}
+        for wave_number, wave_handoffs in completed_waves:
+            for handoff in wave_handoffs:
+                assignment = assignments_by_role[handoff.role]
+                messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
+                record_workflow_event(
+                    db,
+                    workflow,
+                    "BRANCH_COMPLETED",
+                    f"Completed specialist branch {handoff.role}",
+                    node="specialists",
+                    payload={
+                        "role": handoff.role,
+                        "deliverable": handoff.deliverable,
+                        "depends_on": assignment.depends_on,
+                        "dependency_count": len(assignment.depends_on),
+                        "wave": wave_number,
+                        "revision_round": handoff.revision_round,
+                        "output_chars": len(handoff.content),
+                    },
+                )
+            record_workflow_event(
+                db,
+                workflow,
+                "WAVE_COMPLETED",
+                f"Completed specialist execution wave {wave_number}",
+                node="specialists",
+                payload={
+                    "wave": wave_number,
+                    "roles": [handoff.role for handoff in wave_handoffs],
+                    "branch_count": len(wave_handoffs),
+                    "revision_round": revision_round,
                 },
             )
         return complete_node(db, workflow, "specialists", state, {
