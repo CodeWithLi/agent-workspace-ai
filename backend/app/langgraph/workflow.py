@@ -63,6 +63,8 @@ class ProjectState(TypedDict, total=False):
     plan_revision_count: int
     plan_revision_feedback: str
     specialist_handoffs: list[dict[str, Any]]
+    specialist_failures: list[dict[str, Any]]
+    specialist_recovery_count: int
     quality_gate: dict[str, Any]
     revision_round: int
     revision_feedback: str
@@ -119,6 +121,8 @@ def initial_state(
         "plan_revision_count": 0,
         "plan_revision_feedback": "",
         "specialist_handoffs": [],
+        "specialist_failures": [],
+        "specialist_recovery_count": 0,
         "quality_gate": {},
         "revision_round": 0,
         "revision_feedback": "",
@@ -134,6 +138,69 @@ def initial_state(
 
 def append_message(state: WorkspaceGraphState, role: str, content: str) -> list[dict[str, str]]:
     return [*state.get("messages", []), {"role": role, "content": content}]
+
+
+def specialist_failure_roles(state: dict[str, Any]) -> list[str]:
+    assignments = state.get("execution_plan", {}).get("assignments", [])
+    assigned_roles = {
+        assignment.get("role")
+        for assignment in assignments
+        if isinstance(assignment, dict) and isinstance(assignment.get("role"), str)
+    }
+    failures = state.get("specialist_failures")
+    if not isinstance(failures, list):
+        return []
+    return list(
+        dict.fromkeys(
+            failure.get("role")
+            for failure in failures
+            if isinstance(failure, dict) and failure.get("role") in assigned_roles
+        )
+    )
+
+
+def prepare_specialist_retry(state: dict[str, Any], instruction: str) -> tuple[list[str], int]:
+    feedback = instruction.strip()
+    if not feedback:
+        raise ValueError("Recovery instruction is required for specialist retry")
+    roles = specialist_failure_roles(state)
+    if not roles:
+        raise ValueError("Workflow has no failed specialist branches to retry")
+    recovery_count = int(state.get("specialist_recovery_count", 0)) + 1
+    state["revision_feedback"] = feedback
+    state["specialist_failures"] = []
+    state["specialist_recovery_count"] = recovery_count
+    return roles, recovery_count
+
+
+def prepare_specialist_replan(state: dict[str, Any], instruction: str) -> tuple[list[str], int]:
+    feedback = instruction.strip()
+    if not feedback:
+        raise ValueError("Recovery instruction is required for specialist replanning")
+    roles = specialist_failure_roles(state)
+    if not roles:
+        raise ValueError("Workflow has no failed specialist branches to replan")
+    revision_count = int(state.get("plan_revision_count", 0)) + 1
+    state["require_plan_approval"] = True
+    state["plan_approved"] = False
+    state["plan_revision_feedback"] = feedback
+    state["plan_revision_count"] = revision_count
+    state["specialist_handoffs"] = []
+    state["specialist_failures"] = []
+    state["quality_gate"] = {}
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        state["messages"] = [
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and not str(message.get("role", "")).startswith("specialist_")
+            and message.get("role") != "quality_gate_agent"
+        ]
+    state["revision_round"] = 0
+    state["revision_feedback"] = ""
+    state["manual_revision_count"] = 0
+    return roles, revision_count
 
 
 def select_execution_plan_version(
@@ -767,8 +834,54 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     expected_lease_token,
                 )
                 if failures and not retrying_failures:
-                    failure = failures[0][1]
-                    raise RuntimeError(str(failure)) from failure
+                    specialist_failures = [
+                        {
+                            "role": assignment.role,
+                            "wave": wave_number,
+                            "branch_attempt": branch_attempt,
+                            "retryable": failure_retryability[assignment.role],
+                            "category": (
+                                "RETRY_EXHAUSTED"
+                                if failure_retryability[assignment.role]
+                                and branch_attempt >= branch_max_attempts
+                                else "RETRY_AVAILABLE"
+                                if failure_retryability[assignment.role]
+                                else "NON_RETRYABLE"
+                            ),
+                            "message": str(failure)[:500],
+                        }
+                        for assignment, failure in failures
+                    ]
+                    record_workflow_event(
+                        db,
+                        workflow,
+                        "SPECIALIST_REVIEW_REQUIRED",
+                        "Specialist branch failures require operator recovery",
+                        node="specialists",
+                        payload={
+                            "wave": wave_number,
+                            "roles": [failure["role"] for failure in specialist_failures],
+                            "failed_count": len(specialist_failures),
+                            "retryable_count": sum(
+                                bool(failure["retryable"])
+                                for failure in specialist_failures
+                            ),
+                            "branch_attempt": branch_attempt,
+                            "workflow_attempt": workflow_attempt,
+                        },
+                    )
+                    return complete_node(
+                        db,
+                        workflow,
+                        "specialists",
+                        state,
+                        {
+                            **checkpoint_output,
+                            "specialist_failures": specialist_failures,
+                            "current_node": "specialist_review",
+                        },
+                        expected_lease_token,
+                    )
                 if not retrying_failures:
                     break
                 await asyncio.sleep(retry_delay)
@@ -789,6 +902,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         ]
         return complete_node(db, workflow, "specialists", state, {
             "specialist_handoffs": [handoff.model_dump(mode="json") for handoff in merged_handoffs],
+            "specialist_failures": [],
             "messages": messages,
             "revision_feedback": "",
             "current_node": "quality_gate",
@@ -979,6 +1093,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     def after_planning(state: WorkspaceGraphState) -> Literal["continue", "pause"]:
         return "continue" if state.get("current_node") == "specialists" else "pause"
 
+    def after_specialists(state: WorkspaceGraphState) -> Literal["continue", "pause"]:
+        return "continue" if state.get("current_node") == "quality_gate" else "pause"
+
     def after_quality_gate(state: WorkspaceGraphState) -> Literal["revise", "continue", "pause"]:
         current_node = state.get("current_node")
         if current_node == "specialists":
@@ -1009,6 +1126,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "planning": "planning",
             "plan_review": END,
             "specialists": "specialists",
+            "specialist_review": END,
             "quality_gate": "quality_gate",
             "project_manager": "project_manager",
             "tester": "tester",
@@ -1024,7 +1142,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         after_planning,
         {"continue": "specialists", "pause": END},
     )
-    builder.add_edge("specialists", "quality_gate")
+    builder.add_conditional_edges(
+        "specialists",
+        after_specialists,
+        {"continue": "quality_gate", "pause": END},
+    )
     builder.add_conditional_edges(
         "quality_gate",
         after_quality_gate,
@@ -1077,11 +1199,12 @@ async def continue_workspace_graph(
     db: Session,
     workflow: WorkflowRun,
     human_feedback: str = "",
-    decision: Literal["APPROVE", "REVISE"] | None = None,
+    decision: Literal["APPROVE", "REVISE", "RETRY", "REPLAN"] | None = None,
     plan_version: int | None = None,
 ) -> WorkflowRun:
     if workflow.status != WorkflowStatus.paused or workflow.current_node not in {
         "plan_review",
+        "specialist_review",
         "quality_review",
         "report",
     }:
@@ -1133,6 +1256,38 @@ async def continue_workspace_graph(
         else:
             raise ValueError("Plan review decision must be APPROVE or REVISE")
         workflow.state_json = json.dumps(persisted, ensure_ascii=False)
+    elif gate == "specialist_review":
+        feedback = human_feedback.strip()
+        if decision == "RETRY":
+            roles, recovery_count = prepare_specialist_retry(persisted, feedback)
+            workflow.current_node = "specialists"
+            record_workflow_event(
+                db,
+                workflow,
+                "SPECIALIST_RETRY_REQUESTED",
+                "Operator requested targeted specialist recovery",
+                node="specialist_review",
+                payload={"roles": roles, "recovery_count": recovery_count},
+            )
+        elif decision == "REPLAN":
+            roles, revision_count = prepare_specialist_replan(persisted, feedback)
+            workflow.current_node = "planning"
+            record_workflow_event(
+                db,
+                workflow,
+                "SPECIALIST_REPLAN_REQUESTED",
+                "Operator returned failed specialist work to planning",
+                node="specialist_review",
+                payload={
+                    "roles": roles,
+                    "revision_count": revision_count,
+                    "source_plan_version": int(persisted.get("plan_version", 0)),
+                },
+            )
+        else:
+            raise ValueError("Specialist review decision must be RETRY or REPLAN")
+        workflow.state_json = json.dumps(persisted, ensure_ascii=False)
+        pause_before_report = True
     elif gate == "quality_review":
         persisted["revision_feedback"] = human_feedback.strip() or "请根据质量门禁问题补充证据并修订专业交接。"
         persisted["manual_revision_count"] = int(persisted.get("manual_revision_count", 0)) + 1
@@ -1153,7 +1308,11 @@ async def continue_workspace_graph(
         workflow,
         "CONTINUED",
         "Workflow continued after human review",
-        payload={"approval_gate": gate, "plan_version": reviewed_plan_version},
+        payload={
+            "approval_gate": gate,
+            "decision": decision,
+            "plan_version": reviewed_plan_version,
+        },
     )
     db.commit()
     return await execute_workspace_graph(db, workflow, pause_before_report=pause_before_report)
@@ -1212,6 +1371,24 @@ async def execute_workspace_graph(db: Session, workflow: WorkflowRun, pause_befo
             "PAUSED",
             "Workflow is waiting for quality revision direction",
             payload={"approval_gate": "quality_review"},
+        )
+    elif workflow.current_node == "specialist_review":
+        workflow.status = WorkflowStatus.paused
+        failures = result.get("specialist_failures", [])
+        record_workflow_event(
+            db,
+            workflow,
+            "PAUSED",
+            "Workflow is waiting for specialist branch recovery",
+            payload={
+                "approval_gate": "specialist_review",
+                "roles": [
+                    failure.get("role")
+                    for failure in failures
+                    if isinstance(failure, dict) and isinstance(failure.get("role"), str)
+                ],
+                "failed_count": len(failures),
+            },
         )
     elif workflow.current_node == "report" and pause_before_report:
         workflow.status = WorkflowStatus.paused

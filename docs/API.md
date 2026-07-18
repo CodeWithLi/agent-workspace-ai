@@ -88,7 +88,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 - `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限，错误、Prompt、Handoff 与人工反馈正文不会进入流。
 - `GET /workflow/{workflow_id}/saga-steps`：查看写工具执行快照、状态、补偿次数和人工介入原因。
 - `POST /workflow/{workflow_id}/pause`：使用唯一 `request_id` 和暂停原因请求安全暂停。排队运行立即进入 `PAUSED`；专业分支运行在当前拓扑波次检查点提交后暂停，其他节点在节点提交后暂停，相同请求幂等返回。
-- `POST /workflow/continue`：恢复计划审批、质量门禁、报告确认或操作员暂停。`plan_review` 必须提交 `decision=APPROVE|REVISE`，可用 `plan_version` 指定服务端保存的历史计划；`REVISE` 还必须附带 `human_feedback`，并以所选版本为基线从 Planner 重新执行。客户端不能提交或覆盖计划快照。操作员暂停必须提供恢复指令，该指令会持久化到结构化运行上下文并传递给后续 Agent。
+- `POST /workflow/continue`：恢复计划审批、失败分支、质量门禁、报告确认或操作员暂停。`plan_review` 接受 `APPROVE|REVISE` 和可选 `plan_version`；`specialist_review` 只接受带 `human_feedback` 的 `RETRY|REPLAN`，前者保留成功 Handoff 并定向继续失败分支及下游，后者清空旧分支产物、返回 Planner 并强制新版本重新审批。不同门禁的决策类型不可混用。客户端不能提交或覆盖计划快照；操作员暂停必须提供恢复指令，该指令会持久化到结构化运行上下文并传递给后续 Agent。
 - `POST /workflow/{workflow_id}/cancel`
 - `POST /workflow/{workflow_id}/retry`：仅接受 `FAILED` 源运行和唯一 `request_id`；源运行保持只读，接口独立扣费并从失败检查点创建新的 `QUEUED` 子运行。相同源运行与 `request_id` 返回同一子运行，项目存在其他活动运行时返回 `409`。
 - `POST /workflow/{workflow_id}/retry-compensation`：仅用于 `COMPENSATION_FAILED`，人工核对业务数据后重试确定性补偿。
@@ -115,7 +115,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
 
-`POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。计划中的每个 assignment 可使用 `depends_on` 引用同一计划内的前置角色；服务端拒绝重复、自依赖、未知依赖和环，缺少该字段的旧计划按无依赖处理。同一拓扑波次内并行执行，后续波次接收直接上游 Handoff。每个尝试批次都会原子提交已成功 Handoff 和消息；`LLMRetryableError`（网络/超时、408/409/429、5xx 或畸形成功响应）、Agent 并发饱和和超时只重试失败角色，认证、请求配置、业务和依赖错误不执行局部重试。事件使用 `workflow_attempt` 区分 worker 尝试、使用 `branch_attempt` 区分同一 worker 内的局部尝试，并以 `BRANCH_RETRY_SCHEDULED` 公开脱敏退避元数据。创建运行时将当前局部重试参数冻结到 `branch_retry_policy`，后续运行时热更新只影响新运行，人工 retry 子运行继承源策略。每次重规划都会追加带版本号、反馈和时间戳的不可变快照；批准或继续修订历史版本时，服务端重新校验对应快照。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点和专业波次持久化快照，自动重试耗尽或取消后幂等退款。
+`POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。计划中的每个 assignment 可使用 `depends_on` 引用同一计划内的前置角色；服务端拒绝重复、自依赖、未知依赖和环，缺少该字段的旧计划按无依赖处理。同一拓扑波次内并行执行，后续波次接收直接上游 Handoff。每个尝试批次都会原子提交已成功 Handoff 和消息；`LLMRetryableError`（网络/超时、408/409/429、5xx 或畸形成功响应）、Agent 并发饱和和超时只重试失败角色。确定性错误或局部重试耗尽会提交当前成功 Handoff 后进入 `specialist_review`，不会让整个 worker 失败；事件使用 `workflow_attempt` 区分 worker 尝试、使用 `branch_attempt` 区分局部尝试，并公开脱敏的退避与恢复元数据。创建运行时冻结局部重试参数；每次重规划追加不可变快照，失败分支触发的重规划必须重新审批。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点和专业波次持久化快照，取消或真正的终态失败才进入补偿与幂等退款。
 
 追踪接口中，管理员可汇总和查看全平台工作流；普通成员只查看本人发起且当前仍有项目读取权限的工作流。指定无权访问的 `project_id`、跨租户运行或无权限的对比对象统一返回 `404`。基线对比要求两个不同运行属于同一项目且均已结束，否则返回 `400`。总运行数、状态、Token、成本和每日趋势使用完整数据库聚合；P95、Agent 分布、节点瓶颈和 SLO 健康度使用有上限的最近样本，截断时 `window.analysis_truncated=true`。异常检测使用同项目较旧运行的中位数绝对偏差（MAD）构造动态上界，并同时报告失败和静态 SLO 超限。追踪、健康和对比响应不返回 `state_json`、Prompt、人工反馈或产物正文，事件 payload 只公开角色、轮次、下一节点、质量分数等允许的运行元数据。
 

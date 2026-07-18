@@ -448,7 +448,7 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
 
 
 @pytest.mark.asyncio
-async def test_specialist_wave_checkpoint_survives_retry_without_repeating_completed_agents(
+async def test_specialist_wave_checkpoint_survives_operator_recovery_without_repeating_agents(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -540,8 +540,8 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
 
     first_attempt = await process_workflow(db, workflow.id)
     first_state = json.loads(first_attempt.state_json)
-    assert first_attempt.status == WorkflowStatus.queued
-    assert first_attempt.current_node == "specialists"
+    assert first_attempt.status == WorkflowStatus.paused
+    assert first_attempt.current_node == "specialist_review"
     assert {item["role"] for item in first_state["specialist_handoffs"]} == {
         "operations_analyst",
         "knowledge_admin",
@@ -551,8 +551,14 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
         "knowledge_admin": 1,
         "test_engineer": 1,
     }
+    assert [item["role"] for item in first_state["specialist_failures"]] == ["test_engineer"]
 
-    completed = await process_workflow(db, workflow.id)
+    completed = await continue_workspace_graph(
+        db,
+        first_attempt,
+        "测试环境已修复，请从失败分支检查点继续。",
+        decision="RETRY",
+    )
     completed_state = json.loads(completed.state_json)
     assert completed.status == WorkflowStatus.paused
     assert completed.current_node == "report"
@@ -574,6 +580,8 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
     assert event_types.count("WAVE_CHECKPOINTED") == 1
     assert event_types.count("BRANCH_FAILED") == 1
     assert event_types.count("BRANCH_RETRY_SCHEDULED") == 0
+    assert event_types.count("SPECIALIST_REVIEW_REQUIRED") == 1
+    assert event_types.count("SPECIALIST_RETRY_REQUESTED") == 1
     node_events = list(
         db.scalars(
             select(WorkflowEvent)
@@ -587,7 +595,7 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
     )
     assert [event.event_type for event in node_events] == [
         "NODE_STARTED",
-        "NODE_FAILED",
+        "NODE_COMPLETED",
         "NODE_STARTED",
         "NODE_COMPLETED",
     ]
@@ -702,6 +710,100 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
     assert retry_payload["branch_attempt"] == 1
     assert retry_payload["next_branch_attempt"] == 2
     assert retry_payload["retry_delay_seconds"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_deterministic_branch_failure_pauses_for_targeted_operator_recovery(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ensure_default_agents(db)
+    user = User(email="branch-review@example.com", name="Branch Review", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Branch Review", description="Recover one specialist", owner_id=user.id)
+    db.add(project)
+    db.commit()
+    specialist_calls: dict[str, int] = {}
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "动态编排器" in system_prompt:
+            return "invalid JSON uses the validated fallback plan"
+        if "专业交接 Agent" in system_prompt:
+            role = json.loads(user_prompt)["assignment"]["role"]
+            specialist_calls[role] = specialist_calls.get(role, 0) + 1
+            if role == "test_engineer" and specialist_calls[role] == 1:
+                raise ValueError("测试环境配置缺少验收凭据")
+            return (
+                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
+                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
+                "所有结论均与用户目标和成功标准建立可追溯关系。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 95,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "质量门禁通过",
+                },
+                ensure_ascii=False,
+            )
+        if "报告生成器" in system_prompt:
+            return "# 最终报告\n\n失败分支已定向恢复，成功分支未重复执行。"
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    class FakeLease:
+        async def release(self) -> None:
+            return None
+
+    async def fake_slot(*_args):
+        return FakeLease()
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+    monkeypatch.setattr("app.langgraph.workflow.acquire_agent_slot", fake_slot)
+
+    workflow = await run_workspace_graph(
+        db,
+        project,
+        user.id,
+        "设计可恢复的企业协作流程",
+        pause_before_report=True,
+    )
+    failed_state = json.loads(workflow.state_json)
+
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "specialist_review"
+    assert [item["role"] for item in failed_state["specialist_failures"]] == ["test_engineer"]
+    assert {item["role"] for item in failed_state["specialist_handoffs"]} == {"operations_analyst"}
+    assert specialist_calls == {"test_engineer": 1, "operations_analyst": 1}
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
+
+    workflow = await continue_workspace_graph(
+        db,
+        workflow,
+        "测试凭据已补齐，请仅恢复失败分支。",
+        decision="RETRY",
+    )
+    recovered_state = json.loads(workflow.state_json)
+
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "report"
+    assert recovered_state["specialist_failures"] == []
+    assert recovered_state["specialist_recovery_count"] == 1
+    assert recovered_state["quality_gate"]["passed"] is True
+    assert specialist_calls == {"test_engineer": 2, "operations_analyst": 1}
+    event_types = list(
+        db.scalars(
+            select(WorkflowEvent.event_type)
+            .where(WorkflowEvent.workflow_id == workflow.id)
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert event_types.count("SPECIALIST_REVIEW_REQUIRED") == 1
+    assert event_types.count("SPECIALIST_RETRY_REQUESTED") == 1
+    assert "WAVE_RESTORED" in event_types
 
 
 @pytest.mark.asyncio

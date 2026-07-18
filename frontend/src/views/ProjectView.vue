@@ -273,11 +273,24 @@
           <time>{{ new Date(event.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</time>
         </div>
       </div>
-      <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate" :class="{ 'plan-review': workflowPlanReview }">
+      <section v-if="workflowStatus === 'PAUSED'" class="workflow-approval-gate" :class="{ 'plan-review': workflowPlanReview, 'specialist-review': workflowSpecialistReview }">
         <div>
           <strong>{{ workflowApprovalTitle }}</strong>
           <p>{{ workflowApprovalDescription }}</p>
           <small v-if="workflowOperatorPaused" class="workflow-pause-reason">暂停原因：{{ workflowPauseReason }}</small>
+          <section v-if="workflowSpecialistReview" class="workflow-specialist-failures" aria-label="失败分支恢复详情">
+            <ul>
+              <li v-for="failure in specialistFailures" :key="failure.role">
+                <el-icon aria-hidden="true"><CircleClose /></el-icon>
+                <div>
+                  <strong>{{ specialistRoleLabel(failure.role) }}</strong>
+                  <span class="specialist-failure-category">{{ specialistFailureCategoryLabel(failure.category) }}</span>
+                  <small>第 {{ failure.wave }} 波 · A{{ failure.branch_attempt }}</small>
+                  <p>{{ failure.message }}</p>
+                </div>
+              </li>
+            </ul>
+          </section>
         </div>
         <el-input
           v-model="workflowFeedback"
@@ -286,8 +299,23 @@
           :placeholder="workflowFeedbackPlaceholder"
           aria-label="工作流人工反馈"
         />
+        <div v-if="workflowSpecialistReview" class="workflow-approval-actions workflow-recovery-actions">
+          <el-button
+            :icon="MagicStick"
+            :loading="workflowActionBusy"
+            :disabled="!workflowFeedback.trim() || !specialistFailures.length"
+            @click="continueWorkflow('REPLAN')"
+          >返回 Planner 重新规划</el-button>
+          <el-button
+            type="primary"
+            :icon="RefreshRight"
+            :loading="workflowActionBusy"
+            :disabled="!workflowFeedback.trim() || !specialistFailures.length"
+            @click="continueWorkflow('RETRY')"
+          >仅重试 {{ specialistFailures.length }} 个失败分支</el-button>
+        </div>
         <el-button
-          v-if="!workflowPlanReview"
+          v-else-if="!workflowPlanReview"
           type="warning"
           :loading="workflowActionBusy"
           :disabled="workflowFeedbackRequired && !workflowFeedback.trim()"
@@ -470,6 +498,15 @@ interface WorkflowCollaborationQuestion {
   blocking: boolean
 }
 
+interface WorkflowSpecialistFailure {
+  role: string
+  wave: number
+  branch_attempt: number
+  retryable: boolean
+  category: 'NON_RETRYABLE' | 'RETRY_EXHAUSTED' | 'RETRY_AVAILABLE'
+  message: string
+}
+
 interface WorkflowQualityGate {
   score: number
   passed: boolean
@@ -553,15 +590,26 @@ const workflowPlanReview = computed(() => (
   && workflowCurrentNode.value === 'plan_review'
   && !workflowOperatorPaused.value
 ))
-const workflowFeedbackRequired = computed(() => workflowOperatorPaused.value || workflowCurrentNode.value === 'quality_review')
+const workflowSpecialistReview = computed(() => (
+  workflowStatus.value === 'PAUSED'
+  && workflowCurrentNode.value === 'specialist_review'
+  && !workflowOperatorPaused.value
+))
+const workflowFeedbackRequired = computed(() => (
+  workflowOperatorPaused.value
+  || workflowCurrentNode.value === 'quality_review'
+  || workflowSpecialistReview.value
+))
 const workflowApprovalTitle = computed(() => {
   if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
   if (workflowPlanReview.value) return `执行计划 v${displayedPlanVersion.value} 等待批准`
+  if (workflowSpecialistReview.value) return '专业分支等待人工恢复'
   return workflowCurrentNode.value === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认'
 })
 const workflowApprovalDescription = computed(() => {
   if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
   if (workflowPlanReview.value) return '核对角色、依赖、交付物和成功标准。批准后将按依赖波次启动专业 Agent；需要调整时请填写具体意见。'
+  if (workflowSpecialistReview.value) return '定向重试会保留成功交接并继续失败分支及其下游；重新规划会丢弃旧分支产物并生成新的计划版本。'
   return workflowCurrentNode.value === 'quality_review'
     ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。'
     : '确认当前需求、架构、任务和测试产物后继续生成最终报告。'
@@ -569,6 +617,7 @@ const workflowApprovalDescription = computed(() => {
 const workflowFeedbackPlaceholder = computed(() => {
   if (workflowOperatorPaused.value) return '输入恢复指令，后续 Agent 将基于该约束继续执行'
   if (workflowPlanReview.value) return '需要重新规划时，说明缺失角色、目标、交付物或成功标准'
+  if (workflowSpecialistReview.value) return '说明环境、权限、依赖或验收条件如何修复；该指令会注入恢复后的 Agent'
   return workflowCurrentNode.value === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'
 })
 const workflowContinueLabel = computed(() => {
@@ -704,6 +753,10 @@ const specialistHandoffs = computed<WorkflowHandoff[]>(() => {
   const handoffs = workflowState.value?.specialist_handoffs
   return Array.isArray(handoffs) ? handoffs as WorkflowHandoff[] : []
 })
+const specialistFailures = computed<WorkflowSpecialistFailure[]>(() => {
+  const failures = workflowState.value?.specialist_failures
+  return Array.isArray(failures) ? failures as WorkflowSpecialistFailure[] : []
+})
 const branchRuntimeByRole = computed(() => {
   const states = new Map<string, BranchRuntimeState>()
   for (const assignment of executionPlan.value?.assignments || []) {
@@ -823,7 +876,7 @@ const workflowCompletedStages = computed(() => {
     completed += 1
     if (!workflowState.value?.require_plan_approval || workflowState.value?.plan_approved) completed += 1
   }
-  if (specialistHandoffs.value.length) completed += 1
+  if (specialistHandoffs.value.length && !specialistFailures.value.length) completed += 1
   if (qualityGate.value?.passed) completed += 1
   return completed
 })
@@ -832,6 +885,7 @@ const workflowStatusLabel = computed(() => {
   if (workflowStatus.value === 'PAUSED') {
     if (workflowOperatorPaused.value) return '人工干预中'
     if (workflowCurrentNode.value === 'plan_review') return '等待计划审批'
+    if (workflowCurrentNode.value === 'specialist_review') return '等待分支恢复'
     return workflowCurrentNode.value === 'quality_review' ? '等待质量修订' : '等待报告确认'
   }
   return ({
@@ -876,6 +930,7 @@ function workflowStageLabel(node: string) {
     planning: '动态规划',
     plan_review: '计划审批',
     specialists: '专业分支',
+    specialist_review: '分支恢复',
     quality_gate: '质量门禁',
     quality_review: '人工修订',
     project_manager: '项目计划',
@@ -904,6 +959,9 @@ function workflowEventLabel(eventType: string) {
     BRANCH_COMPLETED: '分支已交接',
     BRANCH_FAILED: '分支执行失败',
     BRANCH_RETRY_SCHEDULED: '分支准备重试',
+    SPECIALIST_REVIEW_REQUIRED: '分支等待恢复',
+    SPECIALIST_RETRY_REQUESTED: '定向恢复分支',
+    SPECIALIST_REPLAN_REQUESTED: '失败分支退回规划',
     QUALITY_GATE_PASSED: '质量门禁通过',
     QUALITY_GATE_FAILED: '质量门禁未通过',
     REVISION_REQUESTED: '请求自动修订',
@@ -934,6 +992,14 @@ function specialistRoleLabel(role: string) {
     knowledge_admin: '知识库管理员',
     notification_secretary: '通知秘书'
   }[role] || role
+}
+
+function specialistFailureCategoryLabel(category: WorkflowSpecialistFailure['category']) {
+  return {
+    NON_RETRYABLE: '不可自动重试',
+    RETRY_EXHAUSTED: '自动重试已耗尽',
+    RETRY_AVAILABLE: '可人工定向重试'
+  }[category] || category
 }
 
 function handoffFor(role: string) {
@@ -1261,11 +1327,12 @@ async function submitWorkflowPause() {
   }
 }
 
-async function continueWorkflow(decision?: 'APPROVE' | 'REVISE') {
+async function continueWorkflow(decision?: 'APPROVE' | 'REVISE' | 'RETRY' | 'REPLAN') {
   if (!workflowId.value) return
   const operatorResume = workflowOperatorPaused.value
   if (workflowPlanReview.value && !decision) return
-  if (decision === 'REVISE' && !workflowFeedback.value.trim()) return
+  if (workflowSpecialistReview.value && !decision) return
+  if (['REVISE', 'RETRY', 'REPLAN'].includes(decision || '') && !workflowFeedback.value.trim()) return
   workflowActionBusy.value = true
   try {
     const feedback = workflowFeedback.value.trim()
@@ -1283,6 +1350,8 @@ async function continueWorkflow(decision?: 'APPROVE' | 'REVISE') {
     if (operatorResume) ElMessage.success('恢复指令已应用')
     else if (decision === 'APPROVE') ElMessage.success(`执行计划 v${displayedPlanVersion.value} 已批准，专业分支开始执行`)
     else if (decision === 'REVISE') ElMessage.success('重新规划要求已提交')
+    else if (decision === 'RETRY') ElMessage.success('失败分支已重新入队，成功交接将从检查点恢复')
+    else if (decision === 'REPLAN') ElMessage.success('失败分支已退回 Planner，旧交接不会复用')
     else ElMessage.success('工作流已继续')
   } finally {
     workflowActionBusy.value = false
@@ -2050,7 +2119,7 @@ onBeforeUnmount(disposeWorkflowEventStream)
   background: #fffbeb;
 }
 
-.workflow-approval-gate > div {
+.workflow-approval-gate > div:first-child {
   display: grid;
   gap: 4px;
 }
@@ -2070,6 +2139,74 @@ onBeforeUnmount(disposeWorkflowEventStream)
   grid-template-columns: minmax(240px, 0.9fr) minmax(320px, 1.3fr) minmax(250px, auto);
 }
 
+.workflow-approval-gate.specialist-review {
+  grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.15fr) minmax(250px, auto);
+  border-left-color: var(--color-danger);
+  background: #fef2f2;
+}
+
+.workflow-specialist-failures {
+  margin-top: 8px;
+}
+
+.workflow-specialist-failures ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflow-specialist-failures li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, var(--color-danger) 22%, var(--color-border));
+}
+
+.workflow-specialist-failures .el-icon {
+  margin-top: 2px;
+  color: var(--color-danger);
+  font-size: 16px;
+}
+
+.workflow-specialist-failures li > div {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
+}
+
+.workflow-specialist-failures strong,
+.workflow-specialist-failures span,
+.workflow-specialist-failures small,
+.workflow-specialist-failures p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workflow-specialist-failures strong {
+  color: var(--color-foreground);
+}
+
+.specialist-failure-category {
+  color: var(--color-danger);
+  font-weight: 650;
+}
+
+.workflow-specialist-failures small {
+  color: var(--color-muted-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.workflow-specialist-failures p {
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .workflow-approval-actions {
   display: flex;
   align-items: center;
@@ -2080,6 +2217,12 @@ onBeforeUnmount(disposeWorkflowEventStream)
 .workflow-approval-actions .el-button {
   min-height: 40px;
   margin-left: 0;
+}
+
+.workflow-recovery-actions {
+  min-width: 250px;
+  align-items: stretch;
+  flex-direction: column;
 }
 
 @media (max-width: 900px) {
@@ -2093,6 +2236,10 @@ onBeforeUnmount(disposeWorkflowEventStream)
   }
 
   .workflow-approval-gate {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-approval-gate.specialist-review {
     grid-template-columns: 1fr;
   }
 

@@ -25,6 +25,8 @@ PUBLIC_WORKFLOW_EVENT_PAYLOAD_FIELDS = frozenset(
         "retry_delay_seconds",
         "retryable",
         "retrying_count",
+        "retryable_count",
+        "recovery_count",
         "role",
         "roles",
         "score",

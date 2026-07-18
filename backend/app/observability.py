@@ -85,6 +85,7 @@ NODE_LABELS = {
     "planning": "动态规划",
     "plan_review": "计划审批",
     "specialists": "专业分支",
+    "specialist_review": "分支恢复",
     "quality_gate": "质量门禁",
     "quality_review": "人工修订",
     "project_manager": "项目计划",
@@ -336,12 +337,20 @@ def _pair_event_spans(
             "CANCEL_REQUESTED",
         }:
             pause_payload = _public_payload(open_pause)
+            approval_gate = pause_payload.get("approval_gate")
+            wait_label = (
+                "人工干预等待"
+                if approval_gate == "operator"
+                else "分支恢复等待"
+                if approval_gate == "specialist_review"
+                else "人工确认等待"
+            )
             spans.append(
                 _SpanDraft(
                     span_id=f"wait-{open_pause.id}",
                     kind="wait",
                     node=open_pause.node,
-                    label="人工干预等待" if pause_payload.get("approval_gate") == "operator" else "人工确认等待",
+                    label=wait_label,
                     agent_role="",
                     status="COMPLETED",
                     attempt=1,

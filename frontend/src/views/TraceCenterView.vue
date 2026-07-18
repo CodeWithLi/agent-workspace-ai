@@ -458,7 +458,7 @@ const statusLabels: Record<string, string> = {
 }
 const nodeLabels: Record<string, string> = {
   queue: '排队', requirement: '需求分析', product: '产品方案', architect: '架构设计',
-  planning: '动态规划', plan_review: '计划审批', specialists: '专业分支', quality_gate: '质量门禁',
+  planning: '动态规划', plan_review: '计划审批', specialists: '专业分支', specialist_review: '分支恢复', quality_gate: '质量门禁',
   quality_review: '人工修订', project_manager: '项目计划', tester: '测试方案',
   report: '项目报告', completed: '完成'
 }
@@ -470,7 +470,8 @@ const roleLabels: Record<string, string> = {
 }
 const eventLabels: Record<string, string> = {
   QUEUED: '进入队列', STARTED: '开始运行', CONTINUED: '继续运行', NODE_STARTED: '节点开始',
-  NODE_COMPLETED: '节点完成', NODE_FAILED: '节点失败',
+  NODE_COMPLETED: '节点完成', NODE_FAILED: '节点失败', SPECIALIST_REVIEW_REQUIRED: '分支等待恢复',
+  SPECIALIST_RETRY_REQUESTED: '定向恢复分支', SPECIALIST_REPLAN_REQUESTED: '失败分支退回规划',
   WAVE_STARTED: '波次开始', WAVE_COMPLETED: '波次完成', WAVE_CHECKPOINTED: '波次已保存',
   WAVE_RESTORED: '波次已恢复', BRANCH_STARTED: '分支开始', BRANCH_COMPLETED: '分支完成',
   BRANCH_FAILED: '分支失败', BRANCH_RETRY_SCHEDULED: '分支准备重试', RETRY_SCHEDULED: '计划自动重试',

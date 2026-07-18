@@ -14,7 +14,14 @@ from app.api.routes.projects import get_project_for_user
 from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import SessionLocal, get_db
-from app.langgraph.workflow import initial_state, record_workflow_event, select_execution_plan_version, snapshot_agent_configs
+from app.langgraph.workflow import (
+    initial_state,
+    prepare_specialist_replan,
+    prepare_specialist_retry,
+    record_workflow_event,
+    select_execution_plan_version,
+    snapshot_agent_configs,
+)
 from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
 from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
 from app.services.billing import InsufficientTokensError, apply_token_change
@@ -41,6 +48,7 @@ WORKFLOW_NODE_ORDER = {
     "planning": 3,
     "plan_review": 4,
     "specialists": 5,
+    "specialist_review": 5,
     "quality_gate": 6,
     "quality_review": 7,
     "project_manager": 8,
@@ -529,6 +537,24 @@ async def continue_workflow(
                     "source_plan_version": reviewed_plan_version,
                 },
             )
+        elif workflow.current_node == "specialist_review":
+            try:
+                roles, recovery_count = prepare_specialist_retry(state, feedback)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+            workflow.current_node = "specialists"
+            workflow.pause_before_report = True
+            record_workflow_event(
+                db,
+                workflow,
+                "SPECIALIST_RETRY_REQUESTED",
+                "Operator resume instruction triggered targeted specialist recovery",
+                node="specialist_review",
+                payload={"roles": roles, "recovery_count": recovery_count},
+            )
         elif workflow.current_node == "report":
             workflow.pause_before_report = False
         workflow.state_json = json.dumps(state, ensure_ascii=False)
@@ -585,7 +611,7 @@ async def continue_workflow(
                     "source_plan_version": selected_version,
                 },
             )
-        else:
+        elif payload.decision == "APPROVE":
             state["plan_approved"] = True
             workflow.current_node = "specialists"
             record_workflow_event(
@@ -600,7 +626,65 @@ async def continue_workflow(
                     "plan_version": selected_version,
                 },
             )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Plan review decision must be APPROVE or REVISE",
+            )
         workflow.state_json = json.dumps(state, ensure_ascii=False)
+    elif workflow.current_node == "specialist_review":
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Recovery instruction is required for specialist review",
+            )
+        state = workflow_state(workflow)
+        if payload.decision == "RETRY":
+            try:
+                roles, recovery_count = prepare_specialist_retry(state, feedback)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+            workflow.current_node = "specialists"
+            record_workflow_event(
+                db,
+                workflow,
+                "SPECIALIST_RETRY_REQUESTED",
+                "Operator requested targeted specialist recovery",
+                node="specialist_review",
+                payload={"roles": roles, "recovery_count": recovery_count},
+            )
+        elif payload.decision == "REPLAN":
+            try:
+                roles, revision_count = prepare_specialist_replan(state, feedback)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+            workflow.current_node = "planning"
+            record_workflow_event(
+                db,
+                workflow,
+                "SPECIALIST_REPLAN_REQUESTED",
+                "Operator returned failed specialist work to planning",
+                node="specialist_review",
+                payload={
+                    "roles": roles,
+                    "revision_count": revision_count,
+                    "source_plan_version": int(state.get("plan_version", 0)),
+                },
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Specialist review decision must be RETRY or REPLAN",
+            )
+        state["specialist_failures"] = []
+        workflow.state_json = json.dumps(state, ensure_ascii=False)
+        workflow.pause_before_report = True
     elif workflow.current_node == "quality_review":
         if not feedback:
             raise HTTPException(
@@ -639,6 +723,10 @@ async def continue_workflow(
         audit_action = "workflow.plan_approved"
     elif gate == "plan_review" and payload.decision == "REVISE":
         audit_action = "workflow.plan_revision_requested"
+    elif gate == "specialist_review" and payload.decision == "RETRY":
+        audit_action = "workflow.specialist_retry_requested"
+    elif gate == "specialist_review" and payload.decision == "REPLAN":
+        audit_action = "workflow.specialist_replan_requested"
     record_audit(
         db,
         audit_action,

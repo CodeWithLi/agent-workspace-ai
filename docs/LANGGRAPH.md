@@ -48,13 +48,15 @@
 
 规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次，并选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并重新校验已保存快照；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志，防止恢复或客户端绕过门禁。
 
-专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每个尝试批次结束后原子持久化成功 Handoff、消息和失败事件；如果全部失败都属于 `LLMRetryableError`、Agent 并发饱和或超时，运行只对失败角色执行有界指数退避，退避后再次检查租约、暂停和取消，再开始下一批次。网关只把网络/超时、408/409/429、5xx 和畸形成功响应归为 `LLMRetryableError`；认证、请求配置、业务或依赖错误以及局部次数耗尽会立即升级到现有 worker 级恢复。任何已成功角色都不会重复执行。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。
+专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每个尝试批次结束后原子持久化成功 Handoff、消息和失败事件；如果全部失败都属于 `LLMRetryableError`、Agent 并发饱和或超时，运行只对失败角色执行有界指数退避，退避后再次检查租约、暂停和取消，再开始下一批次。网关只把网络/超时、408/409/429、5xx 和畸形成功响应归为 `LLMRetryableError`。
+
+认证、请求配置、业务或依赖等确定性错误以及局部次数耗尽不会再让成功分支跟随整条 worker 失败。当前波次先原子提交成功 Handoff 和失败摘要，再将图停在 `specialist_review`：`RETRY` 必须携带修复指令，保留同修订轮次的成功 Handoff，只执行失败角色及尚未完成的传递下游；`REPLAN` 清空旧专业 Handoff、质量门禁和修订状态，以原计划和人工意见返回 Planner，并强制新计划进入 `plan_review`。失败正文只存在受控工作流快照，事件和追踪仅公开角色、波次、尝试、失败/可重试计数与恢复次数。任何已成功角色都不会重复执行。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。
 
 质量门禁先检查角色覆盖、交付内容、成功标准和专业广度，再合并独立 Reviewer 的结构化协作账本。账本合同包含共同决策、来源角色、审查置信度、冲突双方立场、解决状态、待确认问题和责任角色；服务端过滤未参与当前计划的角色，并在阻塞冲突或阻塞问题仍开放时把评分封顶为 79、强制 `passed=false`，同时从冲突双方推导定向返修角色，Reviewer 不能用自报高分绕过。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向；后续项目经理、测试和报告节点消费同一已提交账本，不重新猜测冲突结论。
 
-除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、局部重试、质量分数和人工修订状态。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据；Handoff、决策与冲突正文、错误、Prompt、质量问题与人工反馈只保留在受控持久化边界，不会进入 SSE 或追踪响应。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
+除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`SPECIALIST_REVIEW_REQUIRED`、`SPECIALIST_RETRY_REQUESTED`、`SPECIALIST_REPLAN_REQUESTED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败/可重试计数、恢复次数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据；Handoff、失败与恢复指令、决策与冲突正文、错误、Prompt、质量问题与人工反馈只保留在受控持久化边界，不会进入 SSE 或追踪响应。人工检查点重试仍创建不可变子运行；分支恢复则在原运行的已提交波次上继续。
 
-项目页在加载时回放最近的持久化事件，并在 SSE 更新后按角色重新归约状态；`workflow_attempt`、`branch_attempt`、`will_retry`、退避秒数和 `WAVE_RESTORED.roles` 共同区分等待、执行中、等待重试、失败、检查点恢复和已交接。SSE 中断或刷新不会把已知 Agent 退回“等待执行”。完成或恢复的分支可从波次列表直接展开对应 Handoff；质量门禁下方按共同决策、冲突与解决、待确认问题展示协作账本和责任角色。移动端使用相同文字、图标、尝试与决策元数据，不依赖 hover 或单一颜色。
+项目页在加载时回放最近的持久化事件，并在 SSE 更新后按角色重新归约状态；`workflow_attempt`、`branch_attempt`、`will_retry`、退避秒数和 `WAVE_RESTORED.roles` 共同区分等待、执行中、等待重试、失败、检查点恢复和已交接。SSE 中断或刷新不会把已知 Agent 退回“等待执行”。完成或恢复的分支可从波次列表直接展开对应 Handoff；失败门禁就地展示失败类别、波次、尝试和可行动错误，并提供定向重试与重新规划；质量门禁下方按共同决策、冲突与解决、待确认问题展示协作账本和责任角色。移动端使用相同文字、图标、尝试与决策元数据，不依赖 hover 或单一颜色。
 
 ## 运行追踪与成本归属
 
@@ -87,7 +89,7 @@ SLO 健康度只使用已结束的成功或失败运行，按当前追踪权限�
 ## 暂停与继续
 
 `POST /api/v1/workflow/run` 返回 `202 QUEUED`，后台 dispatcher 认领并执行，默认在 `report` 前进入 `PAUSED`。
-`POST /api/v1/workflow/continue` 可在 `plan_review` 接收 `APPROVE/REVISE` 决策和可选 `plan_version`、在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。`plan_version` 只能用于计划审批门禁，不存在或不合法的版本返回 `422`。最终报告写入 `reports` 表。项目页先从 `GET /workflow/{id}/events/history` 恢复最近事件，再以 `Last-Event-ID` 连接 `GET /workflow/{id}/events`；凭证过期时只执行一次共享刷新，断线后按服务端提示指数退避重连，已确认游标不会重复应用。
+`POST /api/v1/workflow/continue` 可在 `plan_review` 接收 `APPROVE/REVISE` 决策和可选 `plan_version`、在 `specialist_review` 接收 `RETRY/REPLAN` 与必填恢复指令、在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。不同门禁不接受彼此的决策类型，`plan_version` 只能用于计划审批；缺失指令、非法决策或版本返回 `422`。最终报告写入 `reports` 表。项目页先从 `GET /workflow/{id}/events/history` 恢复最近事件，再以 `Last-Event-ID` 连接 `GET /workflow/{id}/events`；凭证过期时只执行一次共享刷新，断线后按服务端提示指数退避重连，已确认游标不会重复应用。
 
 继续操作只允许对 `PAUSED` 运行执行一次；任务创建按标题幂等，重复继续返回 `409`，不会重复落任务或报告。
 

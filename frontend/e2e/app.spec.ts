@@ -2472,6 +2472,119 @@ test('restores live specialist retry states and opens completed handoffs', async
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
+test('recovers a failed specialist branch from its committed checkpoint', async ({ page }, testInfo) => {
+  let recoveryPayload: Record<string, unknown> = {}
+  const recoveryWorkflow = {
+    workflow_id: 160,
+    project_id: 2,
+    parent_workflow_id: null,
+    retry_from_node: '',
+    retry_sequence: 0,
+    pause_requested_at: null,
+    pause_requested_by_user_id: null,
+    pause_reason: '',
+    intervention_count: 0,
+    status: 'PAUSED',
+    current_node: 'specialist_review',
+    state: {
+      execution_plan: {
+        objective: '在保留成功交接的前提下恢复失败专业分支',
+        rationale: '运营与测试并行，确定性失败进入人工恢复门禁。',
+        assignments: [
+          { role: 'operations_analyst', objective: '定义发布和回滚边界', deliverable: '发布运行手册', depends_on: [] },
+          { role: 'test_engineer', objective: '验证边界与验收证据', deliverable: '测试与验收清单', depends_on: [] }
+        ],
+        success_criteria: ['成功分支不重复', '失败分支接受人工修复指令']
+      },
+      specialist_handoffs: [
+        {
+          role: 'operations_analyst',
+          objective: '定义发布和回滚边界',
+          deliverable: '发布运行手册',
+          content: '已完成发布窗口、监控阈值、失败信号和回滚负责人定义。',
+          revision_round: 0
+        }
+      ],
+      specialist_failures: [
+        {
+          role: 'test_engineer',
+          wave: 1,
+          branch_attempt: 1,
+          retryable: false,
+          category: 'NON_RETRYABLE',
+          message: '测试环境配置缺少验收凭据'
+        }
+      ],
+      specialist_recovery_count: 0,
+      quality_gate: {},
+      revision_round: 0,
+      documents: [],
+      messages: []
+    },
+    attempt_count: 1,
+    max_attempts: 2,
+    error: '',
+    created_at: '2026-07-20T10:00:00Z',
+    updated_at: '2026-07-20T10:00:08Z',
+    started_at: '2026-07-20T10:00:01Z',
+    finished_at: null
+  }
+  const events = [
+    { id: 1, workflow_id: 160, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'operations started', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-20T10:00:03Z' },
+    { id: 2, workflow_id: 160, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'test started', payload: { role: 'test_engineer', branch_attempt: 1 }, created_at: '2026-07-20T10:00:03Z' },
+    { id: 3, workflow_id: 160, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-20T10:00:07Z' },
+    { id: 4, workflow_id: 160, node: 'specialists', event_type: 'BRANCH_FAILED', message: 'test failed', payload: { role: 'test_engineer', branch_attempt: 1, retryable: false, will_retry: false }, created_at: '2026-07-20T10:00:07Z' },
+    { id: 5, workflow_id: 160, node: 'specialists', event_type: 'SPECIALIST_REVIEW_REQUIRED', message: 'review required', payload: { roles: ['test_engineer'], failed_count: 1 }, created_at: '2026-07-20T10:00:08Z' },
+    { id: 6, workflow_id: 160, node: 'specialist_review', event_type: 'PAUSED', message: 'paused', payload: { approval_gate: 'specialist_review', roles: ['test_engineer'], failed_count: 1 }, created_at: '2026-07-20T10:00:08Z' }
+  ]
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: [recoveryWorkflow] }))
+  await page.route(/\/api\/v1\/workflow\/160$/, (route) => route.fulfill({ json: recoveryWorkflow }))
+  await page.route(/\/api\/v1\/workflow\/160\/saga-steps$/, (route) => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/workflow\/160\/events\/history(?:\?.*)?$/, (route) => route.fulfill({ json: events }))
+  await page.route(/\/api\/v1\/workflow\/160\/events$/, (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
+  await page.route(/\/api\/v1\/workflow\/continue$/, async (route) => {
+    recoveryPayload = await route.request().postDataJSON()
+    return route.fulfill({
+      json: {
+        ...recoveryWorkflow,
+        status: 'QUEUED',
+        current_node: 'specialists',
+        state: {
+          ...recoveryWorkflow.state,
+          specialist_failures: [],
+          specialist_recovery_count: 1,
+          revision_feedback: recoveryPayload.human_feedback
+        }
+      }
+    })
+  })
+
+  await page.goto('/projects/2')
+
+  await expect(page.getByText('专业分支等待人工恢复', { exact: true })).toBeVisible()
+  const recovery = page.getByRole('region', { name: '失败分支恢复详情' })
+  await expect(recovery.getByText('测试工程师', { exact: true })).toBeVisible()
+  await expect(recovery.getByText('不可自动重试', { exact: true })).toBeVisible()
+  await expect(recovery.getByText('测试环境配置缺少验收凭据', { exact: true })).toBeVisible()
+  const retryButton = page.getByRole('button', { name: '仅重试 1 个失败分支' })
+  const replanButton = page.getByRole('button', { name: '返回 Planner 重新规划' })
+  await expect(retryButton).toBeDisabled()
+  await expect(replanButton).toBeDisabled()
+  await page.getByLabel('工作流人工反馈').fill('验收凭据已补齐，请保留运营交接并仅恢复测试分支。')
+  await retryButton.click()
+
+  expect(recoveryPayload).toMatchObject({
+    workflow_id: 160,
+    decision: 'RETRY',
+    human_feedback: '验收凭据已补齐，请保留运营交接并仅恢复测试分支。'
+  })
+  await expect(page.getByText('失败分支已重新入队，成功交接将从检查点恢复')).toBeVisible()
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.setViewportSize({ width: 375, height: 812 })
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
 test('shows dynamic specialist handoffs and submits quality revision feedback', async ({ page }, testInfo) => {
   await page.goto('/projects/2')
 
