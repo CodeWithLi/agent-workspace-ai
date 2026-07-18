@@ -99,11 +99,33 @@ MinerU 3.4.4 的 pipeline wheel 使用了未声明的 `six` 依赖；基准专�
 
 Linux 证据表明 MinerU 在该合成边界语料上质量最高，Docling 是高级解析器中延迟最低且体积较小的选项，Unstructured 能在 Linux 正常运行但本轮没有质量或资源优势。因此保留 Docling 作为默认高级解析器候选，MinerU 作为质量优先的复杂中文 PDF 离线候选；在真实业务文档验证前不把该排序外推成普遍结论。
 
+## 固定开源模型端到端门禁
+
+[`RAG Model Quality Gate #10`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29644078245) 在提交 `c945780` 上使用固定 revision 和模型文件 SHA-256，完整执行 multilingual E5 embedding、Chonkie semantic chunking、查询改写、多向量混合召回、mMARCO Cross-Encoder rerank、Qwen2.5-1.5B 回答和 Phi-3.5 judge。Artifact ID 为 `8429990285`，下载包 SHA-256 为 `574cbff039e1a83d6f90d23c440e4d3f492fb47b08b26f7d858422e75eb657f9`。
+
+Run #7 的完整候选诊断证明单一 rerank 阈值不可行：必须保留的 `knowledge-access` 证据最低分为 `0.1003`，不可回答 GPU 问题的库外候选最高分为 `0.1115`，区间重叠。最终选择器采用两阶段门槛：reranker 成功后所有候选先达到基础分；query coverage 低于专用下限时再达到更高 override 分。固定本地模型校准为基础分 `0.08`、coverage 下限 `0.08`、override `0.12`；外部 reranker 使用独立运行时配置。reranker 失败时保留原有 dense fallback，不把未打分尾部混入成功 rerank 结果。
+
+| 指标 | 旧 900/140 baseline | 语义父子分块 candidate | 增益 |
+|---|---:|---:|---:|
+| Recall@5 | 0.8333 | 1.0000 | +0.1667 |
+| MRR | 0.7500 | 1.0000 | +0.2500 |
+| nDCG@5 | 0.7718 | 1.0000 | +0.2282 |
+| Context Precision@5 | 0.3667 | 0.6583 | +0.2916 |
+| Citation Target Accuracy | 0.6667 | 1.0000 | +0.3333 |
+| Faithfulness | 0.8750 | 1.0000 | +0.1250 |
+| Judge Citation Correctness | 0.8750 | 1.0000 | +0.1250 |
+| Answer Assertion Accuracy | 0.6667 | 1.0000 | +0.3333 |
+| Refusal Accuracy | 1.0000 | 1.0000 | 0.0000 |
+| 业务 p95 | 108.28 s | 76.10 s | -32.17 s |
+| Judge p95（单列，不计入业务延迟） | 490.04 s | 272.54 s | -217.50 s |
+
+Candidate 的所有严格门禁和 A/B 比较均通过，主检索指标提升超过 `0.05`，API 模型成本为 `0`（GitHub CPU runner 上执行固定本地模型）。Judge 上下文总预算限制为 `2200 tokens`，保留每个 selected citation，完整 prompt 在确定性 tokenizer 下小于 `3000 tokens`，因此使用 4K judge context 而不再把 8K 模型分配和 judge 耗时混入业务 p95。答案后处理只允许从 rank-1 child chunk 补充遗漏的完整时间/频率证据句，并复用合法 citation；不得从 parent 或次级候选追加无关限定。
+
 ## 尚未完成的验证
 
 - 当前已固化 6 份仓库真实文档快照并增加 DOCX 表格、随机 Unicode 和扫描 PDF OCR 自动样本；仍需加入业务方脱敏的真实复杂 PDF、中文表格、公式和代码文档。
 - Docling、MinerU、Unstructured 与 native 的 Linux 同样本矩阵和严格汇总门禁已绿色；仍需用业务脱敏样本复核合成语料结论。
-- 确定性结构分块 A/B 已进入门禁；真实多语 embedding、查询改写、reranker、答案忠实度与引用正确率工作流已实现，但尚需配置受控外部服务并取得绿色运行报告。
+- 确定性结构分块和固定开源模型端到端 A/B 均已绿色；外部托管模型工作流仍可用于供应商验收，但不再替代或阻塞固定模型回归证据。
 - Milvus v4 child/parent 多向量、个人 owner 隔离、4 并发 p95 已在 `CI #7/#8` 真实服务 job 绿色；双版本索引、原子激活和回滚另有 SQLite/API/E2E 证据。
 - Docling DOCX 表格与图片型 PDF OCR 已在本地及 [`RAG Docling Integration #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629854246) 真实 1.26.0 服务通过。
 
