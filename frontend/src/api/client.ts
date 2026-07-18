@@ -53,6 +53,16 @@ function persistSession(data: TokenResponse) {
   localStorage.setItem('user', JSON.stringify(data.user))
 }
 
+function expireSession() {
+  localStorage.removeItem('token')
+  localStorage.removeItem('user')
+  if (window.location.pathname !== '/login') window.location.assign('/login')
+}
+
+function isRejectedRefresh(error: unknown): boolean {
+  return axios.isAxiosError(error) && [401, 403].includes(error.response?.status || 0)
+}
+
 export async function refreshAccessToken(): Promise<string> {
   if (!refreshPromise) {
     refreshPromise = axios
@@ -60,6 +70,10 @@ export async function refreshAccessToken(): Promise<string> {
       .then(({ data }) => {
         persistSession(data)
         return data.access_token
+      })
+      .catch((error) => {
+        if (isRejectedRefresh(error)) expireSession()
+        throw error
       })
       .finally(() => {
         refreshPromise = null
@@ -87,9 +101,6 @@ api.interceptors.response.use(
         config.headers.Authorization = `Bearer ${token}`
         return api.request(config)
       } catch {
-        localStorage.removeItem('token')
-        localStorage.removeItem('user')
-        if (window.location.pathname !== '/login') window.location.assign('/login')
         return Promise.reject(error)
       }
     }

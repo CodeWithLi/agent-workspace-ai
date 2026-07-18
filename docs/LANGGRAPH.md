@@ -55,7 +55,7 @@
 ## 暂停与继续
 
 `POST /api/v1/workflow/run` 返回 `202 QUEUED`，后台 dispatcher 认领并执行，默认在 `report` 前进入 `PAUSED`。
-`POST /api/v1/workflow/continue` 可在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。最终报告写入 `reports` 表。`GET /workflow/{id}/events` 以 SSE 返回持久化节点事件。
+`POST /api/v1/workflow/continue` 可在 `quality_review` 接收修订方向，或在 `report` 前接收最终确认意见，随后重新入队。最终报告写入 `reports` 表。项目页先从 `GET /workflow/{id}/events/history` 恢复最近事件，再以 `Last-Event-ID` 连接 `GET /workflow/{id}/events`；凭证过期时只执行一次共享刷新，断线后按服务端提示指数退避重连，已确认游标不会重复应用。
 
 继续操作只允许对 `PAUSED` 运行执行一次；任务创建按标题幂等，重复继续返回 `409`，不会重复落任务或报告。
 

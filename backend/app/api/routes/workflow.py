@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from io import BytesIO
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from fastapi import UploadFile
 from sqlalchemy import select
@@ -16,7 +16,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal, get_db
 from app.langgraph.workflow import initial_state, record_workflow_event, snapshot_agent_configs
 from app.models import Project, Report, TokenTransaction, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
-from app.schemas import WorkflowContinueRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
+from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
 from app.services.billing import InsufficientTokensError, apply_token_change
 from app.services.workflows import finish_workflow_compensation, refund_workflow_charge
 from app.rag.service import DuplicateDocumentError, queue_document
@@ -64,6 +64,22 @@ def get_owned_workflow(workflow_id: int, current_user: User, db: Session, *, wri
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
     get_project_for_user(workflow.project_id, current_user, db, write=write)
     return workflow
+
+
+def to_event_response(event: WorkflowEvent) -> WorkflowEventResponse:
+    try:
+        payload = json.loads(event.payload_json)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    return WorkflowEventResponse(
+        id=event.id,
+        workflow_id=event.workflow_id,
+        node=event.node,
+        event_type=event.event_type,
+        message=event.message,
+        payload=payload if isinstance(payload, dict) else {},
+        created_at=event.created_at,
+    )
 
 
 @router.post("/run", response_model=WorkflowResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -181,6 +197,25 @@ def list_workflow_saga_steps(
     )
 
 
+@router.get("/{workflow_id}/events/history", response_model=list[WorkflowEventResponse])
+def list_workflow_event_history(
+    workflow_id: int,
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[WorkflowEventResponse]:
+    get_owned_workflow(workflow_id, current_user, db)
+    events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(WorkflowEvent.workflow_id == workflow_id)
+            .order_by(WorkflowEvent.id.desc())
+            .limit(limit)
+        )
+    )
+    return [to_event_response(event) for event in reversed(events)]
+
+
 @router.get("/{workflow_id}/events")
 async def stream_workflow_events(
     workflow_id: int,
@@ -198,10 +233,24 @@ async def stream_workflow_events(
 
     async def event_stream():
         nonlocal cursor
+        idle_polls = 0
+        yield "retry: 1500\n\n"
         while True:
             with SessionLocal() as event_db:
                 workflow = event_db.get(WorkflowRun, workflow_id)
-                if not workflow or workflow.user_id != user_id:
+                event_user = event_db.get(User, user_id)
+                project = event_db.get(Project, workflow.project_id) if workflow else None
+                if (
+                    not workflow
+                    or workflow.user_id != user_id
+                    or not event_user
+                    or not event_user.is_active
+                    or not project
+                ):
+                    return
+                try:
+                    get_project_for_user(project.id, event_user, event_db)
+                except HTTPException:
                     return
                 events = list(
                     event_db.scalars(
@@ -217,27 +266,27 @@ async def stream_workflow_events(
                 }
                 for event in events:
                     cursor = event.id
-                    data = json.dumps(
-                        {
-                            "id": event.id,
-                            "workflow_id": event.workflow_id,
-                            "node": event.node,
-                            "event_type": event.event_type,
-                            "message": event.message,
-                            "payload": json.loads(event.payload_json),
-                            "created_at": event.created_at.isoformat(),
-                        },
-                        ensure_ascii=False,
-                    )
+                    data = to_event_response(event).model_dump_json()
                     yield f"id: {event.id}\nevent: workflow\ndata: {data}\n\n"
-                if terminal and not events:
+                if events:
+                    idle_polls = 0
+                elif terminal:
                     return
+                else:
+                    idle_polls += 1
+                    if idle_polls >= 15:
+                        yield ": heartbeat\n\n"
+                        idle_polls = 0
             await asyncio.sleep(1)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

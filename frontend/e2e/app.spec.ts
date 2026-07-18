@@ -870,6 +870,7 @@ async function mockApi(page: Page) {
     else if (method === 'GET' && path === '/workflow/99') body = qualityWorkflow
     else if (method === 'GET' && path === '/workflow/88/saga-steps') body = sagaSteps
     else if (method === 'GET' && path === '/workflow/99/saga-steps') body = []
+    else if (method === 'GET' && /^\/workflow\/(88|99)\/events\/history$/.test(path)) body = []
     else if (method === 'GET' && /^\/workflow\/(88|99)\/events$/.test(path)) {
       return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' })
     } else if (method === 'POST' && path === '/workflow/continue') {
@@ -1035,6 +1036,82 @@ test('shows Saga compensation failure and completes manual recovery', async ({ p
   await expect(page.getByText('已回滚', { exact: true })).toBeVisible()
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('restores workflow history and reconnects live progress without duplicate events', async ({ page }) => {
+  const runningWorkflow = {
+    workflow_id: 99,
+    project_id: 2,
+    status: 'RUNNING',
+    current_node: 'product',
+    state: { messages: [], documents: [] },
+    attempt_count: 1,
+    max_attempts: 3,
+    error: '',
+    created_at: '2026-07-18T08:00:00Z',
+    updated_at: '2026-07-18T08:01:00Z',
+    started_at: '2026-07-18T08:00:01Z',
+    finished_at: null
+  }
+  const completedWorkflow = {
+    ...runningWorkflow,
+    status: 'COMPLETED',
+    current_node: 'completed',
+    state: { messages: [], documents: [], report: '# 已恢复的项目报告' },
+    updated_at: '2026-07-18T08:02:00Z',
+    finished_at: '2026-07-18T08:02:00Z'
+  }
+  const queuedEvent = {
+    id: 1,
+    workflow_id: 99,
+    node: 'requirement',
+    event_type: 'QUEUED',
+    message: 'Workflow queued',
+    payload: {},
+    created_at: '2026-07-18T08:00:00Z'
+  }
+  const completedEvent = {
+    id: 2,
+    workflow_id: 99,
+    node: 'completed',
+    event_type: 'COMPLETED',
+    message: 'Workflow completed',
+    payload: {},
+    created_at: '2026-07-18T08:02:00Z'
+  }
+  const cursors: string[] = []
+  let streamAttempts = 0
+
+  await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: [runningWorkflow] }))
+  await page.route(/\/api\/v1\/workflow\/99\/events\/history(?:\?.*)?$/, (route) => route.fulfill({ json: [queuedEvent] }))
+  await page.route(/\/api\/v1\/workflow\/99\/events$/, async (route) => {
+    streamAttempts += 1
+    cursors.push(route.request().headers()['last-event-id'] || '')
+    if (streamAttempts === 1) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'retry: 2000\n\n'
+      })
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    return route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `retry: 500\n\nid: 2\nevent: workflow\ndata: ${JSON.stringify(completedEvent)}\n\n`
+    })
+  })
+  await page.route(/\/api\/v1\/workflow\/99$/, (route) => route.fulfill({ json: completedWorkflow }))
+
+  await page.goto('/projects/2')
+
+  await expect(page.getByRole('alert')).toContainText('实时进度暂时中断')
+  await expect(page.getByText('已完成', { exact: true })).toBeVisible({ timeout: 8_000 })
+  await expect(page.locator('.workflow-events').getByText('已入队', { exact: true })).toHaveCount(1)
+  await expect(page.locator('.workflow-events').getByText('执行完成', { exact: true })).toHaveCount(1)
+  expect(streamAttempts).toBe(2)
+  expect(cursors).toEqual(['1', '1'])
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('lists index versions and rolls knowledge search back on desktop and mobile', async ({ page }) => {

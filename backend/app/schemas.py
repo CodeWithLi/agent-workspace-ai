@@ -441,6 +441,16 @@ class WorkflowEventOut(BaseModel):
     created_at: datetime
 
 
+class WorkflowEventResponse(BaseModel):
+    id: int
+    workflow_id: int
+    node: str
+    event_type: str
+    message: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
 class WorkflowSagaStepOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

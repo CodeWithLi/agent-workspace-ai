@@ -67,7 +67,8 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `POST /workflow/continue`
 - `GET /workflow?project_id=...`
 - `GET /workflow/{workflow_id}`
-- `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID` 的持久化进度 SSE。
+- `GET /workflow/{workflow_id}/events/history`：按时间顺序读取最近 1-200 条持久化事件，用于页面刷新恢复。
+- `GET /workflow/{workflow_id}/events`：支持 `Last-Event-ID`、服务端重试间隔和心跳的持久化进度 SSE；连接期间持续复核用户与项目权限。
 - `GET /workflow/{workflow_id}/saga-steps`：查看写工具执行快照、状态、补偿次数和人工介入原因。
 - `POST /workflow/{workflow_id}/cancel`
 - `POST /workflow/{workflow_id}/retry`：终态失败后重新扣费并入队。

@@ -9,7 +9,7 @@
         <el-tag :type="project?.status === 'ARCHIVED' ? 'info' : 'success'">{{ project?.status === 'ARCHIVED' ? '已归档' : '进行中' }}</el-tag>
         <el-tag>{{ roleLabel(project?.current_user_role) }}</el-tag>
         <el-button v-if="project?.current_user_role !== 'viewer'" :icon="Edit" @click="openProjectEdit">编辑项目</el-button>
-        <el-button v-if="project?.current_user_role !== 'viewer' && auth.hasPermission('projects:write')" :icon="MagicStick" type="primary" :loading="running" @click="runWorkflow">运行多 Agent 工作流</el-button>
+        <el-button v-if="project?.current_user_role !== 'viewer' && auth.hasPermission('projects:write')" :icon="MagicStick" type="primary" :loading="running" :disabled="workflowRunLocked" @click="runWorkflow">{{ workflowRunLocked ? '工作流处理中' : '运行多 Agent 工作流' }}</el-button>
       </div>
     </div>
 
@@ -74,6 +74,22 @@
       </div>
       <el-tag :type="workflowTagType">{{ workflowStatusLabel }}</el-tag>
       <p v-if="workflowError" class="workflow-error">{{ workflowError }}</p>
+      <div
+        v-if="workflowConnectionNotice"
+        class="workflow-connection-notice"
+        :class="{ reconnecting: workflowConnectionState === 'reconnecting' }"
+        :role="workflowConnectionState === 'reconnecting' ? 'alert' : 'status'"
+        aria-live="polite"
+      >
+        <el-icon aria-hidden="true"><Connection /></el-icon>
+        <span>{{ workflowConnectionNotice }}</span>
+        <el-button
+          v-if="['reconnecting', 'closed'].includes(workflowConnectionState)"
+          :icon="RefreshRight"
+          size="small"
+          @click="restartWorkflowEvents"
+        >立即重连</el-button>
+      </div>
       <div class="workflow-steps-scroll">
         <el-steps class="workflow-steps" :active="workflowCompletedStages" finish-status="success" simple>
           <el-step v-for="stage in workflowStages" :key="stage" :title="stage" />
@@ -196,7 +212,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleClose, Delete, Edit, MagicStick, Plus, RefreshRight } from '@element-plus/icons-vue'
+import { CircleClose, Connection, Delete, Edit, MagicStick, Plus, RefreshRight } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
@@ -205,6 +221,7 @@ import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
 import axios from 'axios'
 import { confirmDestructiveAction } from '../utils/confirm'
+import { useWorkflowEventStream } from '../composables/useWorkflowEventStream'
 
 interface WorkflowAssignment {
   role: string
@@ -248,8 +265,6 @@ const workflowFeedback = ref('')
 const workflowEvents = ref<WorkflowEvent[]>([])
 const workflowSagaSteps = ref<WorkflowSagaStep[]>([])
 const workflowActionBusy = ref(false)
-const workflowStream = ref<AbortController | null>(null)
-const lastWorkflowEventId = ref(0)
 const running = ref(false)
 const members = ref<ProjectMember[]>([])
 const activities = ref<ProjectActivity[]>([])
@@ -261,6 +276,45 @@ const projectSaving = ref(false)
 const projectForm = reactive({ name: '', description: '', status: 'ACTIVE' })
 const activeWorkflowDocument = ref('PRD')
 const workflowStages = ['需求分析', '产品方案', '架构设计', '动态规划', '专业分支', '质量门禁', '项目计划', '测试方案', '项目报告']
+const workflowConnectionDetail = ref('')
+const {
+  connectionState: workflowConnectionState,
+  lastEventId: lastWorkflowEventId,
+  start: startWorkflowEventStream,
+  restart: restartWorkflowEventStream,
+  stop: stopWorkflowEventStream,
+  clear: clearWorkflowEventStream,
+  dispose: disposeWorkflowEventStream
+} = useWorkflowEventStream({
+  onEvent: handleWorkflowEvent,
+  onConnectionState: (state, detail) => {
+    workflowConnectionDetail.value = state === 'reconnecting' && detail.retryInMs
+      ? `${Math.max(1, Math.ceil(detail.retryInMs / 1000))} 秒后自动重连`
+      : ''
+  }
+})
+const workflowStreamActive = computed(() => ['QUEUED', 'RUNNING', 'CANCELLING', 'COMPENSATING'].includes(workflowStatus.value))
+const workflowRunLocked = computed(() => [
+  'QUEUED',
+  'RUNNING',
+  'CANCELLING',
+  'COMPENSATING',
+  'COMPENSATION_FAILED',
+  'PAUSED'
+].includes(workflowStatus.value))
+const workflowConnectionNotice = computed(() => {
+  if (!workflowStreamActive.value) return ''
+  if (workflowConnectionState.value === 'connected') {
+    return '实时进度已连接，刷新或离开页面不会中断后台 Agent。'
+  }
+  if (workflowConnectionState.value === 'reconnecting') {
+    return `实时进度暂时中断，后台 Agent 仍在执行。${workflowConnectionDetail.value}`
+  }
+  if (workflowConnectionState.value === 'closed') {
+    return '实时进度连接已关闭，后台 Agent 仍在执行。'
+  }
+  return '正在恢复实时进度，后台 Agent 会继续执行。'
+})
 const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
   const plan = workflowState.value?.execution_plan
   return plan && Array.isArray(plan.assignments) ? plan as WorkflowExecutionPlan : null
@@ -425,6 +479,7 @@ function sagaToolLabel(tool: string) {
 
 function activityLabel(action: string) {
   return {
+    'project.create': '项目已创建',
     'project.update': '项目配置已更新',
     'project.member_upsert': '项目成员已更新',
     'project.member_remove': '项目成员已移除',
@@ -432,70 +487,78 @@ function activityLabel(action: string) {
     'task.update': '更新了任务',
     'task.comment': '添加了任务评论',
     'meeting.tasks_create': '会议行动项已转为任务',
-    'workflow.artifact_publish': '工作流产物已发布'
+    'workflow.artifact_publish': '工作流产物已发布',
+    'workflow.queued': '工作流已入队',
+    'workflow.continue': '工作流已继续',
+    'workflow.retry': '工作流已重试',
+    'workflow.cancel_requested': '工作流已请求取消',
+    'workflow.compensation_retry': '工作流回滚已重试'
   }[action] || action
 }
 
 function applyWorkflow(workflow: WorkflowRun) {
+  const enteredTerminalState = ['COMPLETED', 'FAILED', 'CANCELLED'].includes(workflow.status)
+    && workflowStatus.value !== workflow.status
   if (workflowCurrentNode.value !== workflow.current_node) workflowFeedback.value = ''
   workflowId.value = workflow.workflow_id
   workflowStatus.value = workflow.status
   workflowCurrentNode.value = workflow.current_node
   workflowState.value = workflow.state
   workflowError.value = workflow.error
+  if (enteredTerminalState) workflowRequestId.value = crypto.randomUUID()
 }
 
 async function refreshWorkflow() {
   if (!workflowId.value) return
-  const [workflowResponse, sagaResponse] = await Promise.all([
-    api.get<WorkflowRun>(`/workflow/${workflowId.value}`),
-    api.get<WorkflowSagaStep[]>(`/workflow/${workflowId.value}/saga-steps`)
-  ])
+  const workflowResponse = await api.get<WorkflowRun>(`/workflow/${workflowId.value}`)
   applyWorkflow(workflowResponse.data)
+}
+
+async function refreshWorkflowSagaSteps() {
+  if (!workflowId.value) return
+  const sagaResponse = await api.get<WorkflowSagaStep[]>(`/workflow/${workflowId.value}/saga-steps`)
   workflowSagaSteps.value = sagaResponse.data
 }
 
-function watchWorkflowEvents() {
-  if (!workflowId.value) return
-  workflowStream.value?.abort()
-  const controller = new AbortController()
-  workflowStream.value = controller
-  void consumeWorkflowEvents(workflowId.value, controller)
+async function loadWorkflowEventHistory(id: number): Promise<number> {
+  const { data } = await api.get<WorkflowEvent[]>(`/workflow/${id}/events/history`, {
+    params: { limit: 100 }
+  })
+  workflowEvents.value = data
+  return data[data.length - 1]?.id || 0
 }
 
-async function consumeWorkflowEvents(id: number, controller: AbortController) {
-  try {
-    const response = await fetch(`${apiBaseURL}/workflow/${id}/events?last_event_id=${lastWorkflowEventId.value}`, {
-      headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
-      signal: controller.signal
-    })
-    if (!response.ok || !response.body) throw new Error('工作流进度连接失败')
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const blocks = buffer.split('\n\n')
-      buffer = blocks.pop() || ''
-      for (const block of blocks) {
-        const raw = block.match(/^data: (.+)$/m)?.[1]
-        if (!raw) continue
-        const event = JSON.parse(raw) as WorkflowEvent
-        if (!workflowEvents.value.some((item) => item.id === event.id)) workflowEvents.value.push(event)
-        lastWorkflowEventId.value = Math.max(lastWorkflowEventId.value, event.id)
-        if (['NODE_COMPLETED', 'PLAN_CREATED', 'BRANCH_COMPLETED', 'QUALITY_GATE_PASSED', 'QUALITY_GATE_FAILED', 'REVISION_REQUESTED', 'SAGA_STEP_COMPLETED', 'SAGA_STEP_COMPENSATED', 'SAGA_COMPENSATION_FAILED', 'COMPENSATION_FAILED', 'COMPENSATED', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRY_SCHEDULED'].includes(event.event_type)) {
-          await refreshWorkflow()
-        }
-      }
-    }
-    await refreshWorkflow()
-  } catch (error) {
-    if (!(error instanceof DOMException && error.name === 'AbortError')) {
-      ElMessage.error(error instanceof Error ? error.message : '工作流进度连接失败')
-    }
+function watchWorkflowEvents(cursor = lastWorkflowEventId.value) {
+  if (!workflowId.value) return
+  if (!workflowStreamActive.value) {
+    stopWorkflowEventStream()
+    return
   }
+  startWorkflowEventStream({
+    eventsUrl: `${apiBaseURL}/workflow/${workflowId.value}/events`,
+    lastEventId: cursor
+  })
+}
+
+async function handleWorkflowEvent(event: WorkflowEvent): Promise<boolean> {
+  if (event.workflow_id !== workflowId.value) return true
+  if (!workflowEvents.value.some((item) => item.id === event.id)) {
+    workflowEvents.value.push(event)
+  }
+  await refreshWorkflow()
+  if (
+    event.event_type.startsWith('SAGA_')
+    || ['COMPENSATION_STARTED', 'COMPENSATION_FAILED', 'COMPENSATED'].includes(event.event_type)
+  ) {
+    await refreshWorkflowSagaSteps()
+  }
+  if (!workflowStreamActive.value) workflowRequestId.value = crypto.randomUUID()
+  return workflowStreamActive.value
+}
+
+function restartWorkflowEvents() {
+  if (!workflowId.value || !workflowStreamActive.value) return
+  restartWorkflowEventStream()
 }
 
 async function load() {
@@ -518,9 +581,18 @@ async function load() {
   const latestWorkflow = workflowRes.data[0]
   if (latestWorkflow) {
     applyWorkflow(latestWorkflow)
-    const { data } = await api.get<WorkflowSagaStep[]>(`/workflow/${latestWorkflow.workflow_id}/saga-steps`)
-    workflowSagaSteps.value = data
-    watchWorkflowEvents()
+    const [sagaResponse, eventCursor] = await Promise.all([
+      api.get<WorkflowSagaStep[]>(`/workflow/${latestWorkflow.workflow_id}/saga-steps`),
+      loadWorkflowEventHistory(latestWorkflow.workflow_id)
+    ])
+    workflowSagaSteps.value = sagaResponse.data
+    watchWorkflowEvents(eventCursor)
+  } else {
+    workflowState.value = null
+    workflowId.value = null
+    workflowEvents.value = []
+    workflowSagaSteps.value = []
+    clearWorkflowEventStream()
   }
 }
 
@@ -530,8 +602,9 @@ async function retryCompensation() {
   try {
     const { data } = await api.post<WorkflowRun>(`/workflow/${workflowId.value}/retry-compensation`)
     applyWorkflow(data)
-    await refreshWorkflow()
-    watchWorkflowEvents()
+    await refreshWorkflowSagaSteps()
+    const cursor = await loadWorkflowEventHistory(data.workflow_id)
+    watchWorkflowEvents(cursor)
   } finally {
     workflowActionBusy.value = false
   }
@@ -566,9 +639,7 @@ async function runWorkflow() {
       request_id: workflowRequestId.value
     }, { suppressErrorToast: true })
     workflowEvents.value = []
-    lastWorkflowEventId.value = 0
     applyWorkflow(data)
-    watchWorkflowEvents()
     await auth.fetchMe()
     await load()
   } catch (error) {
@@ -592,8 +663,8 @@ async function continueWorkflow() {
     })
     workflowFeedback.value = ''
     applyWorkflow(data)
-    watchWorkflowEvents()
-    if (data.status === 'COMPLETED' || data.status === 'FAILED') workflowRequestId.value = crypto.randomUUID()
+    const cursor = await loadWorkflowEventHistory(data.workflow_id)
+    watchWorkflowEvents(cursor)
   } finally {
     workflowActionBusy.value = false
   }
@@ -606,6 +677,9 @@ async function cancelWorkflow() {
   try {
     const { data } = await api.post<WorkflowRun>(`/workflow/${workflowId.value}/cancel`)
     applyWorkflow(data)
+    await refreshWorkflowSagaSteps()
+    const cursor = await loadWorkflowEventHistory(data.workflow_id)
+    watchWorkflowEvents(cursor)
     await auth.fetchMe()
   } finally {
     workflowActionBusy.value = false
@@ -620,8 +694,9 @@ async function retryWorkflow() {
       request_id: crypto.randomUUID()
     })
     applyWorkflow(data)
+    const cursor = await loadWorkflowEventHistory(data.workflow_id)
+    watchWorkflowEvents(cursor)
     await auth.fetchMe()
-    watchWorkflowEvents()
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.status === 402) await router.push('/wallet')
     else throw error
@@ -669,10 +744,61 @@ async function publishArtifact(documentType: string, target: 'report' | 'knowled
 }
 
 onMounted(load)
-onBeforeUnmount(() => workflowStream.value?.abort())
+onBeforeUnmount(disposeWorkflowEventStream)
 </script>
 
 <style scoped>
+.agent-row {
+  min-width: 0;
+}
+
+.agent-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.workflow-steps {
+  min-width: 960px;
+}
+
+.workflow-steps :deep(.el-step__title) {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.workflow-steps :deep(.el-step.is-simple:not(:last-of-type) .el-step__title) {
+  max-width: none;
+}
+
+.workflow-connection-notice {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-primary);
+  border-radius: var(--radius-md);
+  background: var(--color-primary-soft);
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workflow-connection-notice.reconnecting {
+  border-left-color: var(--color-warning);
+  background: #fff7ed;
+}
+
+.workflow-connection-notice span {
+  min-width: 0;
+  flex: 1;
+}
+
+.workflow-connection-notice .el-button {
+  margin-left: auto;
+}
+
 .workflow-orchestration {
   margin: 18px 0;
   padding: 16px 0;
@@ -846,6 +972,17 @@ onBeforeUnmount(() => workflowStream.value?.abort())
 }
 
 @media (max-width: 640px) {
+  .workflow-connection-notice {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .workflow-connection-notice .el-button {
+    width: 100%;
+    min-height: 44px;
+    margin-left: 0;
+  }
+
   .orchestration-heading {
     flex-direction: column;
   }
