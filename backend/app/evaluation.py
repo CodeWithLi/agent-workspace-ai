@@ -388,6 +388,7 @@ def _claim_run(run: EvaluationRun, now: datetime) -> tuple[int, str]:
 def claim_next_evaluation_run(db: Session) -> tuple[int, str] | None:
     now = utc_now()
     _recover_stale_runs(db, now)
+    db.flush()
     run = db.scalar(
         select(EvaluationRun)
         .where(

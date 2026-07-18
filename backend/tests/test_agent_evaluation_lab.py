@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
@@ -12,7 +13,9 @@ from app.evaluation import (
     parse_evaluation_judge_response,
     process_evaluation_run,
     run_evaluation,
+    settings,
     retry_evaluation_run,
+    utc_now,
 )
 from app.models import Agent, AgentRole, EvaluationCase, EvaluationResult, EvaluationRun, User, UserRole
 
@@ -245,3 +248,23 @@ def test_cancel_and_retry_preserve_durable_progress(db: Session) -> None:
     assert run.status == "QUEUED"
     assert run.attempt_count == 0
     assert run.next_attempt_at is not None
+
+
+def test_stale_evaluation_is_reclaimed_with_autoflush_disabled(db: Session) -> None:
+    user, _, _ = seed_evaluation(db)
+    run, _ = enqueue_evaluation_run(db, request_id="evaluation-stale", user_id=user.id)
+    db.commit()
+
+    first_claim = claim_next_evaluation_run(db)
+    assert first_claim is not None
+
+    db.autoflush = False
+    stale = db.get(EvaluationRun, run.id)
+    stale.locked_at = utc_now() - timedelta(seconds=settings.evaluation_lease_seconds + 1)
+    db.commit()
+
+    replacement = claim_next_evaluation_run(db)
+
+    assert replacement is not None
+    assert replacement[0] == run.id
+    assert replacement[1] != first_claim[1]
