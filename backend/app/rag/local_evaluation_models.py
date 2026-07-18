@@ -122,7 +122,7 @@ class LocalOpenModelSuite:
         try:
             return await asyncio.to_thread(self._encode, texts, "passage")
         except Exception as exc:
-            raise LLMGatewayError("Local embedding model failed") from exc
+            raise LLMGatewayError(f"Local embedding model failed: {type(exc).__name__}: {exc}") from exc
 
     async def embed_queries(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -130,7 +130,7 @@ class LocalOpenModelSuite:
         try:
             return await asyncio.to_thread(self._encode, texts, "query")
         except Exception as exc:
-            raise LLMGatewayError("Local query embedding model failed") from exc
+            raise LLMGatewayError(f"Local query embedding model failed: {type(exc).__name__}: {exc}") from exc
 
     def build_semantic_chunker(
         self,
@@ -188,7 +188,7 @@ class LocalOpenModelSuite:
         try:
             return await asyncio.to_thread(self._rerank, query, rows)
         except Exception as exc:
-            raise LLMGatewayError("Local reranker failed") from exc
+            raise LLMGatewayError(f"Local reranker failed: {type(exc).__name__}: {exc}") from exc
 
     async def healthcheck(self) -> None:
         rows = await self.rerank("Connection test", [{"content": "Connection test", "score": 1.0}])
@@ -280,4 +280,4 @@ class LocalOpenModelSuite:
         try:
             return await asyncio.to_thread(self._chat, system_prompt, user_prompt, response_format)
         except Exception as exc:
-            raise LLMGatewayError("Local chat model failed") from exc
+            raise LLMGatewayError(f"Local chat model failed: {type(exc).__name__}: {exc}") from exc
