@@ -642,6 +642,39 @@ export interface TraceHealth {
   anomalies: TraceAnomaly[]
 }
 
+export type TraceAlertStatus = 'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED'
+
+export interface TraceAlert {
+  id: number
+  workflow_id: number
+  project_id: number
+  project_name: string
+  severity: 'CRITICAL' | 'WARNING'
+  status: TraceAlertStatus
+  signals: string[]
+  duration_ms: number
+  total_cost_micros: number
+  detected_at: string
+  acknowledged_by_user_id?: number | null
+  acknowledged_at?: string | null
+  resolved_by_user_id?: number | null
+  resolved_at?: string | null
+  resolution_note: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TraceAlertCollection {
+  summary: {
+    total: number
+    open: number
+    acknowledged: number
+    resolved: number
+    critical: number
+  }
+  items: TraceAlert[]
+}
+
 export interface TraceSpan {
   span_id: string
   kind: string

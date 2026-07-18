@@ -121,8 +121,14 @@
         :health="health"
         :loading="healthLoading"
         :error="healthError"
+        :alerts="alerts"
+        :alerts-loading="alertsLoading"
+        :alerts-error="alertsError"
+        :alert-action-loading="alertActionLoading"
         :can-manage-settings="auth.user?.role === 'admin'"
-        @retry="loadHealth"
+        @retry="loadObservability"
+        @retry-alerts="loadAlerts"
+        @update-alerts="updateAlerts"
         @open-run="openTrace"
         @open-settings="router.push('/settings')"
       />
@@ -405,10 +411,11 @@
 
 <script setup lang="ts">
 import { Close, DataAnalysis, Refresh, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, getApiErrorMessage } from '../api/client'
-import type { TraceComparison, TraceDetail, TraceHealth, TraceOverview, TraceRun, TraceSpan, WorkflowTraceStatus } from '../api/types'
+import type { TraceAlertCollection, TraceComparison, TraceDetail, TraceHealth, TraceOverview, TraceRun, TraceSpan, WorkflowTraceStatus } from '../api/types'
 import TraceComparisonDialog from '../components/TraceComparisonDialog.vue'
 import TraceHealthPanel from '../components/TraceHealthPanel.vue'
 import { renderTraceTrendChart, type TraceTrendChart } from '../lib/traceChart'
@@ -465,6 +472,10 @@ const overview = ref<TraceOverview | null>(null)
 const health = ref<TraceHealth | null>(null)
 const healthLoading = ref(false)
 const healthError = ref('')
+const alerts = ref<TraceAlertCollection | null>(null)
+const alertsLoading = ref(false)
+const alertsError = ref('')
+const alertActionLoading = ref(false)
 const chartElement = ref<HTMLDivElement | null>(null)
 const detail = ref<TraceDetail | null>(null)
 const detailLoading = ref(false)
@@ -571,9 +582,71 @@ async function loadHealth() {
   }
 }
 
+async function loadAlerts(sync = true) {
+  alertsLoading.value = true
+  alertsError.value = ''
+  const params = {
+    days: days.value,
+    project_id: projectId.value || undefined
+  }
+  try {
+    if (sync) {
+      await api.post('/traces/alerts/sync', null, {
+        params,
+        suppressErrorToast: true
+      })
+    }
+    const { data } = await api.get<TraceAlertCollection>('/traces/alerts', {
+      params,
+      suppressErrorToast: true
+    })
+    alerts.value = data
+  } catch (error) {
+    alertsError.value = getApiErrorMessage(error)
+  } finally {
+    alertsLoading.value = false
+  }
+}
+
+async function loadObservability() {
+  let syncError = ''
+  alertsLoading.value = true
+  healthLoading.value = true
+  try {
+    await api.post('/traces/alerts/sync', null, {
+      params: {
+        days: days.value,
+        project_id: projectId.value || undefined
+      },
+      suppressErrorToast: true
+    })
+  } catch (error) {
+    syncError = getApiErrorMessage(error)
+  }
+  await Promise.all([loadAlerts(false), loadHealth()])
+  if (syncError && !alertsError.value) alertsError.value = `自动同步失败：${syncError}`
+}
+
+async function updateAlerts(payload: { alertIds: number[]; action: 'ACKNOWLEDGE' | 'RESOLVE'; resolutionNote: string }) {
+  alertActionLoading.value = true
+  try {
+    await api.post('/traces/alerts/bulk', {
+      alert_ids: payload.alertIds,
+      action: payload.action,
+      resolution_note: payload.resolutionNote
+    })
+    ElMessage.success(payload.action === 'ACKNOWLEDGE' ? '告警已确认' : '告警已解决')
+    await loadAlerts(false)
+  } catch (error) {
+    ElMessage.error(getApiErrorMessage(error))
+  } finally {
+    alertActionLoading.value = false
+  }
+}
+
 function refreshAll() {
   void loadOverview()
-  void loadHealth()
+  void loadObservability()
 }
 
 function renderChart() {

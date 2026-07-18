@@ -619,6 +619,41 @@ async function mockApi(page: Page) {
       }
     ]
   }
+  let traceAlerts = [
+    {
+      id: 301, workflow_id: 88, project_id: 1, project_name: '灰度发布工作台', severity: 'WARNING', status: 'OPEN',
+      signals: ['成本偏离历史基线'], duration_ms: 480000, total_cost_micros: 11800,
+      detected_at: '2026-07-18T08:08:00Z', acknowledged_by_user_id: null, acknowledged_at: null,
+      resolved_by_user_id: null, resolved_at: null, resolution_note: '',
+      created_at: '2026-07-18T08:09:00Z', updated_at: '2026-07-18T08:09:00Z'
+    },
+    {
+      id: 302, workflow_id: 86, project_id: 1, project_name: '灰度发布工作台', severity: 'CRITICAL', status: 'OPEN',
+      signals: ['运行失败', '耗时超过 SLO'], duration_ms: 840000, total_cost_micros: 9200,
+      detected_at: '2026-07-17T06:14:00Z', acknowledged_by_user_id: null, acknowledged_at: null,
+      resolved_by_user_id: null, resolved_at: null, resolution_note: '',
+      created_at: '2026-07-17T06:15:00Z', updated_at: '2026-07-17T06:15:00Z'
+    },
+    {
+      id: 303, workflow_id: 85, project_id: 1, project_name: '灰度发布工作台', severity: 'WARNING', status: 'ACKNOWLEDGED',
+      signals: ['P95 耗时超过 SLO'], duration_ms: 700000, total_cost_micros: 8500,
+      detected_at: '2026-07-16T06:14:00Z', acknowledged_by_user_id: 1, acknowledged_at: '2026-07-16T06:20:00Z',
+      resolved_by_user_id: null, resolved_at: null, resolution_note: '',
+      created_at: '2026-07-16T06:15:00Z', updated_at: '2026-07-16T06:20:00Z'
+    }
+  ]
+  function traceAlertCollection() {
+    return {
+      summary: {
+        total: traceAlerts.length,
+        open: traceAlerts.filter((item) => item.status === 'OPEN').length,
+        acknowledged: traceAlerts.filter((item) => item.status === 'ACKNOWLEDGED').length,
+        resolved: traceAlerts.filter((item) => item.status === 'RESOLVED').length,
+        critical: traceAlerts.filter((item) => item.severity === 'CRITICAL').length
+      },
+      items: traceAlerts
+    }
+  }
   type MockGenerationJob = {
     job_id: number
     operation: 'CREATE' | 'REGENERATE'
@@ -1021,6 +1056,23 @@ async function mockApi(page: Page) {
     }
     else if (method === 'GET' && path === '/traces/overview') body = traceOverview
     else if (method === 'GET' && path === '/traces/health') body = traceHealth
+    else if (method === 'POST' && path === '/traces/alerts/sync') body = { created_count: 0 }
+    else if (method === 'GET' && path === '/traces/alerts') body = traceAlertCollection()
+    else if (method === 'POST' && path === '/traces/alerts/bulk') {
+      const input = request.postDataJSON() as { alert_ids: number[]; action: 'ACKNOWLEDGE' | 'RESOLVE'; resolution_note: string }
+      const now = '2026-07-18T09:00:00Z'
+      traceAlerts = traceAlerts.map((item) => {
+        if (!input.alert_ids.includes(item.id)) return item
+        if (input.action === 'ACKNOWLEDGE' && item.status === 'OPEN') {
+          return { ...item, status: 'ACKNOWLEDGED', acknowledged_by_user_id: 1, acknowledged_at: now, updated_at: now }
+        }
+        if (input.action === 'RESOLVE' && item.status !== 'RESOLVED') {
+          return { ...item, status: 'RESOLVED', resolved_by_user_id: 1, resolved_at: now, resolution_note: input.resolution_note, updated_at: now }
+        }
+        return item
+      })
+      body = traceAlerts.filter((item) => input.alert_ids.includes(item.id))
+    }
     else if (method === 'GET' && path === '/traces/compare') body = traceComparison
     else if (method === 'GET' && path === '/traces/88') body = traceDetail
     else if (method === 'GET' && path === '/agents') body = discussionAgents
@@ -1260,6 +1312,55 @@ test('monitors SLO error budget and drills into anomalous runs', async ({ page }
   await expect(page.getByRole('heading', { name: '#88 · 灰度发布工作台' })).toBeVisible()
   await page.getByRole('button', { name: '关闭运行追踪' }).click()
   await expect(page).toHaveURL(/\/traces$/)
+})
+
+test('acknowledges, batches and resolves durable trace alerts', async ({ page }, testInfo) => {
+  await page.goto('/traces')
+
+  await expect(page.getByRole('heading', { name: '告警处理' })).toBeVisible()
+  const alertSurface = page.locator('.alert-desktop-table:visible, .alert-mobile-list:visible')
+  await expect(alertSurface).toContainText('#88')
+  await expect(alertSurface).toContainText('#86')
+  await expect(alertSurface).toContainText('#85')
+
+  const alert88 = page.locator('.alert-desktop-table:visible tr, .alert-mobile-list:visible .alert-mobile-card').filter({ hasText: '#88' })
+  await alert88.getByRole('button', { name: '确认', exact: true }).click()
+  await expect(alert88.getByText('处理中', { exact: true })).toBeVisible()
+
+  const alert86 = page.locator('.alert-desktop-table:visible tr, .alert-mobile-list:visible .alert-mobile-card').filter({ hasText: '#86' })
+  if (testInfo.project.name === 'mobile-chromium') {
+    const checkboxTarget = await alert86.locator('.el-checkbox').evaluate((checkbox) => {
+      const rect = checkbox.getBoundingClientRect()
+      return { width: rect.width, height: rect.height }
+    })
+    expect(checkboxTarget.width).toBeGreaterThanOrEqual(44)
+    expect(checkboxTarget.height).toBeGreaterThanOrEqual(44)
+  }
+  await alert86.locator('.el-checkbox').click()
+  await page.getByRole('button', { name: '批量确认' }).click()
+  await expect(alert86.getByText('处理中', { exact: true })).toBeVisible()
+
+  await alert88.getByRole('button', { name: '解决', exact: true }).click()
+  const resolutionDialog = page.getByRole('dialog', { name: '解决告警' })
+  await expect(resolutionDialog.getByRole('button', { name: '确认解决' })).toBeDisabled()
+  await resolutionDialog.getByLabel('处理说明').fill('已切换低成本模型并完成回归验证')
+  await resolutionDialog.getByRole('button', { name: '确认解决' }).click()
+  await expect(alert88).toHaveCount(0)
+
+  await page.getByText('全部', { exact: true }).click()
+  const resolvedAlert = page.locator('.alert-desktop-table:visible tr, .alert-mobile-list:visible .alert-mobile-card').filter({ hasText: '#88' })
+  await expect(resolvedAlert.getByText('已解决', { exact: true })).toBeVisible()
+  if (testInfo.project.name === 'mobile-chromium') {
+    await expect(resolvedAlert).toContainText('已切换低成本模型并完成回归验证')
+    const actionHeights = await resolvedAlert.locator('.alert-mobile-actions .el-button').evaluateAll((buttons) => (
+      buttons.map((button) => button.getBoundingClientRect().height)
+    ))
+    expect(actionHeights.every((height) => height >= 44)).toBeTruthy()
+  }
+
+  await page.getByRole('button', { name: '刷新运行追踪' }).click()
+  await expect(resolvedAlert).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
 test('compares multi-agent runs and restores the comparison deep link', async ({ page }, testInfo) => {

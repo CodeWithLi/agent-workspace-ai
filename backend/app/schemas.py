@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models import AgentRole, ProjectMemberRole, SagaStepStatus, TaskStatus, UserRole, WorkflowStatus
+from app.models import AgentRole, ProjectMemberRole, SagaStepStatus, TaskStatus, TraceAlertStatus, UserRole, WorkflowStatus
 
 
 class UserCreate(BaseModel):
@@ -641,6 +641,64 @@ class TraceHealthOut(BaseModel):
     summary: TraceHealthSummaryOut
     metrics: list[TraceSLOMetricOut]
     anomalies: list[TraceAnomalyOut]
+
+
+class TraceAlertOut(BaseModel):
+    id: int
+    workflow_id: int
+    project_id: int
+    project_name: str
+    severity: str
+    status: TraceAlertStatus
+    signals: list[str]
+    duration_ms: int
+    total_cost_micros: int
+    detected_at: datetime
+    acknowledged_by_user_id: int | None
+    acknowledged_at: datetime | None
+    resolved_by_user_id: int | None
+    resolved_at: datetime | None
+    resolution_note: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class TraceAlertSummaryOut(BaseModel):
+    total: int
+    open: int
+    acknowledged: int
+    resolved: int
+    critical: int
+
+
+class TraceAlertCollectionOut(BaseModel):
+    summary: TraceAlertSummaryOut
+    items: list[TraceAlertOut]
+
+
+class TraceAlertSyncOut(BaseModel):
+    created_count: int
+
+
+class TraceAlertBulkUpdate(BaseModel):
+    alert_ids: list[int] = Field(min_length=1, max_length=100)
+    action: str
+    resolution_note: str = Field(default="", max_length=500)
+
+    @field_validator("alert_ids")
+    @classmethod
+    def validate_alert_ids(cls, value: list[int]) -> list[int]:
+        if any(item <= 0 for item in value):
+            raise ValueError("Alert IDs must be positive")
+        return list(dict.fromkeys(value))
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in {"ACKNOWLEDGE", "RESOLVE"}:
+            raise ValueError("Alert action must be ACKNOWLEDGE or RESOLVE")
+        return normalized
 
 
 class TraceSpanOut(BaseModel):

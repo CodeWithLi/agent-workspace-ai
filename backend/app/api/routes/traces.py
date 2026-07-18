@@ -3,9 +3,26 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.models import User, WorkflowStatus
-from app.observability import compare_trace_runs, get_trace_detail, get_trace_health, get_trace_overview
-from app.schemas import TraceComparisonOut, TraceDetailOut, TraceHealthOut, TraceOverviewOut
+from app.models import TraceAlertStatus, User, WorkflowStatus
+from app.observability import (
+    compare_trace_runs,
+    get_trace_alerts,
+    get_trace_detail,
+    get_trace_health,
+    get_trace_overview,
+    sync_trace_alerts,
+    transition_trace_alerts,
+)
+from app.schemas import (
+    TraceAlertBulkUpdate,
+    TraceAlertCollectionOut,
+    TraceAlertOut,
+    TraceAlertSyncOut,
+    TraceComparisonOut,
+    TraceDetailOut,
+    TraceHealthOut,
+    TraceOverviewOut,
+)
 
 
 router = APIRouter()
@@ -56,6 +73,59 @@ def trace_health(
         days=days,
         project_id=project_id,
     )
+
+
+@router.post("/alerts/sync", response_model=TraceAlertSyncOut)
+def trace_alert_sync(
+    days: int = Query(default=30, ge=1, le=90),
+    project_id: int | None = Query(default=None, ge=1),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TraceAlertSyncOut:
+    created_count = sync_trace_alerts(
+        db,
+        current_user,
+        days=days,
+        project_id=project_id,
+    )
+    db.commit()
+    return TraceAlertSyncOut(created_count=created_count)
+
+
+@router.get("/alerts", response_model=TraceAlertCollectionOut)
+def trace_alerts(
+    days: int = Query(default=30, ge=1, le=90),
+    project_id: int | None = Query(default=None, ge=1),
+    alert_status: TraceAlertStatus | None = Query(default=None, alias="status"),
+    severity: str | None = Query(default=None, pattern="^(WARNING|CRITICAL)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TraceAlertCollectionOut:
+    return get_trace_alerts(
+        db,
+        current_user,
+        days=days,
+        project_id=project_id,
+        alert_status=alert_status,
+        severity=severity,
+    )
+
+
+@router.post("/alerts/bulk", response_model=list[TraceAlertOut])
+def trace_alert_bulk_update(
+    payload: TraceAlertBulkUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TraceAlertOut]:
+    alerts = transition_trace_alerts(
+        db,
+        current_user,
+        alert_ids=payload.alert_ids,
+        action=payload.action,
+        resolution_note=payload.resolution_note,
+    )
+    db.commit()
+    return alerts
 
 
 @router.get("/{workflow_id}", response_model=TraceDetailOut)

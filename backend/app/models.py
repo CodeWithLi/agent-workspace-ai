@@ -48,6 +48,12 @@ class WorkflowStatus(str, Enum):
     failed = "FAILED"
 
 
+class TraceAlertStatus(str, Enum):
+    open = "OPEN"
+    acknowledged = "ACKNOWLEDGED"
+    resolved = "RESOLVED"
+
+
 class SagaStepStatus(str, Enum):
     pending = "PENDING"
     executing = "EXECUTING"
@@ -129,6 +135,7 @@ class Project(Base):
     prototypes: Mapped[list["ProductPrototype"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    trace_alerts: Mapped[list["TraceAlert"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     member_links: Mapped[list["ProjectMember"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
@@ -796,6 +803,50 @@ class WorkflowRun(Base):
     saga_steps: Mapped[list["WorkflowSagaStep"]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan"
     )
+    trace_alert: Mapped["TraceAlert | None"] = relationship(
+        back_populates="workflow", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class TraceAlert(Base):
+    __tablename__ = "trace_alerts"
+    __table_args__ = (
+        UniqueConstraint("workflow_id", name="uq_trace_alert_workflow"),
+        CheckConstraint("severity IN ('WARNING','CRITICAL')", name="ck_trace_alert_severity"),
+        Index("ix_trace_alert_scope", "user_id", "status", "detected_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    workflow_id: Mapped[int] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    severity: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[TraceAlertStatus] = mapped_column(
+        SqlEnum(
+            TraceAlertStatus,
+            values_callable=lambda enum: [item.value for item in enum],
+            native_enum=False,
+        ),
+        default=TraceAlertStatus.open,
+        index=True,
+    )
+    signals_json: Mapped[str] = mapped_column(Text, default="[]")
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    total_cost_micros: Mapped[int] = mapped_column(Integer, default=0)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    acknowledged_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    workflow: Mapped[WorkflowRun] = relationship(back_populates="trace_alert")
+    project: Mapped[Project] = relationship(back_populates="trace_alerts")
 
 
 class WorkflowEvent(Base):

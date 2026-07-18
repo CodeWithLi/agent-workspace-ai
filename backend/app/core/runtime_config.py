@@ -174,6 +174,35 @@ CONFIG_DEFINITIONS = {
             minimum=1.5,
             maximum=6,
         ),
+        ConfigDefinition(
+            "observability_alert_worker_enabled",
+            "Alert Worker Enabled",
+            "observability",
+            bool,
+            restart_required=True,
+        ),
+        ConfigDefinition(
+            "observability_alert_poll_seconds",
+            "Alert Poll Seconds",
+            "observability",
+            int,
+            minimum=5,
+            maximum=3600,
+        ),
+        ConfigDefinition(
+            "observability_alert_lookback_days",
+            "Alert Lookback Days",
+            "observability",
+            int,
+            minimum=1,
+            maximum=90,
+        ),
+        ConfigDefinition(
+            "observability_alert_email_enabled",
+            "Alert Email Enabled",
+            "observability",
+            bool,
+        ),
     )
 }
 BASE_VALUES = {key: getattr(settings, key) for key in CONFIG_DEFINITIONS}

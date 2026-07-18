@@ -10,17 +10,29 @@ from app.main import app
 from app.models import (
     Agent,
     AgentRole,
+    AuditLog,
     LLMUsage,
+    Notification,
     Project,
     ProjectMember,
     ProjectMemberRole,
+    TraceAlert,
+    TraceAlertStatus,
     User,
     UserRole,
     WorkflowEvent,
     WorkflowRun,
     WorkflowStatus,
 )
-from app.observability import compare_trace_runs, get_trace_detail, get_trace_health, get_trace_overview
+from app.observability import (
+    compare_trace_runs,
+    get_trace_alerts,
+    get_trace_detail,
+    get_trace_health,
+    get_trace_overview,
+    sync_trace_alerts,
+    transition_trace_alerts,
+)
 
 
 NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
@@ -560,6 +572,155 @@ def test_trace_health_detects_history_outliers_without_exposing_run_content(
     assert "outlier-secret" not in serialized
 
 
+def test_trace_alert_sync_is_idempotent_scoped_and_routes_notifications(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    project, outlier = _add_health_history(db, data["admin"])
+    monkeypatch.setattr(observability.settings, "observability_slo_min_runs", 5)
+    monkeypatch.setattr(observability.settings, "observability_slo_p95_duration_ms", 2_000_000)
+    monkeypatch.setattr(observability.settings, "observability_slo_average_cost_micros", 100_000)
+    monkeypatch.setattr(observability.settings, "observability_anomaly_sensitivity", 3.0)
+    monkeypatch.setattr(observability.settings, "observability_alert_email_enabled", True, raising=False)
+
+    assert sync_trace_alerts(db, data["admin"], days=7, project_id=None) == 2
+    db.commit()
+    alerts = list(db.query(TraceAlert).order_by(TraceAlert.workflow_id))
+    assert {item.workflow_id for item in alerts} == {data["failed"].id, outlier.id}
+    outlier_alert = next(item for item in alerts if item.workflow_id == outlier.id)
+    assert outlier_alert.project_id == project.id
+    assert json.loads(outlier_alert.signals_json) == ["耗时偏离历史基线", "成本偏离历史基线"]
+    assert outlier_alert.status == TraceAlertStatus.open
+    assert outlier_alert.severity == "WARNING"
+
+    notifications = list(db.query(Notification).order_by(Notification.id))
+    assert len(notifications) == 4
+    assert {item.channel for item in notifications} == {"in_app", "email"}
+    assert all(item.status == ("SENT" if item.channel == "in_app" else "SCHEDULED") for item in notifications)
+    assert sync_trace_alerts(db, data["admin"], days=7, project_id=None) == 0
+    db.commit()
+    assert db.query(Notification).count() == 4
+
+    admin_alerts = get_trace_alerts(db, data["admin"], days=7, project_id=None, alert_status=None, severity=None)
+    assert admin_alerts.summary.total == 2
+    assert admin_alerts.summary.open == 2
+    assert {item.workflow_id for item in admin_alerts.items} == {data["failed"].id, outlier.id}
+    assert get_trace_alerts(db, data["alice"], days=7, project_id=None, alert_status=None, severity=None).items == []
+    bob_alerts = get_trace_alerts(db, data["bob"], days=7, project_id=None, alert_status=None, severity=None)
+    assert [item.workflow_id for item in bob_alerts.items] == [data["failed"].id]
+    data["beta"].owner_id = data["admin"].id
+    membership = db.query(ProjectMember).filter_by(project_id=data["beta"].id, user_id=data["bob"].id).one()
+    db.delete(membership)
+    db.commit()
+    assert get_trace_alerts(
+        db,
+        data["bob"],
+        days=7,
+        project_id=None,
+        alert_status=None,
+        severity=None,
+    ).items == []
+    serialized = admin_alerts.model_dump_json()
+    assert "health-secret" not in serialized
+    assert "outlier-secret" not in serialized
+    assert "other-secret-prompt" not in serialized
+
+
+def test_trace_alert_sync_backfills_more_than_health_response_limit(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    base = NOW - timedelta(hours=5)
+    db.add_all(
+        [
+            WorkflowRun(
+                project_id=data["beta"].id,
+                user_id=data["bob"].id,
+                status=WorkflowStatus.failed,
+                current_node="architect",
+                created_at=base + timedelta(minutes=index * 2),
+                started_at=base + timedelta(minutes=index * 2, seconds=10),
+                finished_at=base + timedelta(minutes=index * 2 + 1),
+            )
+            for index in range(25)
+        ]
+    )
+    db.commit()
+    monkeypatch.setattr(observability.settings, "observability_slo_p95_duration_ms", 2_000_000)
+    monkeypatch.setattr(observability.settings, "observability_slo_average_cost_micros", 100_000)
+    monkeypatch.setattr(observability.settings, "observability_alert_email_enabled", False, raising=False)
+
+    assert sync_trace_alerts(db, data["admin"], days=7, project_id=None) == 26
+    db.commit()
+    assert db.query(TraceAlert).count() == 26
+
+
+def test_trace_alert_state_machine_is_scoped_audited_and_idempotent(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    monkeypatch.setattr(observability.settings, "observability_slo_min_runs", 5)
+    monkeypatch.setattr(observability.settings, "observability_slo_p95_duration_ms", 2_000_000)
+    monkeypatch.setattr(observability.settings, "observability_slo_average_cost_micros", 100_000)
+    monkeypatch.setattr(observability.settings, "observability_alert_email_enabled", False, raising=False)
+    assert sync_trace_alerts(db, data["admin"], days=7, project_id=None) == 1
+    db.commit()
+    alert = db.query(TraceAlert).one()
+
+    with pytest.raises(HTTPException) as hidden:
+        transition_trace_alerts(
+            db,
+            data["alice"],
+            alert_ids=[alert.id],
+            action="ACKNOWLEDGE",
+            resolution_note="",
+        )
+    assert hidden.value.status_code == 404
+
+    acknowledged = transition_trace_alerts(
+        db,
+        data["bob"],
+        alert_ids=[alert.id],
+        action="ACKNOWLEDGE",
+        resolution_note="",
+    )
+    db.commit()
+    assert acknowledged[0].status == TraceAlertStatus.acknowledged
+    assert acknowledged[0].acknowledged_by_user_id == data["bob"].id
+    assert transition_trace_alerts(
+        db,
+        data["bob"],
+        alert_ids=[alert.id],
+        action="ACKNOWLEDGE",
+        resolution_note="",
+    )[0].status == TraceAlertStatus.acknowledged
+
+    resolved = transition_trace_alerts(
+        db,
+        data["bob"],
+        alert_ids=[alert.id],
+        action="RESOLVE",
+        resolution_note="已修复模型超时并完成复盘",
+    )
+    db.commit()
+    assert resolved[0].status == TraceAlertStatus.resolved
+    assert resolved[0].resolution_note == "已修复模型超时并完成复盘"
+    with pytest.raises(HTTPException) as backwards:
+        transition_trace_alerts(
+            db,
+            data["bob"],
+            alert_ids=[alert.id],
+            action="ACKNOWLEDGE",
+            resolution_note="",
+        )
+    assert backwards.value.status_code == 409
+    actions = {item.action for item in db.query(AuditLog).filter(AuditLog.resource_type == "trace_alert")}
+    assert {"trace_alert.created", "trace_alert.acknowledge", "trace_alert.resolve"}.issubset(actions)
+
+
 def test_trace_detail_pairs_spans_assigns_usage_and_redacts_payloads(db: Session) -> None:
     data = _seed_trace_data(db)
 
@@ -762,5 +923,8 @@ def test_trace_routes_are_published_in_openapi() -> None:
     paths = app.openapi()["paths"]
     assert "/api/v1/traces/overview" in paths
     assert "/api/v1/traces/health" in paths
+    assert "/api/v1/traces/alerts" in paths
+    assert "/api/v1/traces/alerts/sync" in paths
+    assert "/api/v1/traces/alerts/bulk" in paths
     assert "/api/v1/traces/compare" in paths
     assert "/api/v1/traces/{workflow_id}" in paths

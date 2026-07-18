@@ -9,15 +9,20 @@ from statistics import median
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.models import (
     Agent,
     LLMUsage,
+    Notification,
     Project,
     ProjectMember,
+    TraceAlert,
+    TraceAlertStatus,
     User,
     UserRole,
     WorkflowEvent,
@@ -26,6 +31,9 @@ from app.models import (
 )
 from app.schemas import (
     TraceAgentMetricOut,
+    TraceAlertCollectionOut,
+    TraceAlertOut,
+    TraceAlertSummaryOut,
     TraceAnomalyOut,
     TraceBottleneckOut,
     TraceComparisonAgentOut,
@@ -56,6 +64,8 @@ USAGE_ANALYSIS_LIMIT = 50_000
 BOTTLENECK_RUN_LIMIT = 500
 RECENT_RUN_LIMIT = 100
 ANOMALY_LIMIT = 20
+ALERT_LIST_LIMIT = 200
+ALERT_SYNC_CREATE_LIMIT = 100
 settings = get_settings()
 
 ACTIVE_STATUSES = {
@@ -209,6 +219,17 @@ def _scope_conditions(
     if workflow_status is not None:
         conditions.append(WorkflowRun.status == workflow_status)
     return conditions
+
+
+def _accessible_project_ids(user: User):
+    return (
+        select(Project.id)
+        .outerjoin(
+            ProjectMember,
+            (ProjectMember.project_id == Project.id) & (ProjectMember.user_id == user.id),
+        )
+        .where(or_(Project.owner_id == user.id, ProjectMember.user_id == user.id))
+    )
 
 
 def _span_terminal_status(workflow: WorkflowRun) -> str:
@@ -556,6 +577,7 @@ def _trace_anomalies(
     *,
     costs: dict[int, int],
     projects: dict[int, Project],
+    limit: int | None = ANOMALY_LIMIT,
 ) -> list[TraceAnomalyOut]:
     grouped: dict[int, list[WorkflowRun]] = defaultdict(list)
     for workflow in workflows:
@@ -606,7 +628,330 @@ def _trace_anomalies(
                     detected_at=workflow.finished_at or workflow.created_at,
                 )
             )
-    return sorted(rows, key=lambda item: (_utc(item.detected_at), item.workflow_id), reverse=True)[:ANOMALY_LIMIT]
+    ordered = sorted(rows, key=lambda item: (_utc(item.detected_at), item.workflow_id), reverse=True)
+    return ordered[:limit] if limit is not None else ordered
+
+
+def _terminal_workflows(
+    db: Session,
+    current_user: User | None,
+    *,
+    days: int,
+    project_id: int | None,
+) -> list[WorkflowRun]:
+    start_at = _utc_now() - timedelta(days=days)
+    if current_user is not None:
+        _ensure_project_filter(project_id, current_user, db)
+        conditions = _scope_conditions(
+            current_user,
+            start_at,
+            project_id=project_id,
+            workflow_status=None,
+        )
+        if current_user.role != UserRole.admin:
+            conditions.append(WorkflowRun.project_id.in_(_accessible_project_ids(current_user)))
+    else:
+        conditions = [WorkflowRun.created_at >= start_at]
+        if project_id is not None:
+            conditions.append(WorkflowRun.project_id == project_id)
+    return list(
+        db.scalars(
+            select(WorkflowRun)
+            .where(
+                *conditions,
+                WorkflowRun.finished_at.is_not(None),
+                WorkflowRun.status.in_(HEALTH_STATUSES),
+            )
+            .order_by(WorkflowRun.created_at.desc(), WorkflowRun.id.desc())
+            .limit(RUN_ANALYSIS_LIMIT)
+        )
+    )
+
+
+def _workflow_costs(db: Session, workflow_ids: list[int]) -> dict[int, int]:
+    if not workflow_ids:
+        return {}
+    return {
+        workflow_id: int(cost)
+        for workflow_id, cost in db.execute(
+            select(
+                LLMUsage.workflow_id,
+                func.coalesce(func.sum(LLMUsage.estimated_cost_micros), 0),
+            )
+            .where(LLMUsage.workflow_id.in_(workflow_ids))
+            .group_by(LLMUsage.workflow_id)
+        ).all()
+        if workflow_id is not None
+    }
+
+
+def _project_map(db: Session, project_ids: set[int]) -> dict[int, Project]:
+    if not project_ids:
+        return {}
+    return {
+        item.id: item
+        for item in db.scalars(select(Project).where(Project.id.in_(project_ids)))
+    }
+
+
+def _alert_notifications(
+    db: Session,
+    *,
+    alert: TraceAlert,
+    workflow: WorkflowRun,
+    project: Project | None,
+    signals: list[str],
+    now: datetime,
+) -> None:
+    user = db.get(User, workflow.user_id)
+    project_name = project.name if project else f"Project #{workflow.project_id}"
+    severity_label = "严重" if alert.severity == "CRITICAL" else "警告"
+    title = f"[{severity_label}] 工作流 #{workflow.id} 运行告警"
+    content = f"项目：{project_name}\n运行：#{workflow.id}\n信号：{'、'.join(signals)}"
+    db.add(
+        Notification(
+            project_id=workflow.project_id,
+            user_id=workflow.user_id,
+            recipient_user_id=workflow.user_id,
+            recipient_email=user.email if user else "",
+            title=title,
+            content=content,
+            channel="in_app",
+            status="SENT",
+            sent_at=now,
+        )
+    )
+    if settings.observability_alert_email_enabled and user and user.email:
+        db.add(
+            Notification(
+                project_id=workflow.project_id,
+                user_id=workflow.user_id,
+                recipient_user_id=workflow.user_id,
+                recipient_email=user.email,
+                title=title,
+                content=content,
+                channel="email",
+                schedule_at=now.isoformat(),
+                scheduled_for=now,
+                status="SCHEDULED",
+            )
+        )
+
+
+def sync_trace_alerts(
+    db: Session,
+    current_user: User | None,
+    *,
+    days: int,
+    project_id: int | None,
+) -> int:
+    now = _utc_now()
+    workflows = _terminal_workflows(
+        db,
+        current_user,
+        days=days,
+        project_id=project_id,
+    )
+    workflow_ids = [item.id for item in workflows]
+    costs = _workflow_costs(db, workflow_ids)
+    projects = _project_map(db, {item.project_id for item in workflows})
+    anomalies = _trace_anomalies(workflows, costs=costs, projects=projects, limit=None)
+    existing_ids = set(
+        db.scalars(select(TraceAlert.workflow_id).where(TraceAlert.workflow_id.in_([item.workflow_id for item in anomalies])))
+    ) if anomalies else set()
+    workflows_by_id = {item.id: item for item in workflows}
+    created_count = 0
+    pending_anomalies = [item for item in anomalies if item.workflow_id not in existing_ids][:ALERT_SYNC_CREATE_LIMIT]
+    for anomaly in pending_anomalies:
+        workflow = workflows_by_id[anomaly.workflow_id]
+        try:
+            with db.begin_nested():
+                alert = TraceAlert(
+                    workflow_id=workflow.id,
+                    project_id=workflow.project_id,
+                    user_id=workflow.user_id,
+                    severity=anomaly.severity,
+                    status=TraceAlertStatus.open,
+                    signals_json=json.dumps(anomaly.signals, ensure_ascii=False),
+                    duration_ms=anomaly.duration_ms,
+                    total_cost_micros=anomaly.total_cost_micros,
+                    detected_at=anomaly.detected_at,
+                    last_seen_at=now,
+                )
+                db.add(alert)
+                db.flush()
+                _alert_notifications(
+                    db,
+                    alert=alert,
+                    workflow=workflow,
+                    project=projects.get(workflow.project_id),
+                    signals=anomaly.signals,
+                    now=now,
+                )
+                record_audit(
+                    db,
+                    "trace_alert.created",
+                    project_id=workflow.project_id,
+                    resource_type="trace_alert",
+                    resource_id=alert.id,
+                    details={"workflow_id": workflow.id, "severity": alert.severity},
+                )
+            created_count += 1
+        except IntegrityError:
+            continue
+    return created_count
+
+
+def _alert_accessible(alert: TraceAlert, user: User, db: Session) -> bool:
+    if user.role == UserRole.admin:
+        return True
+    return alert.user_id == user.id and _project_accessible(alert.project_id, user, db)
+
+
+def _alert_signals(alert: TraceAlert) -> list[str]:
+    try:
+        value = json.loads(alert.signals_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _alert_out(alert: TraceAlert, projects: dict[int, Project]) -> TraceAlertOut:
+    project = projects.get(alert.project_id)
+    return TraceAlertOut(
+        id=alert.id,
+        workflow_id=alert.workflow_id,
+        project_id=alert.project_id,
+        project_name=project.name if project else f"Project #{alert.project_id}",
+        severity=alert.severity,
+        status=alert.status,
+        signals=_alert_signals(alert),
+        duration_ms=alert.duration_ms,
+        total_cost_micros=alert.total_cost_micros,
+        detected_at=alert.detected_at,
+        acknowledged_by_user_id=alert.acknowledged_by_user_id,
+        acknowledged_at=alert.acknowledged_at,
+        resolved_by_user_id=alert.resolved_by_user_id,
+        resolved_at=alert.resolved_at,
+        resolution_note=alert.resolution_note,
+        created_at=alert.created_at,
+        updated_at=alert.updated_at,
+    )
+
+
+def get_trace_alerts(
+    db: Session,
+    current_user: User,
+    *,
+    days: int,
+    project_id: int | None,
+    alert_status: TraceAlertStatus | None,
+    severity: str | None,
+) -> TraceAlertCollectionOut:
+    _ensure_project_filter(project_id, current_user, db)
+    start_at = _utc_now() - timedelta(days=days)
+    base_conditions: list[Any] = [TraceAlert.detected_at >= start_at]
+    if current_user.role != UserRole.admin:
+        base_conditions.append(TraceAlert.user_id == current_user.id)
+        base_conditions.append(TraceAlert.project_id.in_(_accessible_project_ids(current_user)))
+    if project_id is not None:
+        base_conditions.append(TraceAlert.project_id == project_id)
+    status_counts = {
+        item.value if isinstance(item, TraceAlertStatus) else str(item): count
+        for item, count in db.execute(
+            select(TraceAlert.status, func.count(TraceAlert.id))
+            .where(*base_conditions)
+            .group_by(TraceAlert.status)
+        )
+    }
+    critical = int(
+        db.scalar(
+            select(func.count(TraceAlert.id)).where(*base_conditions, TraceAlert.severity == "CRITICAL")
+        )
+        or 0
+    )
+    item_conditions = list(base_conditions)
+    if alert_status is not None:
+        item_conditions.append(TraceAlert.status == alert_status)
+    if severity is not None:
+        item_conditions.append(TraceAlert.severity == severity)
+    alerts = list(
+        db.scalars(
+            select(TraceAlert)
+            .where(*item_conditions)
+            .order_by(TraceAlert.status.desc(), TraceAlert.detected_at.desc(), TraceAlert.id.desc())
+            .limit(ALERT_LIST_LIMIT)
+        )
+    )
+    projects = _project_map(db, {item.project_id for item in alerts})
+    return TraceAlertCollectionOut(
+        summary=TraceAlertSummaryOut(
+            total=sum(status_counts.values()),
+            open=status_counts.get(TraceAlertStatus.open.value, 0),
+            acknowledged=status_counts.get(TraceAlertStatus.acknowledged.value, 0),
+            resolved=status_counts.get(TraceAlertStatus.resolved.value, 0),
+            critical=critical,
+        ),
+        items=[_alert_out(item, projects) for item in alerts],
+    )
+
+
+def transition_trace_alerts(
+    db: Session,
+    current_user: User,
+    *,
+    alert_ids: list[int],
+    action: str,
+    resolution_note: str,
+) -> list[TraceAlertOut]:
+    normalized_action = action.strip().upper()
+    if normalized_action not in {"ACKNOWLEDGE", "RESOLVE"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid alert action")
+    note = resolution_note.strip()
+    if normalized_action == "RESOLVE" and not note:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Resolution note is required")
+    unique_ids = list(dict.fromkeys(alert_ids))
+    alerts = list(
+        db.scalars(
+            select(TraceAlert)
+            .where(TraceAlert.id.in_(unique_ids))
+            .with_for_update()
+        )
+    )
+    if len(alerts) != len(unique_ids) or any(not _alert_accessible(item, current_user, db) for item in alerts):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trace alert not found")
+    alerts_by_id = {item.id: item for item in alerts}
+    ordered = [alerts_by_id[item] for item in unique_ids]
+    now = _utc_now()
+    for alert in ordered:
+        changed = False
+        if normalized_action == "ACKNOWLEDGE":
+            if alert.status == TraceAlertStatus.resolved:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resolved alerts cannot be acknowledged")
+            if alert.status == TraceAlertStatus.open:
+                alert.status = TraceAlertStatus.acknowledged
+                alert.acknowledged_by_user_id = current_user.id
+                alert.acknowledged_at = now
+                changed = True
+        elif alert.status != TraceAlertStatus.resolved:
+            alert.status = TraceAlertStatus.resolved
+            alert.resolved_by_user_id = current_user.id
+            alert.resolved_at = now
+            alert.resolution_note = note
+            changed = True
+        if changed:
+            record_audit(
+                db,
+                f"trace_alert.{normalized_action.lower()}",
+                current_user.id,
+                alert.project_id,
+                "trace_alert",
+                alert.id,
+                {"workflow_id": alert.workflow_id},
+            )
+    db.flush()
+    projects = _project_map(db, {item.project_id for item in ordered})
+    return [_alert_out(item, projects) for item in ordered]
 
 
 def get_trace_health(

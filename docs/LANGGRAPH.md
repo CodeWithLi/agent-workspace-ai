@@ -54,6 +54,10 @@ SLO 健康度只使用已结束的成功或失败运行，按当前追踪权限�
 
 异常检测不会把不同项目混为同一基线。每个新运行只与同项目更早的终态运行比较，使用中位数和 MAD 的稳健上界识别耗时与成本偏离，同时保留失败和静态 SLO 超限信号。结果最多返回最近 20 条异常元数据，可直接下钻到运行详情，不持久化 Prompt 或产物内容。
 
+后台告警扫描器按配置周期重新计算最近终态运行，将异常信号幂等持久化到 `trace_alerts`。健康接口仍只返回最近 20 条即时诊断；持久化扫描则在过滤已有 `workflow_id` 后每轮最多回填 100 条，因此历史异常不会因展示上限而永久遗漏，也不会在首次部署时无界发送通知。
+
+告警处理采用 `OPEN -> ACKNOWLEDGED -> RESOLVED` 单向状态机，并允许直接从 `OPEN` 解决。确认人、解决人、时间和处理说明均持久化并进入审计日志；已解决告警不会因后续扫描重新打开。管理员可处理全平台告警，普通成员只能处理本人发起且仍有项目访问权的运行告警。创建时发送站内通知，可选接入现有 SMTP 异步投递队列。
+
 追踪属于运行元数据视图：响应不读取或返回 `state_json`、Prompt、人工反馈和产物正文，事件 payload 使用字段允许列表。管理员可查看全平台运行，普通成员只能查看本人发起且仍可访问对应项目的运行。
 
 ## Saga 写操作一致性
@@ -79,4 +83,4 @@ dispatcher 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 支持多副本。`locked_
 
 运行中的 worker 使用 `lease_token` fencing，并以租约时长三分之一为周期续租。所有节点提交和 Saga 写入都会锁定工作流行并校验 token；旧 worker 即使在超时后恢复，也不能提交业务写入。
 
-实现文件：`backend/app/langgraph/workflow.py`、`backend/app/observability.py`、`frontend/src/views/TraceCenterView.vue`、`frontend/src/components/TraceComparisonDialog.vue`、`frontend/src/components/TraceHealthPanel.vue`。
+实现文件：`backend/app/langgraph/workflow.py`、`backend/app/observability.py`、`backend/app/services/trace_alerts.py`、`frontend/src/views/TraceCenterView.vue`、`frontend/src/components/TraceComparisonDialog.vue`、`frontend/src/components/TraceHealthPanel.vue`。

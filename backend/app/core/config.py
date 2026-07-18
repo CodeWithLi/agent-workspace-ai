@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     observability_slo_average_cost_micros: int = Field(default=50_000, ge=0, le=1_000_000_000)
     observability_slo_min_runs: int = Field(default=5, ge=3, le=100)
     observability_anomaly_sensitivity: float = Field(default=3.0, ge=1.5, le=6.0)
+    observability_alert_worker_enabled: bool = True
+    observability_alert_poll_seconds: int = Field(default=30, ge=5, le=3600)
+    observability_alert_lookback_days: int = Field(default=30, ge=1, le=90)
+    observability_alert_email_enabled: bool = False
 
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"

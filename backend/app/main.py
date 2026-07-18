@@ -17,6 +17,7 @@ from app.core.logging import configure_logging
 from app.core.llm import LLMGatewayError
 from app.services.notifications import notification_dispatcher
 from app.services.prototype_generations import prototype_generation_dispatcher
+from app.services.trace_alerts import trace_alert_dispatcher
 from app.evaluation import evaluation_dispatcher
 from app.admin import router as admin_router
 from app.services.agent_run_reaper import agent_run_reaper
@@ -68,9 +69,11 @@ async def lifespan(_: FastAPI):
     await evaluation_dispatcher.start()
     await runtime_config_refresher.start()
     await knowledge_dispatcher.start()
+    await trace_alert_dispatcher.start()
     try:
         yield
     finally:
+        await trace_alert_dispatcher.stop()
         await knowledge_dispatcher.stop()
         await runtime_config_refresher.stop()
         await evaluation_dispatcher.stop()

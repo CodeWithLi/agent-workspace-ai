@@ -40,6 +40,7 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
                     "chat_token_cost": 17,
                     "rag_top_k": 8,
                     "observability_slo_success_rate": 92.5,
+                    "observability_alert_poll_seconds": 45,
                     "llm_api_key": "runtime-secret-value",
                 }
             ),
@@ -52,6 +53,8 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
         assert items["chat_token_cost"].value == 17
         assert items["observability_slo_success_rate"].value == 92.5
         assert items["observability_slo_success_rate"].category == "observability"
+        assert items["observability_alert_poll_seconds"].value == 45
+        assert items["observability_alert_poll_seconds"].category == "observability"
         assert items["llm_api_key"].value is None
         assert items["llm_api_key"].configured is True
         assert get_settings().llm_model == "glm-settings-test"
@@ -66,6 +69,7 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
             "llm_api_key",
             "llm_model",
             "observability_slo_success_rate",
+            "observability_alert_poll_seconds",
             "rag_top_k",
         }
 
