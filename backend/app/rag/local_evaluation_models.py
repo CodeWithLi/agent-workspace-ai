@@ -158,7 +158,6 @@ class LocalOpenModelSuite:
                 JUDGE_MODEL_FILENAME,
                 JUDGE_MODEL_REVISION,
                 JUDGE_MODEL_SHA256,
-                n_ctx=8192,
             )
         return self._judge_llm
 

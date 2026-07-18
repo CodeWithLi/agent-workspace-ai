@@ -16,6 +16,7 @@ from app.core.llm import LLMGatewayError, get_llm  # noqa: E402
 from app.core.llm_usage import calculate_cost_micros, estimate_tokens  # noqa: E402
 from app.rag.chunking import ChunkingConfig, build_chunker  # noqa: E402
 from app.rag.evaluation import (  # noqa: E402
+    answer_judge_prompt,
     answer_citations,
     compare_end_to_end_reports,
     deterministic_answer_assertion_score,
@@ -124,21 +125,6 @@ async def candidate_rows(documents: dict[str, bytes], strategy: str, settings, g
                 }
             )
     return rows, semantic_boundary_tokens
-
-
-def judge_prompt(case, answer: str, rows: list[dict]) -> str:
-    context = "\n\n".join(f"[{row['citation']}]\n{row['content']}" for row in rows) or "(no context)"
-    evidence = case.evidence or "(the corpus contains no answer)"
-    return (
-        "Evaluate only the supplied answer against the supplied context and reference evidence. "
-        "Return one JSON object with exactly these fields: faithfulness, answer_relevance, "
-        "citation_correctness (numbers from 0 to 1), refusal_correct (boolean), and reason (string). "
-        "Faithfulness is the fraction of factual claims supported by context. Citation correctness requires each "
-        "citation to support its adjacent claim. refusal_correct is true when an unanswerable question is refused, "
-        "or when an answerable question is answered instead of refused. Do not use outside knowledge.\n\n"
-        f"Question: {case.query}\nExpected answerable: {str(case.answerable).lower()}\n"
-        f"Reference evidence: {evidence}\n\nRetrieved context:\n{context}\n\nAnswer:\n{answer}"
-    )
 
 
 async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
@@ -370,7 +356,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                 else 0.0
             )
 
-        prompt = judge_prompt(case, answer, selected)
+        prompt = answer_judge_prompt(case, answer, selected)
         judge_started = perf_counter()
         try:
             judged_text = await gateway.chat(

@@ -4,6 +4,8 @@ from app.rag.chunking import StructuralChunker
 import pytest
 
 from app.rag.evaluation import (
+    RetrievalCase,
+    answer_judge_prompt,
     compare_end_to_end_reports,
     deterministic_answer_assertion_score,
     deterministic_citation_score,
@@ -12,9 +14,32 @@ from app.rag.evaluation import (
     legacy_candidates,
     load_cases,
     load_documents,
+    judge_context_tokens,
     parse_answer_judge_response,
     structural_candidates,
 )
+
+
+def test_judge_prompt_keeps_every_citation_within_model_context() -> None:
+    case = RetrievalCase(
+        name="bounded-judge",
+        query="Which evidence is authoritative?",
+        document="DOC.md",
+        evidence="authoritative evidence",
+    )
+    rows = [
+        {
+            "citation": f"DOC.md#chunk-{index}",
+            "content": f"authoritative evidence {index} " + "long context " * 1200,
+        }
+        for index in range(5)
+    ]
+
+    prompt = answer_judge_prompt(case, "The evidence is authoritative. [DOC.md#chunk-4]", rows)
+
+    assert all(f"[DOC.md#chunk-{index}]" in prompt for index in range(5))
+    assert "Reference evidence: authoritative evidence" in prompt
+    assert judge_context_tokens.count(prompt) < 3000
 
 
 def test_repository_rag_chunking_evaluation_is_reproducible() -> None:

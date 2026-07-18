@@ -10,9 +10,13 @@ from statistics import mean
 from time import perf_counter
 from typing import Callable
 
-from app.rag.chunking import StructuralChunker
+from app.rag.chunking import StructuralChunker, TokenCounter
 from app.rag.parsers import parse_document_elements
 from app.rag.service import query_coverage, sparse_scores, split_text
+
+
+JUDGE_CONTEXT_MAX_TOKENS = 2200
+judge_context_tokens = TokenCounter("cl100k_base")
 
 
 @dataclass(slots=True, frozen=True)
@@ -59,6 +63,37 @@ class ChunkingEvaluation:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def bounded_judge_context(rows: list[dict], max_tokens: int = JUDGE_CONTEXT_MAX_TOKENS) -> str:
+    if not rows:
+        return "(no context)"
+    prefixes = [f"[{row['citation']}]\n" for row in rows]
+    wrapper_tokens = sum(judge_context_tokens.count(prefix) + 4 for prefix in prefixes)
+    available = max(0, max_tokens - wrapper_tokens)
+    per_row, remainder = divmod(available, len(rows))
+    blocks: list[str] = []
+    for index, (prefix, row) in enumerate(zip(prefixes, rows)):
+        content_budget = per_row + (1 if index < remainder else 0)
+        encoded = judge_context_tokens.encoding.encode(str(row.get("content") or ""), disallowed_special=())
+        content = judge_context_tokens.encoding.decode(encoded[:content_budget]).strip()
+        blocks.append(f"{prefix}{content}")
+    return "\n\n".join(blocks)
+
+
+def answer_judge_prompt(case: RetrievalCase, answer: str, rows: list[dict]) -> str:
+    context = bounded_judge_context(rows)
+    evidence = case.evidence or "(the corpus contains no answer)"
+    return (
+        "Evaluate only the supplied answer against the supplied context and reference evidence. "
+        "Return one JSON object with exactly these fields: faithfulness, answer_relevance, "
+        "citation_correctness (numbers from 0 to 1), refusal_correct (boolean), and reason (string). "
+        "Faithfulness is the fraction of factual claims supported by context. Citation correctness requires each "
+        "citation to support its adjacent claim. refusal_correct is true when an unanswerable question is refused, "
+        "or when an answerable question is answered instead of refused. Do not use outside knowledge.\n\n"
+        f"Question: {case.query}\nExpected answerable: {str(case.answerable).lower()}\n"
+        f"Reference evidence: {evidence}\n\nRetrieved context:\n{context}\n\nAnswer:\n{answer}"
+    )
 
 
 @dataclass(slots=True, frozen=True)
