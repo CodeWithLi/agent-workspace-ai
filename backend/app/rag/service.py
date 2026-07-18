@@ -39,7 +39,6 @@ ALLOWED_SUFFIXES = {".pdf", ".docx", ".md", ".markdown", ".txt"}
 EVIDENCE_QUALIFIER_PATTERNS = (
     re.compile(r"\bbefore\s+(?:the\s+)?first\b|首次[^。！？.!?\n]{0,24}前|第一次[^。！？.!?\n]{0,24}前", re.IGNORECASE),
     re.compile(r"\bquarterly\b|每季度|每季", re.IGNORECASE),
-    re.compile(r"\bat\s+least\b|至少", re.IGNORECASE),
 )
 
 
@@ -698,8 +697,8 @@ def ensure_valid_citations(answer: str, rows: list[dict]) -> str:
 def ensure_evidence_qualifiers(answer: str, rows: list[dict]) -> str:
     comparison = answer
     supplements: list[str] = []
-    for row in rows:
-        content = str(row.get("parent_content") or row.get("content") or "")
+    for row in rows[:1]:
+        content = str(row.get("content") or "")
         for sentence in re.split(r"(?<=[。！？.!?])\s+|\n+", content):
             sentence = sentence.strip()
             if not sentence:

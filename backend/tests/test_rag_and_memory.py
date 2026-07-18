@@ -239,7 +239,7 @@ def test_missing_temporal_qualifiers_are_restored_from_cited_evidence() -> None:
     rows = [
         {
             "citation": "OPERATIONS.md#chunk-5",
-            "content": "restore drill",
+            "content": "Perform a restore drill before first production release and at least quarterly.",
             "parent_content": (
                 "Perform a restore drill before first production release and at least quarterly. "
                 "Verify user login after restore."
@@ -252,6 +252,23 @@ def test_missing_temporal_qualifiers_are_restored_from_cited_evidence() -> None:
     assert "before first production release and at least quarterly" in answer
     assert "[OPERATIONS.md#chunk-5]" in answer
     assert "Verify user login" not in answer
+    assert ensure_evidence_qualifiers(answer, rows) == answer
+
+
+def test_qualifiers_ignore_parent_and_secondary_context_noise() -> None:
+    rows = [
+        {
+            "citation": "RAG.md#chunk-1",
+            "content": "Milvus 不可用时读取 PostgreSQL 的持久化向量。",
+            "parent_content": "Perform a restore drill before first production release and at least quarterly.",
+        },
+        {
+            "citation": "OPERATIONS.md#chunk-5",
+            "content": "Perform a restore drill before first production release and at least quarterly.",
+        },
+    ]
+    answer = "Milvus 不可用时读取 PostgreSQL 的持久化向量。[RAG.md#chunk-1]"
+
     assert ensure_evidence_qualifiers(answer, rows) == answer
 
 
