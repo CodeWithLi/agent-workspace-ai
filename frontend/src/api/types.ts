@@ -354,6 +354,27 @@ export interface EvaluationCase {
   updated_at: string
 }
 
+export interface EvaluationFeedbackCandidate {
+  feedback_id: number
+  review_id?: number | null
+  status: 'PENDING' | 'CONVERTED' | 'DISMISSED'
+  evaluation_case_id?: number | null
+  message_id: number
+  conversation_id: number
+  project_id?: number | null
+  user_id: number
+  user_name: string
+  agent_id: number
+  agent_name: string
+  agent_role: string
+  input_text: string
+  answer: string
+  comment: string
+  resolution_note: string
+  created_at: string
+  reviewed_at?: string | null
+}
+
 export interface EvaluationAgentSnapshot {
   id: number
   name: string

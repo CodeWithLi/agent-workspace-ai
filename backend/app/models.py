@@ -1002,6 +1002,45 @@ class EvaluationCase(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class EvaluationFeedbackReview(Base):
+    __tablename__ = "evaluation_feedback_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('CONVERTED', 'DISMISSED')",
+            name="ck_evaluation_feedback_review_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    feedback_id: Mapped[int | None] = mapped_column(
+        ForeignKey("message_feedback.id", ondelete="SET NULL"), unique=True, index=True
+    )
+    evaluation_case_id: Mapped[int | None] = mapped_column(
+        ForeignKey("evaluation_cases.id", ondelete="SET NULL"), unique=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    source_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), index=True
+    )
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), index=True
+    )
+    user_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
+    agent_role: Mapped[str] = mapped_column(String(50), index=True)
+    source_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    resolution_note: Mapped[str] = mapped_column(String(1000), default="")
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class EvaluationSuiteRevision(Base):
     __tablename__ = "evaluation_suite_revisions"
 

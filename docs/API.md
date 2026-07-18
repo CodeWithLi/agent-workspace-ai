@@ -49,6 +49,9 @@
 - `POST /agents/messages/{message_id}/feedback`
 - `POST /agents/messages/{message_id}/regenerate`
 - `GET|POST /evaluations/cases`、`PATCH|DELETE /evaluations/cases/{id}`
+- `GET /evaluations/feedback?status=PENDING|CONVERTED|DISMISSED|ALL`：仅管理员筛选当前负反馈及历史复核结果
+- `POST /evaluations/feedback/{feedback_id}/promote`：仅管理员使用唯一 `request_id` 将负反馈幂等转为启用用例，并冻结来源证据
+- `POST /evaluations/feedback/{feedback_id}/dismiss`：仅管理员使用唯一 `request_id` 和复核原因幂等忽略候选项
 - `POST /evaluations/runs`、`GET /evaluations/runs`、`GET /evaluations/runs/{id}`；创建 Challenger 时同时提交 `baseline_run_id` 与 `candidate_version_id`
 - `POST /evaluations/runs/{id}/cancel`、`POST /evaluations/runs/{id}/retry`
 - `POST /evaluations/runs/{id}/publish`：幂等发布已通过门禁且生产版本未漂移的 Challenger
@@ -62,6 +65,8 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 聊天请求必须包含客户端生成的唯一 `request_id`。平台创建 `agent_runs` 运行记录、预扣固定 Token，并在失败或流式连接异常时幂等退款；重复请求返回 `409`。并发达到 Agent 上限时返回 `429`。
 
 用户必须拥有 `agents:read`。审批执行前会重新检查项目写权限、Agent 硬白名单、数据库工具启停和发起者状态；重复审批返回 `409`。
+
+反馈评测接口只接受当前仍为 `rating=-1` 的助手消息。同一反馈最多生成一个评测用例；转化和忽略均以 `request_id` 幂等，已被其他请求复核时返回 `409`。来源输入、回答和评论只出现在管理员反馈响应及冻结快照中，审计详情只记录资源 ID 和 Agent 角色。
 
 ## 工作流与知识库
 

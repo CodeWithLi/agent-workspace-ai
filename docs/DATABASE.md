@@ -27,6 +27,7 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 - `system_setting_overrides`：加密密钥和非敏感运行时配置覆盖；修改记录写入审计日志。
 - `llm_usage`：供应商 token、模型、耗时、usage 来源和估算成本。
 - `evaluation_cases`：跨 Agent 角色的评测用例、证据规则、Rubric、阈值和权重；删除操作采用归档以保留历史。
+- `evaluation_feedback_reviews`：生产负反馈的终态复核记录；唯一 `feedback_id` 防止重复生成用例，唯一 `request_id` 提供幂等，来源输入、回答、评论和 Agent 角色保存在不可变 JSON 快照中。
 - `evaluation_suite_revisions`：按内容指纹去重的不可变测试集快照。
 - `evaluation_runs`、`evaluation_results`：持久化异步运行、冻结 Agent/Challenger 版本、预期生产版本、租约进度、基线门禁、逐案例多维分数与证据。
 - `agent_evaluation_releases`：评测驱动发布的幂等请求、候选/原生产/恢复版本链、发布与回滚操作者和时间证据。
@@ -34,7 +35,7 @@ Alembic 是生产数据库结构的权威来源：`backend/alembic/versions/`。
 
 ## 迁移
 
-当前迁移头为 `20260718_0022`；工作流安全干预位于 `20260718_0022`，不可变重试谱系位于 `20260718_0021`，持久化追踪告警位于 `20260718_0020`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
+当前迁移头为 `20260718_0024`；生产反馈评测闭环位于 `20260718_0024`，评测驱动 Agent 发布位于 `20260718_0023`，工作流安全干预位于 `20260718_0022`。以 `alembic heads` 的输出为准，不要手工跳过中间迁移。
 
 ```bash
 cd backend

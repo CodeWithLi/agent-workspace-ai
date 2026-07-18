@@ -1148,6 +1148,46 @@ class EvaluationCaseOut(BaseModel):
     updated_at: datetime
 
 
+class EvaluationFeedbackPromoteRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    request_id: str = Field(min_length=8, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+    expected_keywords: list[str] = Field(default_factory=list)
+    forbidden_keywords: list[str] = Field(default_factory=list)
+    rubric: str = Field(min_length=1, max_length=10000)
+    minimum_score: float = Field(default=0.8, ge=0, le=1)
+    weight: float = Field(default=1.0, gt=0, le=100)
+
+
+class EvaluationFeedbackDismissRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    request_id: str = Field(min_length=8, max_length=64)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class EvaluationFeedbackCandidateOut(BaseModel):
+    feedback_id: int
+    review_id: int | None
+    status: str
+    evaluation_case_id: int | None
+    message_id: int
+    conversation_id: int
+    project_id: int | None
+    user_id: int
+    user_name: str
+    agent_id: int
+    agent_name: str
+    agent_role: str
+    input_text: str
+    answer: str
+    comment: str
+    resolution_note: str
+    created_at: datetime
+    reviewed_at: datetime | None
+
+
 class EvaluationRunCreate(BaseModel):
     request_id: str = Field(min_length=8, max_length=64)
     baseline_run_id: int | None = Field(default=None, ge=1)

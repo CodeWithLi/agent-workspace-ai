@@ -1,7 +1,7 @@
 import json
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -31,6 +31,9 @@ from app.schemas import (
     EvaluationCaseCreate,
     EvaluationCaseOut,
     EvaluationCaseUpdate,
+    EvaluationFeedbackCandidateOut,
+    EvaluationFeedbackDismissRequest,
+    EvaluationFeedbackPromoteRequest,
     EvaluationResultOut,
     EvaluationReleaseRequest,
     EvaluationRunCreate,
@@ -41,6 +44,13 @@ from app.services.evaluation_releases import (
     EvaluationReleaseConflict,
     publish_candidate_release,
     rollback_candidate_release,
+)
+from app.services.evaluation_feedback import (
+    EvaluationFeedbackConflict,
+    dismiss_feedback_candidate,
+    list_feedback_candidates,
+    promote_feedback_to_case,
+    reviewed_feedback_candidate,
 )
 
 
@@ -69,6 +79,10 @@ def case_out(item: EvaluationCase) -> EvaluationCaseOut:
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
+
+
+def feedback_candidate_out(data: dict) -> EvaluationFeedbackCandidateOut:
+    return EvaluationFeedbackCandidateOut(**data)
 
 
 def result_out(item: EvaluationResult) -> EvaluationResultOut:
@@ -321,6 +335,125 @@ def delete_evaluation_case(
         request=request,
     )
     db.commit()
+
+
+@router.get("/feedback", response_model=list[EvaluationFeedbackCandidateOut])
+def list_evaluation_feedback(
+    status_filter: str = Query(default="PENDING", alias="status"),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[EvaluationFeedbackCandidateOut]:
+    try:
+        rows = list_feedback_candidates(db, status_filter.strip().upper())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    return [feedback_candidate_out(row) for row in rows]
+
+
+@router.post(
+    "/feedback/{feedback_id}/promote",
+    response_model=EvaluationFeedbackCandidateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def promote_evaluation_feedback(
+    feedback_id: int,
+    payload: EvaluationFeedbackPromoteRequest,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationFeedbackCandidateOut:
+    values = payload.model_dump(exclude={"request_id"})
+    try:
+        try:
+            review, created = promote_feedback_to_case(
+                db,
+                feedback_id=feedback_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+                case_values=values,
+            )
+        except IntegrityError:
+            db.rollback()
+            review, created = promote_feedback_to_case(
+                db,
+                feedback_id=feedback_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+                case_values=values,
+            )
+    except EvaluationFeedbackConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if created:
+        record_audit(
+            db,
+            "evaluation.feedback_convert",
+            current_admin.id,
+            resource_type="evaluation_feedback_review",
+            resource_id=review.id,
+            details={
+                "feedback_id": feedback_id,
+                "evaluation_case_id": review.evaluation_case_id,
+                "agent_id": review.agent_id,
+                "agent_role": review.agent_role,
+            },
+            request=request,
+        )
+        db.commit()
+        db.refresh(review)
+    return feedback_candidate_out(reviewed_feedback_candidate(review))
+
+
+@router.post(
+    "/feedback/{feedback_id}/dismiss",
+    response_model=EvaluationFeedbackCandidateOut,
+)
+def dismiss_evaluation_feedback(
+    feedback_id: int,
+    payload: EvaluationFeedbackDismissRequest,
+    request: Request,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationFeedbackCandidateOut:
+    try:
+        try:
+            review, created = dismiss_feedback_candidate(
+                db,
+                feedback_id=feedback_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+                reason=payload.reason,
+            )
+        except IntegrityError:
+            db.rollback()
+            review, created = dismiss_feedback_candidate(
+                db,
+                feedback_id=feedback_id,
+                request_id=payload.request_id,
+                user_id=current_admin.id,
+                reason=payload.reason,
+            )
+    except EvaluationFeedbackConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if created:
+        record_audit(
+            db,
+            "evaluation.feedback_dismiss",
+            current_admin.id,
+            resource_type="evaluation_feedback_review",
+            resource_id=review.id,
+            details={
+                "feedback_id": feedback_id,
+                "agent_id": review.agent_id,
+                "agent_role": review.agent_role,
+                "reason_chars": len(review.resolution_note),
+            },
+            request=request,
+        )
+        db.commit()
+        db.refresh(review)
+    return feedback_candidate_out(reviewed_feedback_candidate(review))
 
 
 def _enqueue(

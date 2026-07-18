@@ -461,6 +461,48 @@ async function mockApi(page: Page) {
       updated_at: '2026-07-18T08:00:00Z'
     }
   ]
+  let evaluationFeedback = [
+    {
+      feedback_id: 41,
+      review_id: null,
+      status: 'PENDING',
+      evaluation_case_id: null,
+      message_id: 401,
+      conversation_id: 31,
+      project_id: 1,
+      user_id: 2,
+      user_name: '研发成员',
+      agent_id: 2,
+      agent_name: 'AI架构师',
+      agent_role: 'architect',
+      input_text: '设计租户隔离并给出证据引用',
+      answer: '使用共享数据库即可。',
+      comment: '缺少租户边界和引用证据',
+      resolution_note: '',
+      created_at: '2026-07-18T09:30:00Z',
+      reviewed_at: null
+    },
+    {
+      feedback_id: 42,
+      review_id: null,
+      status: 'PENDING',
+      evaluation_case_id: null,
+      message_id: 402,
+      conversation_id: 32,
+      project_id: 1,
+      user_id: 3,
+      user_name: '产品成员',
+      agent_id: 1,
+      agent_name: 'AI产品经理',
+      agent_role: 'product_manager',
+      input_text: '给出可验收的发布需求',
+      answer: '尽快完成发布。',
+      comment: '没有验收标准',
+      resolution_note: '',
+      created_at: '2026-07-18T09:20:00Z',
+      reviewed_at: null
+    }
+  ]
   let evaluationRuns = [mockEvaluationRun(81), mockEvaluationRun(80)]
   let evaluationPolls = 0
   const traceOverview = {
@@ -1038,6 +1080,55 @@ async function mockApi(page: Page) {
       evaluationCases = evaluationCases.map((item) => item.id === id ? { ...item, enabled: false } : item)
       return route.fulfill({ status: 204 })
     }
+    else if (method === 'GET' && path === '/evaluations/feedback') body = evaluationFeedback
+    else if (method === 'POST' && /^\/evaluations\/feedback\/\d+\/promote$/.test(path)) {
+      const feedbackId = Number(path.split('/')[3])
+      const input = request.postDataJSON() as {
+        name: string
+        expected_keywords: string[]
+        forbidden_keywords: string[]
+        rubric: string
+        minimum_score: number
+        weight: number
+      }
+      const feedback = evaluationFeedback.find((item) => item.feedback_id === feedbackId)!
+      const caseId = Math.max(...evaluationCases.map((item) => item.id)) + 1
+      evaluationCases = [...evaluationCases, {
+        id: caseId,
+        name: input.name,
+        agent_role: feedback.agent_role,
+        input_text: feedback.input_text,
+        expected_keywords: input.expected_keywords,
+        forbidden_keywords: input.forbidden_keywords,
+        rubric: input.rubric,
+        minimum_score: input.minimum_score,
+        weight: input.weight,
+        enabled: true,
+        created_at: '2026-07-18T10:20:00Z',
+        updated_at: '2026-07-18T10:20:00Z'
+      }]
+      evaluationFeedback = evaluationFeedback.map((item) => item.feedback_id === feedbackId ? {
+        ...item,
+        review_id: 501,
+        status: 'CONVERTED',
+        evaluation_case_id: caseId,
+        resolution_note: 'Converted to evaluation case',
+        reviewed_at: '2026-07-18T10:20:00Z'
+      } : item)
+      body = evaluationFeedback.find((item) => item.feedback_id === feedbackId)
+    }
+    else if (method === 'POST' && /^\/evaluations\/feedback\/\d+\/dismiss$/.test(path)) {
+      const feedbackId = Number(path.split('/')[3])
+      const input = request.postDataJSON() as { reason: string }
+      evaluationFeedback = evaluationFeedback.map((item) => item.feedback_id === feedbackId ? {
+        ...item,
+        review_id: 502,
+        status: 'DISMISSED',
+        resolution_note: input.reason,
+        reviewed_at: '2026-07-18T10:22:00Z'
+      } : item)
+      body = evaluationFeedback.find((item) => item.feedback_id === feedbackId)
+    }
     else if (method === 'GET' && /^\/evaluations\/runs\/\d+$/.test(path)) {
       const id = Number(path.split('/').pop())
       const run = evaluationRuns.find((item) => item.id === id)
@@ -1307,6 +1398,55 @@ test('manages versioned Agent evaluations and completes an async regression run'
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
+test('triages negative production feedback into the evaluation dataset', async ({ page }) => {
+  await page.goto('/evaluations')
+  await page.getByRole('tab', { name: '反馈队列' }).click()
+
+  const visibleFeedbackList = page.locator('.desktop-feedback-table:visible, .mobile-feedback-list:visible')
+  await expect(visibleFeedbackList).toContainText('缺少租户边界和引用证据')
+  await expect(visibleFeedbackList).toContainText('没有验收标准')
+
+  const architectFeedback = visibleFeedbackList.locator('[data-feedback-id="41"]')
+  await architectFeedback.getByRole('button', { name: '转为用例' }).click()
+  const promoteDialog = page.getByRole('dialog', { name: '转为评测用例' })
+  await expect(promoteDialog.getByText('设计租户隔离并给出证据引用', { exact: true })).toBeVisible()
+  await expect(promoteDialog.getByText('使用共享数据库即可。', { exact: true })).toBeVisible()
+  await expect(promoteDialog.getByText('缺少租户边界和引用证据', { exact: true })).toBeVisible()
+  await promoteDialog.getByLabel('用例名称').fill('租户隔离与证据引用回归')
+  await promoteDialog.getByLabel('期望证据关键词').fill('租户隔离，引用证据')
+  await promoteDialog.getByLabel('禁用词').fill('共享数据库即可')
+  await promoteDialog.getByLabel('评分 Rubric').fill('必须说明租户边界，并引用可核验的知识证据。')
+
+  const promoted = page.waitForRequest((request) => (
+    request.method() === 'POST'
+    && new URL(request.url()).pathname.endsWith('/evaluations/feedback/41/promote')
+  ))
+  await promoteDialog.getByRole('button', { name: '创建评测用例' }).click()
+  const promotePayload = (await promoted).postDataJSON() as {
+    request_id: string
+    name: string
+    expected_keywords: string[]
+    forbidden_keywords: string[]
+    rubric: string
+  }
+  expect(promotePayload.request_id.length).toBeGreaterThanOrEqual(8)
+  expect(promotePayload.expected_keywords).toEqual(['租户隔离', '引用证据'])
+  expect(promotePayload.forbidden_keywords).toEqual(['共享数据库即可'])
+  await expect(page.getByText('反馈已转为评测用例', { exact: true })).toBeVisible()
+
+  const productFeedback = visibleFeedbackList.locator('[data-feedback-id="42"]')
+  await productFeedback.getByRole('button', { name: '忽略' }).click()
+  const dismissDialog = page.getByRole('dialog', { name: '忽略反馈' })
+  await expect(dismissDialog).toContainText('复核结论会写入审计记录')
+  await dismissDialog.getByRole('button', { name: '确认忽略' }).click()
+  await expect(page.getByText('反馈已忽略', { exact: true })).toBeVisible()
+  await expect(page.getByText('没有符合条件的反馈', { exact: true })).toBeVisible()
+
+  await page.getByRole('tab', { name: '用例库' }).click()
+  await expect(page.locator('.desktop-case-table:visible, .mobile-case-list:visible').getByText('租户隔离与证据引用回归', { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
 test('publishes and rolls back a gated Challenger with visible evidence', async ({ page }) => {
   await page.goto('/evaluations')
 
@@ -1372,6 +1512,17 @@ test('keeps the evaluation lab usable at 375px and mobile landscape', async ({ p
   await expect(page.getByRole('button', { name: '运行团队评测' })).toHaveCSS('min-height', '44px')
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 
+  await page.getByRole('tab', { name: '反馈队列' }).click()
+  const feedbackActions = page.locator('.mobile-feedback-list:visible [data-feedback-id="41"] .feedback-card-actions .el-button')
+  await expect(feedbackActions).toHaveCount(2)
+  await expect(feedbackActions.first()).toHaveCSS('min-height', '44px')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.locator('.mobile-feedback-list:visible')).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.getByRole('tab', { name: '运行历史' }).click()
   await page.setViewportSize({ width: 844, height: 390 })
   await expect(page.getByRole('heading', { name: 'Agent 评测实验室' })).toBeVisible()
   await expect(page.locator('.desktop-run-table:visible, .mobile-run-list:visible')).toHaveCount(1)

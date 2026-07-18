@@ -273,6 +273,99 @@
         </div>
         <el-empty v-if="!loading && !filteredCases.length" description="没有符合条件的评测用例" />
       </el-tab-pane>
+
+      <el-tab-pane label="反馈队列" name="feedback">
+        <div class="view-toolbar">
+          <div class="toolbar-copy">
+            <strong>生产负反馈</strong>
+            <span>当前筛选 {{ filteredFeedback.length }} 条</span>
+          </div>
+          <div class="toolbar-filters feedback-toolbar-filters">
+            <el-input
+              v-model="feedbackQuery"
+              :prefix-icon="Search"
+              clearable
+              aria-label="搜索生产负反馈"
+              placeholder="搜索输入、回答或评论"
+            />
+            <el-select v-model="feedbackStatus" aria-label="按反馈状态筛选" @change="loadFeedback">
+              <el-option v-for="option in feedbackStatusOptions" :key="option.value" :label="option.label" :value="option.value" />
+            </el-select>
+            <el-button :icon="Refresh" circle aria-label="刷新反馈队列" title="刷新" @click="loadFeedback" />
+          </div>
+        </div>
+
+        <div class="desktop-feedback-table">
+          <el-table v-loading="loadingFeedback" :data="filteredFeedback" class="data-table" row-key="feedback_id">
+            <el-table-column label="来源输入" min-width="250">
+              <template #default="{ row }">
+                <strong class="feedback-input">{{ row.input_text }}</strong>
+                <span class="feedback-meta">{{ row.user_name }} · 会话 #{{ row.conversation_id }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="Agent" min-width="150">
+              <template #default="{ row }">
+                <strong class="feedback-agent">{{ row.agent_name }}</strong>
+                <span class="feedback-meta">{{ roleLabel(row.agent_role) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="负反馈" min-width="230">
+              <template #default="{ row }">
+                <span class="feedback-comment">{{ row.comment || '未填写评论' }}</span>
+                <span class="feedback-answer">{{ row.answer }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="120">
+              <template #default="{ row }">
+                <el-tag :type="feedbackStatusType(row.status)" size="small" effect="plain">{{ feedbackStatusLabel(row.status) }}</el-tag>
+                <span v-if="row.evaluation_case_id" class="feedback-meta">用例 #{{ row.evaluation_case_id }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="时间" min-width="150">
+              <template #default="{ row }">{{ formatDate(row.reviewed_at || row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="142" align="right" fixed="right">
+              <template #default="{ row }">
+                <div :data-feedback-id="row.feedback_id">
+                  <template v-if="row.status === 'PENDING'">
+                    <el-button link type="primary" @click="openPromoteDialog(row)">转为用例</el-button>
+                    <el-button link type="danger" @click="dismissFeedback(row)">忽略</el-button>
+                  </template>
+                  <span v-else class="feedback-reviewed">已复核</span>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-loading="loadingFeedback" class="mobile-feedback-list">
+          <article
+            v-for="item in filteredFeedback"
+            :key="item.feedback_id"
+            class="feedback-card"
+            :data-feedback-id="item.feedback_id"
+          >
+            <div class="feedback-card-head">
+              <span><strong>{{ item.agent_name }}</strong><small>{{ roleLabel(item.agent_role) }} · {{ item.user_name }}</small></span>
+              <el-tag :type="feedbackStatusType(item.status)" size="small" effect="plain">{{ feedbackStatusLabel(item.status) }}</el-tag>
+            </div>
+            <dl class="feedback-card-evidence">
+              <div><dt>用户输入</dt><dd>{{ item.input_text }}</dd></div>
+              <div><dt>Agent 回答</dt><dd>{{ item.answer }}</dd></div>
+              <div><dt>负反馈</dt><dd>{{ item.comment || '未填写评论' }}</dd></div>
+            </dl>
+            <div v-if="item.status === 'PENDING'" class="feedback-card-actions">
+              <el-button type="primary" :icon="Plus" @click="openPromoteDialog(item)">转为用例</el-button>
+              <el-button :icon="Close" @click="dismissFeedback(item)">忽略</el-button>
+            </div>
+            <div v-else class="feedback-card-foot">
+              <span>{{ item.resolution_note }}</span>
+              <small>{{ formatDate(item.reviewed_at || item.created_at) }}</small>
+            </div>
+          </article>
+        </div>
+        <el-empty v-if="!loadingFeedback && !filteredFeedback.length" description="没有符合条件的反馈" />
+      </el-tab-pane>
     </el-tabs>
 
     <el-drawer
@@ -429,6 +522,40 @@
         <el-button type="primary" :loading="savingCase" :disabled="!validCaseForm" @click="saveCase">保存用例</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="promoteDialog"
+      title="转为评测用例"
+      width="min(760px, calc(100vw - 24px))"
+      top="3vh"
+      class="evaluation-feedback-dialog"
+    >
+      <div v-if="selectedFeedback" class="feedback-source" aria-label="冻结的反馈来源证据">
+        <div class="feedback-source-head">
+          <span>来源证据</span>
+          <strong>{{ selectedFeedback.agent_name }} · {{ roleLabel(selectedFeedback.agent_role) }}</strong>
+        </div>
+        <dl>
+          <div><dt>用户输入</dt><dd>{{ selectedFeedback.input_text }}</dd></div>
+          <div><dt>Agent 回答</dt><dd>{{ selectedFeedback.answer }}</dd></div>
+          <div><dt>用户评论</dt><dd>{{ selectedFeedback.comment || '未填写评论' }}</dd></div>
+        </dl>
+      </div>
+      <el-form label-position="top" class="feedback-promote-form">
+        <el-form-item label="用例名称" required><el-input v-model.trim="promoteForm.name" maxlength="200" /></el-form-item>
+        <el-form-item label="期望证据关键词" required><el-input v-model.trim="promoteForm.expected_keywords" placeholder="例如：租户隔离、引用证据" /></el-form-item>
+        <el-form-item label="禁用词"><el-input v-model.trim="promoteForm.forbidden_keywords" placeholder="例如：跳过鉴权、共享密钥" /></el-form-item>
+        <el-form-item label="评分 Rubric" required><el-input v-model.trim="promoteForm.rubric" type="textarea" :rows="3" maxlength="10000" /></el-form-item>
+        <div class="feedback-rule-grid">
+          <el-form-item label="最低通过分"><el-input-number v-model="promoteForm.minimum_score" :min="0" :max="1" :step="0.05" :precision="2" /></el-form-item>
+          <el-form-item label="用例权重"><el-input-number v-model="promoteForm.weight" :min="0.1" :max="100" :step="0.5" :precision="1" /></el-form-item>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="promoteDialog = false">取消</el-button>
+        <el-button type="primary" :loading="promotingFeedback" :disabled="!validPromoteForm" @click="promoteFeedback">创建评测用例</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -441,11 +568,26 @@ import 'element-plus/es/components/message/style/css.mjs'
 import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
 import 'element-plus/es/components/message-box/style/css.mjs'
 import { api } from '../api/client'
-import type { Agent, AgentEvaluationRelease, AgentVersion, EvaluationCase, EvaluationRun, EvaluationRunDetail } from '../api/types'
+import type {
+  Agent,
+  AgentEvaluationRelease,
+  AgentVersion,
+  EvaluationCase,
+  EvaluationFeedbackCandidate,
+  EvaluationRun,
+  EvaluationRunDetail
+} from '../api/types'
 import { confirmDestructiveAction } from '../utils/confirm'
 
 const ACTIVE_STATUSES = new Set(['QUEUED', 'RUNNING', 'CANCELLING'])
 const statusOptions = ['QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED']
+const feedbackStatusOptions = [
+  { label: '待复核', value: 'PENDING' },
+  { label: '已转用例', value: 'CONVERTED' },
+  { label: '已忽略', value: 'DISMISSED' },
+  { label: '全部状态', value: 'ALL' }
+]
+const DISMISS_FEEDBACK_REASON = '已人工复核，不适合作为可复现评测用例'
 const dimensions = [
   { key: 'requirements', label: '需求覆盖' },
   { key: 'correctness', label: '正确性' },
@@ -461,13 +603,16 @@ const runModeOptions = [
 const route = useRoute()
 const agents = ref<Agent[]>([])
 const cases = ref<EvaluationCase[]>([])
+const feedback = ref<EvaluationFeedbackCandidate[]>([])
 const runs = ref<EvaluationRun[]>([])
 const loading = ref(false)
+const loadingFeedback = ref(false)
 const creatingRun = ref(false)
 const loadingVersions = ref(false)
 const publishingRelease = ref(false)
 const rollingBackRelease = ref(false)
 const savingCase = ref(false)
+const promotingFeedback = ref(false)
 const activeView = ref('runs')
 const baselineRunId = ref<number | null>(null)
 const runMode = ref<'TEAM' | 'CHALLENGER'>('TEAM')
@@ -476,12 +621,16 @@ const candidateVersionId = ref<number | null>(null)
 const candidateVersions = ref<AgentVersion[]>([])
 const runQuery = ref('')
 const caseQuery = ref('')
+const feedbackQuery = ref('')
+const feedbackStatus = ref('PENDING')
 const statusFilter = ref('')
 const detailDrawer = ref(false)
 const detailLoading = ref(false)
 const detailRun = ref<EvaluationRunDetail | null>(null)
 const caseDialog = ref(false)
+const promoteDialog = ref(false)
 const editingCaseId = ref<number | null>(null)
+const selectedFeedback = ref<EvaluationFeedbackCandidate | null>(null)
 const caseForm = reactive({
   name: '',
   agent_role: '',
@@ -493,8 +642,17 @@ const caseForm = reactive({
   weight: 1,
   enabled: true
 })
+const promoteForm = reactive({
+  name: '',
+  expected_keywords: '',
+  forbidden_keywords: '',
+  rubric: '',
+  minimum_score: 0.8,
+  weight: 1
+})
 let pollTimer: ReturnType<typeof window.setInterval> | null = null
 let pollBusy = false
+const feedbackRequestIds = new Map<string, string>()
 
 const enabledCases = computed(() => cases.value.filter((item) => item.enabled))
 const latestRun = computed(() => runs.value[0] || null)
@@ -534,11 +692,32 @@ const filteredCases = computed(() => {
     .toLocaleLowerCase()
     .includes(query))
 })
+const filteredFeedback = computed(() => {
+  const query = feedbackQuery.value.trim().toLocaleLowerCase()
+  return feedback.value.filter((item) => {
+    const matchesStatus = feedbackStatus.value === 'ALL' || item.status === feedbackStatus.value
+    const haystack = [
+      item.user_name,
+      item.agent_name,
+      item.agent_role,
+      item.input_text,
+      item.answer,
+      item.comment,
+      item.resolution_note
+    ].join(' ').toLocaleLowerCase()
+    return matchesStatus && (!query || haystack.includes(query))
+  })
+})
 const validCaseForm = computed(() => Boolean(
   caseForm.name.trim()
   && caseForm.agent_role
   && caseForm.input_text.trim()
   && splitTerms(caseForm.expected_keywords).length
+))
+const validPromoteForm = computed(() => Boolean(
+  promoteForm.name.trim()
+  && splitTerms(promoteForm.expected_keywords).length
+  && promoteForm.rubric.trim()
 ))
 
 function splitTerms(value: string) {
@@ -547,6 +726,15 @@ function splitTerms(value: string) {
 
 function requestId() {
   return globalThis.crypto?.randomUUID?.() || `evaluation-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function feedbackRequestId(action: 'promote' | 'dismiss', feedbackId: number) {
+  const key = `${action}:${feedbackId}`
+  const existing = feedbackRequestIds.get(key)
+  if (existing) return existing
+  const created = requestId()
+  feedbackRequestIds.set(key, created)
+  return created
 }
 
 function selectMatchingBaseline() {
@@ -697,16 +885,42 @@ function scoreSourceLabel(source: string) {
   return source === 'execution_error' ? '执行错误' : '确定性评分'
 }
 
+function feedbackStatusLabel(status: string) {
+  return ({ PENDING: '待复核', CONVERTED: '已转用例', DISMISSED: '已忽略' } as Record<string, string>)[status] || status
+}
+
+function feedbackStatusType(status: string) {
+  if (status === 'CONVERTED') return 'success'
+  if (status === 'DISMISSED') return 'info'
+  return 'warning'
+}
+
+async function loadFeedback() {
+  loadingFeedback.value = true
+  try {
+    const { data } = await api.get<EvaluationFeedbackCandidate[]>('/evaluations/feedback', {
+      params: { status: feedbackStatus.value }
+    })
+    feedback.value = data
+  } finally {
+    loadingFeedback.value = false
+  }
+}
+
 async function loadAll() {
   loading.value = true
   try {
-    const [agentsResponse, casesResponse, runsResponse] = await Promise.all([
+    const [agentsResponse, casesResponse, feedbackResponse, runsResponse] = await Promise.all([
       api.get<Agent[]>('/agents'),
       api.get<EvaluationCase[]>('/evaluations/cases'),
+      api.get<EvaluationFeedbackCandidate[]>('/evaluations/feedback', {
+        params: { status: feedbackStatus.value }
+      }),
       api.get<EvaluationRun[]>('/evaluations/runs')
     ])
     agents.value = agentsResponse.data
     cases.value = casesResponse.data
+    feedback.value = feedbackResponse.data
     runs.value = runsResponse.data
     const queryAgentId = Number(route.query.agent || 0)
     const queryVersionId = Number(route.query.version || 0)
@@ -919,6 +1133,69 @@ async function archiveCase(value: unknown) {
   ElMessage.success('评测用例已归档')
 }
 
+function openPromoteDialog(value: unknown) {
+  const item = value as EvaluationFeedbackCandidate
+  selectedFeedback.value = item
+  Object.assign(promoteForm, {
+    name: `${roleLabel(item.agent_role)}负反馈回归 #${item.feedback_id}`,
+    expected_keywords: '',
+    forbidden_keywords: '',
+    rubric: item.comment ? `修正以下用户反馈：${item.comment}` : '',
+    minimum_score: 0.8,
+    weight: 1
+  })
+  promoteDialog.value = true
+}
+
+async function promoteFeedback() {
+  const item = selectedFeedback.value
+  if (!item) return
+  promotingFeedback.value = true
+  try {
+    const { data } = await api.post<EvaluationFeedbackCandidate>(`/evaluations/feedback/${item.feedback_id}/promote`, {
+      request_id: feedbackRequestId('promote', item.feedback_id),
+      name: promoteForm.name,
+      expected_keywords: splitTerms(promoteForm.expected_keywords),
+      forbidden_keywords: splitTerms(promoteForm.forbidden_keywords),
+      rubric: promoteForm.rubric,
+      minimum_score: promoteForm.minimum_score,
+      weight: promoteForm.weight
+    })
+    feedback.value = feedback.value.map((candidate) => candidate.feedback_id === data.feedback_id ? data : candidate)
+    feedbackRequestIds.delete(`promote:${item.feedback_id}`)
+    const casesResponse = await api.get<EvaluationCase[]>('/evaluations/cases')
+    cases.value = casesResponse.data
+    promoteDialog.value = false
+    ElMessage.success('反馈已转为评测用例')
+  } finally {
+    promotingFeedback.value = false
+  }
+}
+
+async function dismissFeedback(value: unknown) {
+  const item = value as EvaluationFeedbackCandidate
+  try {
+    await ElMessageBox.confirm(
+      `确认忽略反馈 #${item.feedback_id} 吗？复核结论会写入审计记录，之后不会再进入待复核队列。`,
+      '忽略反馈',
+      {
+        type: 'warning',
+        confirmButtonText: '确认忽略',
+        cancelButtonText: '取消'
+      }
+    )
+  } catch {
+    return
+  }
+  const { data } = await api.post<EvaluationFeedbackCandidate>(`/evaluations/feedback/${item.feedback_id}/dismiss`, {
+    request_id: feedbackRequestId('dismiss', item.feedback_id),
+    reason: DISMISS_FEEDBACK_REASON
+  })
+  feedback.value = feedback.value.map((candidate) => candidate.feedback_id === data.feedback_id ? data : candidate)
+  feedbackRequestIds.delete(`dismiss:${item.feedback_id}`)
+  ElMessage.success('反馈已忽略')
+}
+
 onMounted(loadAll)
 onBeforeUnmount(() => {
   if (pollTimer) window.clearInterval(pollTimer)
@@ -970,7 +1247,14 @@ onBeforeUnmount(() => {
 .case-input { max-width: 360px; margin-top: 2px; }
 .keyword-list { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .keyword-list small { color: var(--color-muted-text); }
-.mobile-run-list, .mobile-case-list { display: none; }
+.feedback-input, .feedback-agent, .feedback-comment, .feedback-answer, .feedback-meta { display: block; }
+.feedback-input, .feedback-agent { color: var(--color-foreground); }
+.feedback-input { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feedback-comment { color: var(--color-danger); font-weight: 650; }
+.feedback-answer { display: -webkit-box; margin-top: 3px; overflow: hidden; color: var(--color-muted-text); font-size: 12px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.feedback-meta { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
+.feedback-reviewed { color: var(--color-muted-text); font-size: 12px; }
+.mobile-run-list, .mobile-case-list, .mobile-feedback-list { display: none; }
 .run-detail { min-height: 180px; }
 .detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin-bottom: 18px; overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-border); }
 .detail-summary div { min-width: 0; padding: 12px; background: var(--color-surface); }
@@ -1024,6 +1308,16 @@ onBeforeUnmount(() => {
 .judge-reason { display: grid; grid-template-columns: 72px 1fr; gap: 5px; margin: 14px 0 0; color: var(--color-secondary-text); line-height: 1.6; }
 .detail-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--color-border); }
 .case-rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.feedback-source { overflow: hidden; margin-bottom: 18px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-background); }
+.feedback-source-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--color-border); background: var(--color-surface); }
+.feedback-source-head span { color: var(--color-muted-text); font-size: 12px; font-weight: 650; }
+.feedback-source-head strong { color: var(--color-secondary-text); font-size: 13px; }
+.feedback-source dl { display: grid; margin: 0; }
+.feedback-source dl div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--color-border); }
+.feedback-source dl div:last-child { border-bottom: 0; }
+.feedback-source dt { color: var(--color-muted-text); font-size: 12px; font-weight: 650; }
+.feedback-source dd { margin: 0; color: var(--color-secondary-text); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.feedback-rule-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 
 @media (max-width: 980px) {
   .evaluation-launcher { flex-wrap: wrap; }
@@ -1055,9 +1349,9 @@ onBeforeUnmount(() => {
   .toolbar-filters .el-input { grid-column: 1 / -1; width: 100%; }
   .toolbar-filters .el-select { width: 100%; }
   .toolbar-filters .el-button { min-width: 44px; min-height: 44px; }
-  .desktop-run-table, .desktop-case-table { display: none; }
-  .mobile-run-list, .mobile-case-list { display: grid; gap: 10px; }
-  .run-card, .case-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
+  .desktop-run-table, .desktop-case-table, .desktop-feedback-table { display: none; }
+  .mobile-run-list, .mobile-case-list, .mobile-feedback-list { display: grid; gap: 10px; }
+  .run-card, .case-card, .feedback-card { min-width: 0; padding: 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
   .run-card-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
   .run-card-main span span, .run-card-main strong, .run-card-main small { display: block; }
   .run-card-main small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
@@ -1071,6 +1365,19 @@ onBeforeUnmount(() => {
   .case-card p { display: -webkit-box; margin: 10px 0; overflow: hidden; color: var(--color-secondary-text); line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
   .case-card-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
   .case-card-actions .el-button { min-height: 44px; margin: 0; }
+  .feedback-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .feedback-card-head > span { min-width: 0; }
+  .feedback-card-head strong, .feedback-card-head small { display: block; }
+  .feedback-card-head strong { color: var(--color-foreground); }
+  .feedback-card-head small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
+  .feedback-card-evidence { display: grid; gap: 10px; margin: 14px 0 0; }
+  .feedback-card-evidence div { min-width: 0; }
+  .feedback-card-evidence dt { color: var(--color-muted-text); font-size: 11px; font-weight: 650; }
+  .feedback-card-evidence dd { display: -webkit-box; margin: 2px 0 0; overflow: hidden; color: var(--color-secondary-text); line-height: 1.5; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+  .feedback-card-evidence div:last-child dd { color: var(--color-danger); font-weight: 650; }
+  .feedback-card-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+  .feedback-card-actions .el-button { min-height: 44px; margin: 0; }
+  .feedback-card-foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 14px; color: var(--color-muted-text); font-size: 11px; }
   :deep(.el-input__inner), :deep(.el-textarea__inner) { font-size: 16px; }
   .detail-summary { grid-template-columns: repeat(2, 1fr); }
   .release-evidence { grid-template-columns: 1fr; gap: 12px; padding: 14px; }
@@ -1083,5 +1390,9 @@ onBeforeUnmount(() => {
   .answer-compare { grid-template-columns: 1fr; }
   .case-prompt, .judge-reason { grid-template-columns: 1fr; }
   .case-rule-grid { grid-template-columns: 1fr 1fr; }
+  .feedback-source-head { align-items: flex-start; flex-direction: column; }
+  .feedback-source dl div { grid-template-columns: 1fr; gap: 4px; }
+  .feedback-rule-grid { grid-template-columns: 1fr 1fr; }
+  :deep(.evaluation-feedback-dialog .el-dialog__footer .el-button) { min-height: 44px; }
 }
 </style>
