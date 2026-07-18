@@ -64,3 +64,5 @@ async def test_real_docling_preserves_docx_table_and_ocr_text() -> None:
     assert any(element.kind == "table" and "Owner" in element.content for element in parsed_docx.elements)
     assert parsed_pdf.parser_name == "docling-serve"
     assert "48271" in parsed_pdf.text
+    assert any(element.page_start == 1 for element in parsed_pdf.elements)
+    assert any(element.metadata.get("bbox") for element in parsed_pdf.elements)

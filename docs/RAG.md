@@ -12,6 +12,8 @@ docker compose --profile advanced-rag up -d docling
 
 随后将 `RAG_PARSER_BACKEND` 设为 `auto` 或 `docling`。`auto` 仅在配置 Docling URL 时调用高级解析；失败后是否使用原生解析由 `RAG_PARSER_FALLBACK_ENABLED` 控制。Docling CPU 镜像约 4.4 GB，不能与 API 进程合并部署。
 
+Docling Serve 请求同时导出 Markdown 与 lossless JSON。索引优先使用 `1.26-json-v1` 适配器恢复阅读顺序、标题、表格、页码和 bbox；JSON 不兼容但 Markdown 可用时记录为 `1.26-md-v1`，不会把降级结果伪装成结构化 JSON 版本。
+
 项目文档按项目共享，个人文档按 owner 隔离。相同作用域与相同内容哈希只保存一次；同名但内容不同的文件递增版本号。标签、来源、错误、尝试次数和索引完成时间保存在文档记录中。
 
 ## 检索
@@ -47,6 +49,7 @@ MILVUS_COLLECTION=knowledge_chunks_v4
 2. 普通 CI 的 `rag-integration` 作业启动真实 PostgreSQL、MinIO、etcd 和 Milvus，执行 v4 BM25+child dense+parent dense hybrid、4 并发 p95 门禁，并验证两个个人知识库 owner 之间没有泄漏。
 3. `RAG External Quality Gate` 手动工作流先运行旧 `900/140` 基线，再以相同语料和外部服务运行真实多语 child/parent embedding、语义分块、查询改写、Cross-Encoder reranker、回答模型和 judge 模型。候选方案的 Recall/MRR/nDCG/Context Precision 不得显著退化，且至少一个主检索指标需提升 `0.05`；同时衡量答案忠实度、答案相关性、引用正确率、拒答、端到端 p95 与估算成本。父内容去重后单独计入 embedding token 与成本。该脚本要求 `LLM_FALLBACK_ENABLED=false`，缺少外部配置时以退出码 `2` 拒绝评测。
 4. `RAG Docling Integration` 每周使用真实 Docling Serve CPU 镜像验证 DOCX 标题/表格和图片型 PDF OCR。模型、镜像或 OCR 失败会阻断该工作流，不允许原生 parser fallback 掩盖问题。
+5. `RAG Parser Benchmark` 每月或手动以同一 corpus hash 比较 native、Docling、Unstructured 和 MinerU，记录解析成功率、证据/结构/阅读顺序、页码/bbox、p95、峰值内存和部署体积。高级解析器要求成功率 `1.0`、marker recall `>= 0.9`、结构 recall `>= 0.5`、阅读顺序 `1.0`、页码和 bbox 覆盖均 `>= 0.9`，缺报告或缺资源指标会直接失败。
 
 外部答案门禁命令：
 

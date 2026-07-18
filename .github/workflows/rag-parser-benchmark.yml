@@ -1,0 +1,264 @@
+name: RAG Parser Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 19 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r backend/requirements-rag-parser-benchmark.txt
+      - run: python scripts/benchmark_rag_parsers.py generate --output-dir .run/parser-corpus
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parser-corpus
+          path: .run/parser-corpus/
+          retention-days: 30
+
+  native:
+    needs: corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: parser-corpus
+          path: .run/parser-corpus
+      - run: pip install -r backend/requirements.txt
+      - name: Run native benchmark
+        shell: bash
+        run: |
+          site_packages=$(python -c "import site; print(site.getsitepackages()[0])")
+          footprint_mb=$(du -sm "$site_packages" | cut -f1)
+          python scripts/benchmark_rag_parsers.py run \
+            --backend native \
+            --corpus-dir .run/parser-corpus \
+            --output .run/parser-native.json \
+            --artifact-size-mb "$footprint_mb" \
+            --memory-scope process \
+            --artifact-scope application-dependencies
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-report-native
+          path: .run/parser-native.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  docling:
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DOCLING_SERVE_URL: http://127.0.0.1:5001
+      DOCLING_DO_OCR: "true"
+      DOCLING_TIMEOUT_SECONDS: "1200"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: parser-corpus
+          path: .run/parser-corpus
+      - run: pip install -r backend/requirements.txt
+      - name: Start Docling Serve CPU
+        run: >-
+          docker run -d --name docling-serve
+          -p 5001:5001
+          -e DOCLING_SERVE_ENABLE_UI=0
+          quay.io/docling-project/docling-serve-cpu:1.26.0
+      - name: Wait for Docling
+        shell: bash
+        run: |
+          for attempt in {1..120}; do
+            if curl --fail --silent http://127.0.0.1:5001/docs >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs docling-serve
+          exit 1
+      - name: Run Docling benchmark
+        shell: bash
+        run: |
+          mkdir -p .run
+          (
+            while docker inspect docling-serve >/dev/null 2>&1; do
+              docker exec docling-serve sh -c \
+                'cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes' \
+                2>/dev/null || true
+              sleep 1
+            done
+          ) > .run/docling-memory-bytes.txt &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true; wait "$monitor_pid" 2>/dev/null || true' EXIT
+          image_bytes=$(docker image inspect quay.io/docling-project/docling-serve-cpu:1.26.0 --format '{{.Size}}')
+          image_mb=$(python -c "print($image_bytes / 1048576)")
+          python scripts/benchmark_rag_parsers.py run \
+            --backend docling \
+            --corpus-dir .run/parser-corpus \
+            --output .run/parser-docling.json \
+            --resource-sample-file .run/docling-memory-bytes.txt \
+            --artifact-size-mb "$image_mb" \
+            --memory-scope service-container \
+            --artifact-scope compressed-container-image
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-report-docling
+          path: .run/parser-docling.json
+          if-no-files-found: warn
+          retention-days: 30
+      - if: always()
+        run: docker logs docling-serve
+      - if: always()
+        run: docker rm -f docling-serve
+
+  unstructured:
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DO_NOT_TRACK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: parser-corpus
+          path: .run/parser-corpus
+      - name: Install system dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libmagic-dev poppler-utils tesseract-ocr tesseract-ocr-eng libreoffice
+      - name: Build isolated Unstructured environment
+        shell: bash
+        run: |
+          python -m venv .run/unstructured-venv
+          . .run/unstructured-venv/bin/activate
+          pip install "unstructured[pdf,docx]==0.24.1"
+      - name: Run Unstructured benchmark
+        shell: bash
+        run: |
+          . .run/unstructured-venv/bin/activate
+          footprint_mb=$(du -sm .run/unstructured-venv | cut -f1)
+          python scripts/benchmark_rag_parsers.py run \
+            --backend unstructured \
+            --corpus-dir .run/parser-corpus \
+            --output .run/parser-unstructured.json \
+            --artifact-size-mb "$footprint_mb" \
+            --memory-scope process \
+            --artifact-scope isolated-python-environment
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-report-unstructured
+          path: .run/parser-unstructured.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  mineru:
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      MINERU_MODEL_SOURCE: huggingface
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: parser-corpus
+          path: .run/parser-corpus
+      - name: Install system dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libmagic-dev poppler-utils tesseract-ocr tesseract-ocr-eng libreoffice
+      - name: Build isolated MinerU environment
+        shell: bash
+        run: |
+          python -m venv .run/mineru-venv
+          . .run/mineru-venv/bin/activate
+          pip install -r backend/requirements-rag-parser-benchmark.txt "mineru[pipeline]==3.4.4"
+      - name: Run MinerU benchmark
+        shell: bash
+        run: |
+          . .run/mineru-venv/bin/activate
+          python scripts/benchmark_rag_parsers.py run \
+            --backend mineru \
+            --corpus-dir .run/parser-corpus \
+            --work-dir .run/mineru-output \
+            --output .run/parser-mineru.json \
+            --timeout-seconds 7200 \
+            --artifact-size-mb 0 \
+            --memory-scope process-tree \
+            --artifact-scope isolated-python-environment-plus-model-cache
+          footprint_paths=(.run/mineru-venv)
+          if [ -d "$HOME/.cache/huggingface" ]; then
+            footprint_paths+=("$HOME/.cache/huggingface")
+          fi
+          footprint_mb=$(du -sm "${footprint_paths[@]}" | awk '{sum += $1} END {print sum + 0}')
+          python scripts/benchmark_rag_parsers.py annotate \
+            --report .run/parser-mineru.json \
+            --artifact-size-mb "$footprint_mb"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-report-mineru
+          path: .run/parser-mineru.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  compare:
+    needs: [native, docling, unstructured, mineru]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: parser-report-*
+          path: .run/parser-reports
+          merge-multiple: true
+      - name: Compare parser reports
+        shell: bash
+        run: >-
+          python scripts/benchmark_rag_parsers.py compare
+          --report-dir .run/parser-reports
+          --output .run/rag-parser-comparison.json
+          --enforce-gates
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-parser-comparison-${{ github.run_id }}
+          path: .run/rag-parser-comparison.json
+          if-no-files-found: warn
+          retention-days: 30

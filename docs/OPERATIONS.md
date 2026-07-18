@@ -23,7 +23,7 @@ After a Milvus schema change or restore, treat PostgreSQL `embeddings` as the so
 
 ## RAG Release Evidence
 
-Every RAG release must retain three artifacts or links: the deterministic `.run/rag-evaluation.json`, a green `CI / rag-integration` run, and both `.run/rag-end-to-end-baseline.json` and `.run/rag-end-to-end.json` from `RAG External Quality Gate`. The candidate report must contain a passing `ab_comparison`, not only absolute scores. Releases that change parsing or OCR also require a green `RAG Docling Integration` run. A skipped workflow, local fallback result, missing artifact, or configuration-error report is not passing evidence.
+Every RAG release must retain three artifacts or links: the deterministic `.run/rag-evaluation.json`, a green `CI / rag-integration` run, and both `.run/rag-end-to-end-baseline.json` and `.run/rag-end-to-end.json` from `RAG External Quality Gate`. The candidate report must contain a passing `ab_comparison`, not only absolute scores. Releases that change parsing or OCR also require a green `RAG Docling Integration` run and `.run/rag-parser-comparison.json` from `RAG Parser Benchmark`; all four backend reports must share one corpus hash. A skipped workflow, local fallback result, missing backend/resource metric, or configuration-error report is not passing evidence.
 
 The external report contains per-case retrieved citations and answers. Review judge reasons for every failed case; do not lower thresholds until the underlying retrieval or grounding failure is understood. Treat answers, retrieved document text and judge output as potentially sensitive and keep artifacts private with the configured 30-day retention.
 

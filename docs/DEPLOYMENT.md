@@ -103,6 +103,7 @@ GitHub Actions 还包含以下 RAG 专用门禁：
 
 - `CI / rag-integration`：自动启动真实 PostgreSQL 与 Milvus，验证 hybrid schema、个人数据隔离、4 并发查询和 p95 `<= 3000 ms`。
 - `RAG Docling Integration`：手动或每周运行真实 Docling DOCX 表格与扫描 PDF OCR。
+- `RAG Parser Benchmark`：手动或每月在相同语料哈希上比较 native、Docling、Unstructured 与 MinerU，并保留质量、延迟、内存和部署体积报告。
 - `RAG External Quality Gate`：手动运行真实 embedding/reranker/LLM judge。仓库需要配置 `RAG_EVAL_LLM_*`、`RAG_EVAL_EMBEDDING_*`、`RAG_EVAL_RERANKER_*` 和可选 `RAG_EVAL_JUDGE_MODEL` secrets；成本单价和 embedding 维度使用同名前缀的 repository variables。
 
 外部质量工作流的默认门槛为 Recall@5 `>= 0.8`、Faithfulness `>= 0.9`、judge 引用正确率 `>= 0.95`、拒答准确率 `= 1.0`、端到端 p95 `<= 5000 ms`。未配置 secrets、启用 fallback、judge 返回非严格 JSON 或 reranker 健康检查失败都会以非零退出码失败。
