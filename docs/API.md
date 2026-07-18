@@ -74,6 +74,8 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 - `POST /workflow/{workflow_id}/retry`：终态失败后重新扣费并入队。
 - `POST /workflow/{workflow_id}/retry-compensation`：仅用于 `COMPENSATION_FAILED`，人工核对业务数据后重试确定性补偿。
 - `POST /workflow/{workflow_id}/publish`：将指定工作流产物发布为报告或项目知识文档。
+- `GET /traces/overview?days=7&project_id=...&status=...`：汇总运行状态、端到端时延、Token、预估成本、每日趋势、Agent 性能、节点瓶颈和最近运行；`days` 为 1-90。
+- `GET /traces/{workflow_id}`：返回排队、节点、并行分支和人工等待 Span，以及模型调用和安全事件元数据。
 - `GET /knowledge/documents`
 - `POST /knowledge/upload`
 - `POST /knowledge/search`
@@ -90,6 +92,8 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
 
 `POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`。同一项目存在活动工作流时拒绝创建第二条；同一请求重试返回原工作流，不重复扣费。后台 worker 按节点持久化快照，自动重试耗尽或取消后幂等退款。
+
+追踪接口中，管理员可汇总和查看全平台工作流；普通成员只查看本人发起且当前仍有项目读取权限的工作流。指定无权访问的 `project_id` 或跨租户读取运行详情统一返回 `404`。总运行数、状态、Token、成本和每日趋势使用完整数据库聚合；P95、Agent 分布和节点瓶颈使用有上限的最近样本，截断时 `window.analysis_truncated=true`。追踪响应不返回 `state_json`、Prompt、人工反馈或产物正文，事件 payload 只公开角色、轮次、下一节点、质量分数等允许的运行元数据。
 
 ## AI 原型工作室
 

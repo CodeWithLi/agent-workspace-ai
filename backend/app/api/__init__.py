@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routes import agents, audit, auth, billing, dashboard, evaluations, knowledge, meetings, notifications, projects, prototype_jobs, prototypes, reports, requirements, search, settings, users, workflow
+from app.api.routes import agents, audit, auth, billing, dashboard, evaluations, knowledge, meetings, notifications, projects, prototype_jobs, prototypes, reports, requirements, search, settings, traces, users, workflow
 
 
 api_router = APIRouter()
@@ -14,6 +14,7 @@ api_router.include_router(prototype_jobs.router, prefix="/prototypes", tags=["pr
 api_router.include_router(prototypes.router, prefix="/prototypes", tags=["prototypes"])
 api_router.include_router(agents.router, prefix="/agents", tags=["agents"])
 api_router.include_router(evaluations.router, prefix="/evaluations", tags=["evaluations"])
+api_router.include_router(traces.router, prefix="/traces", tags=["traces"])
 api_router.include_router(knowledge.router, prefix="/knowledge", tags=["knowledge"])
 api_router.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
 api_router.include_router(meetings.router, prefix="/meetings", tags=["meetings"])

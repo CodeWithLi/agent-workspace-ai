@@ -456,6 +456,90 @@ async function mockApi(page: Page) {
   ]
   let evaluationRuns = [mockEvaluationRun(81), mockEvaluationRun(80)]
   let evaluationPolls = 0
+  const traceOverview = {
+    window: {
+      start_at: '2026-07-11T08:00:00Z',
+      end_at: '2026-07-18T08:00:00Z',
+      days: 7,
+      analysis_truncated: true
+    },
+    metrics: {
+      total_runs: 12,
+      active_runs: 2,
+      completed_runs: 8,
+      failed_runs: 2,
+      cancelled_runs: 0,
+      success_rate: 80,
+      average_duration_ms: 310000,
+      p95_duration_ms: 720000,
+      total_tokens: 24800,
+      total_cost_micros: 123400,
+      total_llm_calls: 48
+    },
+    status_counts: { RUNNING: 2, COMPLETED: 8, FAILED: 2 },
+    trend: [
+      { bucket: '2026-07-16', runs: 3, completed: 2, failed: 1, cancelled: 0, total_tokens: 5200, total_cost_micros: 26000 },
+      { bucket: '2026-07-17', runs: 4, completed: 3, failed: 1, cancelled: 0, total_tokens: 8300, total_cost_micros: 41200 },
+      { bucket: '2026-07-18', runs: 5, completed: 3, failed: 0, cancelled: 0, total_tokens: 11300, total_cost_micros: 56200 }
+    ],
+    projects: [{ project_id: 1, project_name: '灰度发布工作台' }],
+    agents: [
+      {
+        agent_id: 3, agent_name: 'AI架构师', agent_role: 'architect', providers: ['openai'], models: ['gpt-5.2'],
+        workflow_count: 8, call_count: 18, input_tokens: 7200, output_tokens: 3300, total_tokens: 10500,
+        total_cost_micros: 62000, average_latency_ms: 4200, p95_latency_ms: 6800, max_latency_ms: 9100
+      },
+      {
+        agent_id: 1, agent_name: 'AI产品经理', agent_role: 'product_manager', providers: ['openai'], models: ['gpt-5.2-mini'],
+        workflow_count: 10, call_count: 20, input_tokens: 6100, output_tokens: 4200, total_tokens: 10300,
+        total_cost_micros: 41400, average_latency_ms: 2800, p95_latency_ms: 4600, max_latency_ms: 7200
+      }
+    ],
+    bottlenecks: [
+      { key: 'node:specialists', node: 'specialists', label: '专业分支', kind: 'node', execution_count: 10, average_duration_ms: 238000, p95_duration_ms: 410000, max_duration_ms: 480000, compute_share_percent: 46.2 },
+      { key: 'node:quality_gate', node: 'quality_gate', label: '质量门禁', kind: 'node', execution_count: 9, average_duration_ms: 96000, p95_duration_ms: 180000, max_duration_ms: 210000, compute_share_percent: 18.6 }
+    ],
+    recent_runs: [
+      {
+        workflow_id: 88, project_id: 1, project_name: '灰度发布工作台', owner_id: 1, owner_name: '灰度管理员',
+        status: 'COMPLETED', current_node: 'completed', duration_ms: 480000, queue_ms: 30000,
+        total_tokens: 2350, total_cost_micros: 11800, llm_call_count: 2, agent_count: 2, event_count: 8,
+        error: '', created_at: '2026-07-18T08:00:00Z', started_at: '2026-07-18T08:00:30Z', finished_at: '2026-07-18T08:08:00Z'
+      }
+    ]
+  }
+  const traceDetail = {
+    run: traceOverview.recent_runs[0],
+    metrics: {
+      total_duration_ms: 480000,
+      queue_ms: 30000,
+      active_compute_ms: 330000,
+      human_wait_ms: 60000,
+      coordination_ms: 60000,
+      total_tokens: 2350,
+      total_cost_micros: 11800,
+      total_llm_calls: 2,
+      critical_span_id: 'node-specialists'
+    },
+    spans: [
+      { span_id: 'queue-88', kind: 'queue', node: 'queue', label: '队列等待', agent_role: '', agent_name: '', status: 'COMPLETED', attempt: 1, started_at: '2026-07-18T08:00:00Z', finished_at: '2026-07-18T08:00:30Z', duration_ms: 30000, llm_call_count: 0, total_tokens: 0, total_cost_micros: 0, model_latency_ms: 0, payload: {} },
+      { span_id: 'node-planning', kind: 'node', node: 'planning', label: '动态规划', agent_role: 'project_manager', agent_name: 'AI项目经理', status: 'COMPLETED', attempt: 1, started_at: '2026-07-18T08:00:30Z', finished_at: '2026-07-18T08:02:00Z', duration_ms: 90000, llm_call_count: 1, total_tokens: 900, total_cost_micros: 4300, model_latency_ms: 2900, payload: { next_node: 'specialists' } },
+      { span_id: 'node-specialists', kind: 'node', node: 'specialists', label: '专业分支', agent_role: '', agent_name: '', status: 'COMPLETED', attempt: 1, started_at: '2026-07-18T08:02:00Z', finished_at: '2026-07-18T08:06:00Z', duration_ms: 240000, llm_call_count: 0, total_tokens: 0, total_cost_micros: 0, model_latency_ms: 0, payload: { next_node: 'quality_gate' } },
+      { span_id: 'branch-architect', kind: 'branch', node: 'specialists', label: 'AI架构师', agent_role: 'architect', agent_name: 'AI架构师', status: 'COMPLETED', attempt: 1, started_at: '2026-07-18T08:02:10Z', finished_at: '2026-07-18T08:05:40Z', duration_ms: 210000, llm_call_count: 1, total_tokens: 1450, total_cost_micros: 7500, model_latency_ms: 6800, payload: { role: 'architect', revision_round: 0, output_chars: 4280 } },
+      { span_id: 'wait-quality', kind: 'wait', node: 'quality_review', label: '人工确认等待', agent_role: '', agent_name: '', status: 'COMPLETED', attempt: 1, started_at: '2026-07-18T08:06:00Z', finished_at: '2026-07-18T08:07:00Z', duration_ms: 60000, llm_call_count: 0, total_tokens: 0, total_cost_micros: 0, model_latency_ms: 0, payload: { approval_gate: 'quality_review' } }
+    ],
+    model_calls: [
+      { id: 901, agent_id: 2, agent_name: 'AI项目经理', agent_role: 'project_manager', operation: 'workflow', provider: 'openai', model: 'gpt-5.2-mini', input_tokens: 580, output_tokens: 320, total_tokens: 900, estimated_cost_micros: 4300, latency_ms: 2900, usage_source: 'provider', created_at: '2026-07-18T08:01:50Z' },
+      { id: 902, agent_id: 3, agent_name: 'AI架构师', agent_role: 'architect', operation: 'workflow', provider: 'openai', model: 'gpt-5.2', input_tokens: 980, output_tokens: 470, total_tokens: 1450, estimated_cost_micros: 7500, latency_ms: 6800, usage_source: 'provider', created_at: '2026-07-18T08:05:30Z' }
+    ],
+    events: [
+      { id: 1, node: 'requirement', event_type: 'QUEUED', message: 'Workflow queued', payload: {}, created_at: '2026-07-18T08:00:00Z' },
+      { id: 2, node: 'planning', event_type: 'NODE_STARTED', message: 'Started planning', payload: {}, created_at: '2026-07-18T08:00:30Z' },
+      { id: 3, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'Started specialist branch architect', payload: { role: 'architect', revision_round: 0 }, created_at: '2026-07-18T08:02:10Z' },
+      { id: 4, node: 'quality_review', event_type: 'PAUSED', message: 'Workflow is waiting for quality revision direction', payload: { approval_gate: 'quality_review' }, created_at: '2026-07-18T08:06:00Z' },
+      { id: 5, node: 'completed', event_type: 'COMPLETED', message: 'Workflow completed', payload: {}, created_at: '2026-07-18T08:08:00Z' }
+    ]
+  }
   type MockGenerationJob = {
     job_id: number
     operation: 'CREATE' | 'REGENERATE'
@@ -856,6 +940,8 @@ async function mockApi(page: Page) {
       evaluationRuns = evaluationRuns.map((item) => item.id === id ? mockEvaluationRun(id, nextStatus) : item)
       body = evaluationRuns.find((item) => item.id === id)
     }
+    else if (method === 'GET' && path === '/traces/overview') body = traceOverview
+    else if (method === 'GET' && path === '/traces/88') body = traceDetail
     else if (method === 'GET' && path === '/agents') body = discussionAgents
     else if (method === 'GET' && path === '/agents/conversations') body = []
     else if (method === 'POST' && path === '/agents/discussion/stream') {
@@ -1018,6 +1104,69 @@ test('keeps the evaluation lab usable at 375px and mobile landscape', async ({ p
   await page.setViewportSize({ width: 844, height: 390 })
   await expect(page.getByRole('heading', { name: 'Agent 评测实验室' })).toBeVisible()
   await expect(page.locator('.desktop-run-table:visible, .mobile-run-list:visible')).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
+test('traces multi-agent runtime metrics and opens a deep-linked run detail', async ({ page }, testInfo) => {
+  await page.goto('/traces')
+
+  await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
+  await expect(page.getByText('80.0%', { exact: true })).toBeVisible()
+  await expect(page.getByText('分析样本已截断', { exact: true })).toBeVisible()
+  await expect(page.locator('strong:visible').filter({ hasText: /^AI架构师$/ }).first()).toBeVisible()
+  const trend = page.getByRole('img', { name: /共 12 次运行.*消耗 24800 Token/ })
+  await expect(trend.locator('canvas')).toBeVisible()
+  const canvasHasPixels = await trend.locator('canvas').evaluate((node) => {
+    const canvas = node as HTMLCanvasElement
+    const context = canvas.getContext('2d')
+    if (!context) return false
+    return context.getImageData(0, 0, canvas.width, canvas.height).data.some((value, index) => index % 4 === 3 && value > 0)
+  })
+  expect(canvasHasPixels).toBe(true)
+
+  const runTrigger = page.locator('.desktop-table:visible .trace-link, .mobile-card-list:visible .run-card-button').first()
+  await runTrigger.click()
+  await expect(page).toHaveURL(/\/traces\?run=88$/)
+  await expect(page.getByRole('heading', { name: '#88 · 灰度发布工作台' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '执行时间线' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '模型调用' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '事件日志' })).toBeVisible()
+  await expect(page.getByText('Started specialist branch architect', { exact: true })).toBeVisible()
+  const visibleModelCalls = page.locator('.trace-detail .desktop-table:visible, .trace-detail .mobile-card-list:visible').filter({ hasText: 'gpt-5.2' })
+  await expect(visibleModelCalls).toBeVisible()
+  const drawerOverflow = await page.evaluate(() => {
+    const body = document.querySelector('.trace-detail-drawer .el-drawer__body')
+    return body ? body.scrollWidth - body.clientWidth : 0
+  })
+  expect(drawerOverflow).toBeLessThanOrEqual(0)
+  if (testInfo.project.name === 'mobile-chromium') {
+    const closeTarget = await page.getByRole('button', { name: '关闭运行追踪' }).evaluate((button) => {
+      const rect = button.getBoundingClientRect()
+      return { width: rect.width, height: rect.height }
+    })
+    expect(closeTarget.width).toBeGreaterThanOrEqual(44)
+    expect(closeTarget.height).toBeGreaterThanOrEqual(44)
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.getByRole('button', { name: '关闭运行追踪' }).click()
+  await expect(page).toHaveURL(/\/traces$/)
+})
+
+test('keeps runtime tracing usable at 375px, landscape and reduced motion', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile-chromium', 'Mobile viewport regression')
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.setViewportSize({ width: 375, height: 812 })
+  await page.goto('/traces')
+
+  await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '刷新运行追踪' })).toHaveCSS('width', '44px')
+  await expect(page.locator('.mobile-card-list:visible .run-card')).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+
+  await page.setViewportSize({ width: 844, height: 390 })
+  await expect(page.getByRole('heading', { name: 'Agent 运行追踪' })).toBeVisible()
+  await expect(page.getByRole('img', { name: /运行与消耗趋势图/ }).locator('canvas')).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 

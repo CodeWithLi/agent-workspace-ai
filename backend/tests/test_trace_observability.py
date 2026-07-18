@@ -1,0 +1,452 @@
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app import observability
+from app.main import app
+from app.models import (
+    Agent,
+    AgentRole,
+    LLMUsage,
+    Project,
+    ProjectMember,
+    ProjectMemberRole,
+    User,
+    UserRole,
+    WorkflowEvent,
+    WorkflowRun,
+    WorkflowStatus,
+)
+from app.observability import get_trace_detail, get_trace_overview
+
+
+NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
+
+
+def _event(
+    workflow: WorkflowRun,
+    event_type: str,
+    at: datetime,
+    *,
+    node: str = "",
+    payload: dict | None = None,
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        workflow_id=workflow.id,
+        node=node,
+        event_type=event_type,
+        message=f"{event_type} {node}".strip(),
+        payload_json=json.dumps(payload or {}),
+        created_at=at,
+    )
+
+
+def _seed_trace_data(db: Session) -> dict[str, object]:
+    admin = User(
+        email="trace-admin@example.com",
+        name="Trace Admin",
+        password_hash="hash",
+        role=UserRole.admin,
+    )
+    alice = User(
+        email="trace-alice@example.com",
+        name="Alice",
+        password_hash="hash",
+        role=UserRole.member,
+    )
+    bob = User(
+        email="trace-bob@example.com",
+        name="Bob",
+        password_hash="hash",
+        role=UserRole.member,
+    )
+    db.add_all([admin, alice, bob])
+    db.flush()
+
+    alpha = Project(name="Alpha", owner_id=alice.id)
+    beta = Project(name="Beta", owner_id=bob.id)
+    db.add_all([alpha, beta])
+    db.flush()
+    db.add_all(
+        [
+            ProjectMember(project_id=alpha.id, user_id=alice.id, role=ProjectMemberRole.owner),
+            ProjectMember(project_id=beta.id, user_id=bob.id, role=ProjectMemberRole.owner),
+        ]
+    )
+
+    architect = Agent(
+        name="Trace Architect",
+        role=AgentRole.architect,
+        description="Architecture",
+        system_prompt="hidden architect prompt",
+        model="trace-model",
+    )
+    product_manager = Agent(
+        name="Trace Product Manager",
+        role=AgentRole.product_manager,
+        description="Product",
+        system_prompt="hidden product prompt",
+        model="trace-model",
+    )
+    operations = Agent(
+        name="Trace Operations",
+        role=AgentRole.operations_analyst,
+        description="Operations",
+        system_prompt="hidden operations prompt",
+        model="trace-model",
+    )
+    db.add_all([architect, product_manager, operations])
+    db.flush()
+
+    base = NOW - timedelta(hours=1)
+    completed = WorkflowRun(
+        project_id=alpha.id,
+        user_id=alice.id,
+        status=WorkflowStatus.completed,
+        current_node="completed",
+        state_json=json.dumps({"prompt": "super-secret-prompt", "artifact": "secret-body"}),
+        created_at=base,
+        started_at=base + timedelta(minutes=1),
+        finished_at=base + timedelta(minutes=13),
+    )
+    failed = WorkflowRun(
+        project_id=beta.id,
+        user_id=bob.id,
+        status=WorkflowStatus.failed,
+        current_node="architect",
+        state_json=json.dumps({"prompt": "other-secret-prompt"}),
+        error="model timeout",
+        created_at=base + timedelta(minutes=5),
+        started_at=base + timedelta(minutes=6),
+        finished_at=base + timedelta(minutes=10),
+    )
+    db.add_all([completed, failed])
+    db.flush()
+
+    db.add_all(
+        [
+            _event(completed, "QUEUED", base, node="requirement"),
+            _event(completed, "STARTED", base + timedelta(minutes=1), node="requirement"),
+            _event(completed, "NODE_STARTED", base + timedelta(minutes=2), node="specialists"),
+            _event(
+                completed,
+                "BRANCH_STARTED",
+                base + timedelta(minutes=2, seconds=10),
+                node="specialists",
+                payload={
+                    "role": "architect",
+                    "revision_round": 0,
+                    "deliverable": "secret architecture deliverable",
+                    "prompt": "secret branch prompt",
+                },
+            ),
+            _event(
+                completed,
+                "BRANCH_STARTED",
+                base + timedelta(minutes=2, seconds=20),
+                node="specialists",
+                payload={"role": "product_manager", "revision_round": 0},
+            ),
+            _event(
+                completed,
+                "BRANCH_COMPLETED",
+                base + timedelta(minutes=6),
+                node="specialists",
+                payload={"role": "architect", "revision_round": 0, "output_chars": 4800},
+            ),
+            _event(
+                completed,
+                "BRANCH_COMPLETED",
+                base + timedelta(minutes=7),
+                node="specialists",
+                payload={"role": "product_manager", "revision_round": 0, "output_chars": 3200},
+            ),
+            _event(
+                completed,
+                "NODE_COMPLETED",
+                base + timedelta(minutes=7, seconds=30),
+                node="specialists",
+                payload={"next_node": "quality_gate"},
+            ),
+            _event(
+                completed,
+                "PAUSED",
+                base + timedelta(minutes=8),
+                node="quality_review",
+                payload={"approval_gate": "quality_review", "human_feedback": "secret feedback"},
+            ),
+            _event(completed, "QUEUED", base + timedelta(minutes=9), node="report"),
+            _event(completed, "NODE_STARTED", base + timedelta(minutes=9), node="report"),
+            _event(
+                completed,
+                "NODE_COMPLETED",
+                base + timedelta(minutes=12),
+                node="report",
+                payload={"next_node": "completed"},
+            ),
+            _event(completed, "COMPLETED", base + timedelta(minutes=13), node="completed"),
+            _event(failed, "QUEUED", base + timedelta(minutes=5), node="architect"),
+            _event(failed, "STARTED", base + timedelta(minutes=6), node="architect"),
+            _event(failed, "NODE_STARTED", base + timedelta(minutes=6), node="architect"),
+            _event(failed, "FAILED", base + timedelta(minutes=10), node="architect"),
+        ]
+    )
+    db.add_all(
+        [
+            LLMUsage(
+                user_id=alice.id,
+                project_id=alpha.id,
+                workflow_id=completed.id,
+                agent_id=architect.id,
+                operation="workflow",
+                provider="openai",
+                model="gpt-trace",
+                input_tokens=60,
+                output_tokens=40,
+                total_tokens=100,
+                estimated_cost_micros=1000,
+                latency_ms=1000,
+                created_at=base + timedelta(minutes=5),
+            ),
+            LLMUsage(
+                user_id=alice.id,
+                project_id=alpha.id,
+                workflow_id=completed.id,
+                agent_id=product_manager.id,
+                operation="workflow",
+                provider="openai",
+                model="gpt-trace",
+                input_tokens=120,
+                output_tokens=80,
+                total_tokens=200,
+                estimated_cost_micros=2000,
+                latency_ms=2000,
+                created_at=base + timedelta(minutes=6, seconds=30),
+            ),
+            LLMUsage(
+                user_id=alice.id,
+                project_id=alpha.id,
+                workflow_id=completed.id,
+                agent_id=operations.id,
+                operation="workflow",
+                provider="local",
+                model="ops-trace",
+                input_tokens=30,
+                output_tokens=20,
+                total_tokens=50,
+                estimated_cost_micros=500,
+                latency_ms=500,
+                created_at=base + timedelta(minutes=11),
+            ),
+            LLMUsage(
+                user_id=bob.id,
+                project_id=beta.id,
+                workflow_id=failed.id,
+                agent_id=architect.id,
+                operation="workflow",
+                provider="openai",
+                model="gpt-trace",
+                input_tokens=40,
+                output_tokens=20,
+                total_tokens=60,
+                estimated_cost_micros=600,
+                latency_ms=3000,
+                created_at=base + timedelta(minutes=8),
+            ),
+        ]
+    )
+    db.commit()
+    return {
+        "admin": admin,
+        "alice": alice,
+        "bob": bob,
+        "alpha": alpha,
+        "beta": beta,
+        "completed": completed,
+        "failed": failed,
+    }
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(observability, "_utc_now", lambda: NOW)
+
+
+def test_trace_overview_aggregates_admin_scope_and_member_scope(db: Session) -> None:
+    data = _seed_trace_data(db)
+
+    admin_overview = get_trace_overview(
+        db,
+        data["admin"],
+        days=7,
+        project_id=None,
+        workflow_status=None,
+    )
+    assert admin_overview.metrics.total_runs == 2
+    assert admin_overview.metrics.completed_runs == 1
+    assert admin_overview.metrics.failed_runs == 1
+    assert admin_overview.metrics.success_rate == 50.0
+    assert admin_overview.metrics.average_duration_ms == 540_000
+    assert admin_overview.metrics.p95_duration_ms == 780_000
+    assert admin_overview.metrics.total_tokens == 410
+    assert admin_overview.metrics.total_cost_micros == 4100
+    assert admin_overview.metrics.total_llm_calls == 4
+    assert admin_overview.status_counts == {"COMPLETED": 1, "FAILED": 1}
+    assert sum(point.runs for point in admin_overview.trend) == 2
+    assert {project.project_name for project in admin_overview.projects} == {"Alpha", "Beta"}
+    assert {run.workflow_id for run in admin_overview.recent_runs} == {
+        data["completed"].id,
+        data["failed"].id,
+    }
+
+    member_overview = get_trace_overview(
+        db,
+        data["alice"],
+        days=7,
+        project_id=None,
+        workflow_status=None,
+    )
+    assert member_overview.metrics.total_runs == 1
+    assert member_overview.metrics.success_rate == 100.0
+    assert member_overview.metrics.total_tokens == 350
+    assert [project.project_name for project in member_overview.projects] == ["Alpha"]
+    assert [run.workflow_id for run in member_overview.recent_runs] == [data["completed"].id]
+
+
+def test_trace_filters_validate_project_access_and_status(db: Session) -> None:
+    data = _seed_trace_data(db)
+
+    failed_only = get_trace_overview(
+        db,
+        data["admin"],
+        days=7,
+        project_id=None,
+        workflow_status=WorkflowStatus.failed,
+    )
+    assert failed_only.metrics.total_runs == 1
+    assert failed_only.metrics.failed_runs == 1
+
+    with pytest.raises(HTTPException) as inaccessible:
+        get_trace_overview(
+            db,
+            data["alice"],
+            days=7,
+            project_id=data["beta"].id,
+            workflow_status=None,
+        )
+    assert inaccessible.value.status_code == 404
+
+
+def test_trace_detail_pairs_spans_assigns_usage_and_redacts_payloads(db: Session) -> None:
+    data = _seed_trace_data(db)
+
+    detail = get_trace_detail(db, data["alice"], data["completed"].id)
+    assert detail.metrics.total_duration_ms == 780_000
+    assert detail.metrics.queue_ms == 60_000
+    assert detail.metrics.active_compute_ms == 510_000
+    assert detail.metrics.human_wait_ms == 60_000
+    assert detail.metrics.coordination_ms == 150_000
+    assert detail.metrics.total_tokens == 350
+    assert detail.metrics.total_cost_micros == 3500
+    assert detail.metrics.total_llm_calls == 3
+
+    architect_branch = next(
+        span for span in detail.spans if span.kind == "branch" and span.agent_role == "architect"
+    )
+    product_branch = next(
+        span for span in detail.spans if span.kind == "branch" and span.agent_role == "product_manager"
+    )
+    specialists_node = next(
+        span for span in detail.spans if span.kind == "node" and span.node == "specialists"
+    )
+    report_node = next(span for span in detail.spans if span.kind == "node" and span.node == "report")
+    wait_span = next(span for span in detail.spans if span.kind == "wait")
+    assert architect_branch.total_tokens == 100
+    assert product_branch.total_tokens == 200
+    assert specialists_node.total_tokens == 0
+    assert report_node.total_tokens == 50
+    assert wait_span.duration_ms == 60_000
+    assert detail.metrics.critical_span_id == specialists_node.span_id
+
+    serialized = detail.model_dump_json()
+    assert "super-secret-prompt" not in serialized
+    assert "secret-body" not in serialized
+    assert "secret architecture deliverable" not in serialized
+    assert "secret branch prompt" not in serialized
+    assert "secret feedback" not in serialized
+    branch_event = next(event for event in detail.events if event.event_type == "BRANCH_STARTED")
+    assert branch_event.payload == {"role": "architect", "revision_round": 0}
+
+
+def test_trace_detail_is_tenant_scoped_while_admin_can_inspect_all(db: Session) -> None:
+    data = _seed_trace_data(db)
+
+    with pytest.raises(HTTPException) as hidden:
+        get_trace_detail(db, data["alice"], data["failed"].id)
+    assert hidden.value.status_code == 404
+    assert get_trace_detail(db, data["admin"], data["failed"].id).run.owner_name == "Bob"
+
+
+def test_trace_detail_revalidates_project_membership(db: Session) -> None:
+    data = _seed_trace_data(db)
+    member = User(
+        email="trace-revoked@example.com",
+        name="Revoked Member",
+        password_hash="hash",
+        role=UserRole.member,
+    )
+    db.add(member)
+    db.flush()
+    membership = ProjectMember(
+        project_id=data["alpha"].id,
+        user_id=member.id,
+        role=ProjectMemberRole.viewer,
+    )
+    workflow = WorkflowRun(
+        project_id=data["alpha"].id,
+        user_id=member.id,
+        status=WorkflowStatus.queued,
+        current_node="requirement",
+        state_json="{}",
+        created_at=NOW - timedelta(minutes=5),
+    )
+    db.add_all([membership, workflow])
+    db.commit()
+
+    assert get_trace_detail(db, member, workflow.id).run.workflow_id == workflow.id
+    db.delete(membership)
+    db.commit()
+    with pytest.raises(HTTPException) as revoked:
+        get_trace_detail(db, member, workflow.id)
+    assert revoked.value.status_code == 404
+
+
+def test_trace_sample_truncation_keeps_exact_database_totals(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seed_trace_data(db)
+    monkeypatch.setattr(observability, "RUN_ANALYSIS_LIMIT", 1)
+    monkeypatch.setattr(observability, "USAGE_ANALYSIS_LIMIT", 1)
+
+    overview = get_trace_overview(
+        db,
+        data["admin"],
+        days=7,
+        project_id=None,
+        workflow_status=None,
+    )
+    assert overview.window.analysis_truncated is True
+    assert overview.metrics.total_runs == 2
+    assert overview.metrics.total_tokens == 410
+    assert overview.metrics.total_cost_micros == 4100
+    assert overview.metrics.total_llm_calls == 4
+
+
+def test_trace_routes_are_published_in_openapi() -> None:
+    paths = app.openapi()["paths"]
+    assert "/api/v1/traces/overview" in paths
+    assert "/api/v1/traces/{workflow_id}" in paths

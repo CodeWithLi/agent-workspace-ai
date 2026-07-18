@@ -497,6 +497,168 @@ class WorkflowPublicationOut(BaseModel):
     document_id: int | None
 
 
+class TraceWindowOut(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    days: int
+    analysis_truncated: bool
+
+
+class TraceMetricSummaryOut(BaseModel):
+    total_runs: int
+    active_runs: int
+    completed_runs: int
+    failed_runs: int
+    cancelled_runs: int
+    success_rate: float
+    average_duration_ms: int
+    p95_duration_ms: int
+    total_tokens: int
+    total_cost_micros: int
+    total_llm_calls: int
+
+
+class TraceTrendPointOut(BaseModel):
+    bucket: str
+    runs: int
+    completed: int
+    failed: int
+    cancelled: int
+    total_tokens: int
+    total_cost_micros: int
+
+
+class TraceProjectOptionOut(BaseModel):
+    project_id: int
+    project_name: str
+
+
+class TraceAgentMetricOut(BaseModel):
+    agent_id: int | None
+    agent_name: str
+    agent_role: str
+    providers: list[str]
+    models: list[str]
+    workflow_count: int
+    call_count: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    total_cost_micros: int
+    average_latency_ms: int
+    p95_latency_ms: int
+    max_latency_ms: int
+
+
+class TraceBottleneckOut(BaseModel):
+    key: str
+    node: str
+    label: str
+    kind: str
+    execution_count: int
+    average_duration_ms: int
+    p95_duration_ms: int
+    max_duration_ms: int
+    compute_share_percent: float
+
+
+class TraceRunOut(BaseModel):
+    workflow_id: int
+    project_id: int
+    project_name: str
+    owner_id: int
+    owner_name: str
+    status: WorkflowStatus
+    current_node: str
+    duration_ms: int
+    queue_ms: int
+    total_tokens: int
+    total_cost_micros: int
+    llm_call_count: int
+    agent_count: int
+    event_count: int
+    error: str
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class TraceOverviewOut(BaseModel):
+    window: TraceWindowOut
+    metrics: TraceMetricSummaryOut
+    status_counts: dict[str, int]
+    trend: list[TraceTrendPointOut]
+    projects: list[TraceProjectOptionOut]
+    agents: list[TraceAgentMetricOut]
+    bottlenecks: list[TraceBottleneckOut]
+    recent_runs: list[TraceRunOut]
+
+
+class TraceSpanOut(BaseModel):
+    span_id: str
+    kind: str
+    node: str
+    label: str
+    agent_role: str
+    agent_name: str
+    status: str
+    attempt: int
+    started_at: datetime
+    finished_at: datetime | None
+    duration_ms: int
+    llm_call_count: int
+    total_tokens: int
+    total_cost_micros: int
+    model_latency_ms: int
+    payload: dict[str, Any]
+
+
+class TraceModelCallOut(BaseModel):
+    id: int
+    agent_id: int | None
+    agent_name: str
+    agent_role: str
+    operation: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost_micros: int
+    latency_ms: int
+    usage_source: str
+    created_at: datetime
+
+
+class TraceEventDetailOut(BaseModel):
+    id: int
+    node: str
+    event_type: str
+    message: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+class TraceDetailMetricsOut(BaseModel):
+    total_duration_ms: int
+    queue_ms: int
+    active_compute_ms: int
+    human_wait_ms: int
+    coordination_ms: int
+    total_tokens: int
+    total_cost_micros: int
+    total_llm_calls: int
+    critical_span_id: str | None
+
+
+class TraceDetailOut(BaseModel):
+    run: TraceRunOut
+    metrics: TraceDetailMetricsOut
+    spans: list[TraceSpanOut]
+    model_calls: list[TraceModelCallOut]
+    events: list[TraceEventDetailOut]
+
+
 class KnowledgeDocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

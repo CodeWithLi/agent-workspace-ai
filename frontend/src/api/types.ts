@@ -483,6 +483,179 @@ export interface WorkflowSagaStep {
   updated_at: string
 }
 
+export type WorkflowTraceStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'CANCELLING'
+  | 'COMPENSATING'
+  | 'COMPENSATION_FAILED'
+  | 'CANCELLED'
+  | 'PAUSED'
+  | 'COMPLETED'
+  | 'FAILED'
+
+export interface TraceWindow {
+  start_at: string
+  end_at: string
+  days: number
+  analysis_truncated: boolean
+}
+
+export interface TraceMetricSummary {
+  total_runs: number
+  active_runs: number
+  completed_runs: number
+  failed_runs: number
+  cancelled_runs: number
+  success_rate: number
+  average_duration_ms: number
+  p95_duration_ms: number
+  total_tokens: number
+  total_cost_micros: number
+  total_llm_calls: number
+}
+
+export interface TraceTrendPoint {
+  bucket: string
+  runs: number
+  completed: number
+  failed: number
+  cancelled: number
+  total_tokens: number
+  total_cost_micros: number
+}
+
+export interface TraceProjectOption {
+  project_id: number
+  project_name: string
+}
+
+export interface TraceAgentMetric {
+  agent_id?: number | null
+  agent_name: string
+  agent_role: string
+  providers: string[]
+  models: string[]
+  workflow_count: number
+  call_count: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  total_cost_micros: number
+  average_latency_ms: number
+  p95_latency_ms: number
+  max_latency_ms: number
+}
+
+export interface TraceBottleneck {
+  key: string
+  node: string
+  label: string
+  kind: string
+  execution_count: number
+  average_duration_ms: number
+  p95_duration_ms: number
+  max_duration_ms: number
+  compute_share_percent: number
+}
+
+export interface TraceRun {
+  workflow_id: number
+  project_id: number
+  project_name: string
+  owner_id: number
+  owner_name: string
+  status: WorkflowTraceStatus
+  current_node: string
+  duration_ms: number
+  queue_ms: number
+  total_tokens: number
+  total_cost_micros: number
+  llm_call_count: number
+  agent_count: number
+  event_count: number
+  error: string
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface TraceOverview {
+  window: TraceWindow
+  metrics: TraceMetricSummary
+  status_counts: Record<string, number>
+  trend: TraceTrendPoint[]
+  projects: TraceProjectOption[]
+  agents: TraceAgentMetric[]
+  bottlenecks: TraceBottleneck[]
+  recent_runs: TraceRun[]
+}
+
+export interface TraceSpan {
+  span_id: string
+  kind: string
+  node: string
+  label: string
+  agent_role: string
+  agent_name: string
+  status: string
+  attempt: number
+  started_at: string
+  finished_at?: string | null
+  duration_ms: number
+  llm_call_count: number
+  total_tokens: number
+  total_cost_micros: number
+  model_latency_ms: number
+  payload: Record<string, unknown>
+}
+
+export interface TraceModelCall {
+  id: number
+  agent_id?: number | null
+  agent_name: string
+  agent_role: string
+  operation: string
+  provider: string
+  model: string
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  estimated_cost_micros: number
+  latency_ms: number
+  usage_source: string
+  created_at: string
+}
+
+export interface TraceEventDetail {
+  id: number
+  node: string
+  event_type: string
+  message: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface TraceDetailMetrics {
+  total_duration_ms: number
+  queue_ms: number
+  active_compute_ms: number
+  human_wait_ms: number
+  coordination_ms: number
+  total_tokens: number
+  total_cost_micros: number
+  total_llm_calls: number
+  critical_span_id?: string | null
+}
+
+export interface TraceDetail {
+  run: TraceRun
+  metrics: TraceDetailMetrics
+  spans: TraceSpan[]
+  model_calls: TraceModelCall[]
+  events: TraceEventDetail[]
+}
+
 export type PrototypeComponentType =
   | 'heading'
   | 'text'

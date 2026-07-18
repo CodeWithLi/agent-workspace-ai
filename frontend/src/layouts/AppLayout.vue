@@ -33,6 +33,10 @@
           <el-icon><Cpu /></el-icon>
           <span>AI 员工</span>
         </el-menu-item>
+        <el-menu-item index="/traces">
+          <el-icon><DataLine /></el-icon>
+          <span>运行追踪</span>
+        </el-menu-item>
         <el-menu-item index="/tasks">
           <el-icon><Tickets /></el-icon>
           <span>任务看板</span>
@@ -118,7 +122,7 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, DataAnalysis, Document, Files, Folder, List, MagicStick, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
+import { ArrowDown, Bell, ChatDotRound, Coin, Connection, Cpu, DataAnalysis, DataLine, Document, Files, Folder, List, MagicStick, Menu as MenuIcon, Monitor, Notebook, Plus, Search, Setting, SwitchButton, Tickets, TrendCharts, User } from '@element-plus/icons-vue'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
