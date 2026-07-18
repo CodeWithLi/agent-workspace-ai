@@ -43,7 +43,7 @@ jobs:
           exit 1
       - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-rag-integration.txt
         working-directory: backend
-      - run: pytest -q tests/test_rag_real_docling.py
+      - run: python -m pytest -q tests/test_rag_real_docling.py
         working-directory: backend
       - if: always()
         run: docker logs docling-serve
