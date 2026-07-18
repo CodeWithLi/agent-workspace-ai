@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import math
 import re
-from time import perf_counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
+from time import perf_counter
 from typing import Callable
 
 from app.rag.chunking import StructuralChunker
@@ -29,6 +30,7 @@ class CandidateChunk:
     content: str
     token_count: int
     has_heading_path: bool
+    parent_id: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,6 +114,11 @@ def deterministic_citation_score(answer: str, allowed: set[str], *, answerable: 
     return 1.0 if citations.issubset(allowed) else 0.0
 
 
+def first_relevant_rank(matches: Iterable[bool]) -> int | None:
+    """Rank one evidence target once, even when overlapping chunks repeat it."""
+    return next((rank for rank, matched in enumerate(matches, start=1) if matched), None)
+
+
 def compare_end_to_end_reports(
     baseline: dict,
     candidate: dict,
@@ -150,16 +157,12 @@ def compare_end_to_end_reports(
         delta = float(candidate_value) - float(baseline_value)
         deltas[metric] = round(delta, 4)
         if delta < -regression_tolerance:
-            failures.append(
-                f"{metric} regressed by {abs(delta):.4f}, tolerance is {regression_tolerance:.4f}"
-            )
+            failures.append(f"{metric} regressed by {abs(delta):.4f}, tolerance is {regression_tolerance:.4f}")
 
     primary_metrics = ("recall_at_k", "mrr", "ndcg_at_k", "context_precision_at_k")
     best_primary_gain = max(deltas[metric] for metric in primary_metrics)
     if best_primary_gain < min_primary_gain:
-        failures.append(
-            f"best primary retrieval gain {best_primary_gain:.4f} < {min_primary_gain:.4f}"
-        )
+        failures.append(f"best primary retrieval gain {best_primary_gain:.4f} < {min_primary_gain:.4f}")
     return {
         "passed": not failures,
         "failures": failures,
@@ -183,10 +186,16 @@ def legacy_candidates(documents: dict[str, bytes], token_count: Callable[[str], 
     candidates: list[CandidateChunk] = []
     for filename, data in documents.items():
         text = data.decode("utf-8-sig")
-        candidates.extend(
-            CandidateChunk(filename, content, token_count(content), False)
-            for content in split_text(text, chunk_size=900, overlap=140)
-        )
+        for chunk_index, content in enumerate(split_text(text, chunk_size=900, overlap=140)):
+            candidates.append(
+                CandidateChunk(
+                    filename,
+                    content,
+                    token_count(content),
+                    False,
+                    f"{filename}:{chunk_index}",
+                )
+            )
     return candidates
 
 
@@ -198,7 +207,13 @@ def structural_candidates(
     for filename, data in documents.items():
         parsed = parse_document_elements(filename, data)
         candidates.extend(
-            CandidateChunk(filename, chunk.content, chunk.token_count, bool(chunk.heading_path))
+            CandidateChunk(
+                filename,
+                chunk.content,
+                chunk.token_count,
+                bool(chunk.heading_path),
+                chunk.parent_stable_id,
+            )
             for chunk in chunker.chunk(parsed)
         )
     return candidates
@@ -223,8 +238,14 @@ def chonkie_sentence_candidates(
     for filename, data in documents.items():
         text = data.decode("utf-8-sig")
         candidates.extend(
-            CandidateChunk(filename, chunk.text, chunk.token_count, False)
-            for chunk in chunker.chunk(text)
+            CandidateChunk(
+                filename,
+                chunk.text,
+                chunk.token_count,
+                False,
+                f"{filename}:{chunk_index}",
+            )
+            for chunk_index, chunk in enumerate(chunker.chunk(text))
         )
     return candidates
 
@@ -262,12 +283,21 @@ def evaluate_candidates(
         }
         scores = sparse_scores(case.query, contents)
         ranking = sorted(range(len(candidates)), key=lambda index: scores[index], reverse=True)
-        retrieved = [
-            index
-            for index in ranking
-            if scores[index] >= min_score
-            and query_coverage(case.query, candidates[index].content) >= min_query_coverage
-        ][:top_k]
+        retrieved: list[int] = []
+        seen_parents: set[tuple[str, str]] = set()
+        for index in ranking:
+            candidate = candidates[index]
+            if scores[index] < min_score:
+                continue
+            if query_coverage(case.query, candidate.content) < min_query_coverage:
+                continue
+            parent_key = (candidate.document, candidate.parent_id)
+            if parent_key in seen_parents:
+                continue
+            seen_parents.add(parent_key)
+            retrieved.append(index)
+            if len(retrieved) >= top_k:
+                break
         latencies_ms.append((perf_counter() - started) * 1000)
         if not case.answerable:
             refusals.append(1.0 if not retrieved else 0.0)
@@ -281,21 +311,18 @@ def evaluate_candidates(
             )
             continue
         containment.append(1.0 if relevant else 0.0)
-        relevant_retrieved = [rank for rank, index in enumerate(retrieved, start=1) if index in relevant]
-        recalls.append(1.0 if relevant_retrieved else 0.0)
-        context_precisions.append(len(relevant_retrieved) / max(len(retrieved), 1))
+        relevant_rank = first_relevant_rank(index in relevant for index in retrieved)
+        recalls.append(1.0 if relevant_rank is not None else 0.0)
+        context_precisions.append((1.0 if relevant_rank is not None else 0.0) / max(len(retrieved), 1))
         citation_targets.append(1.0 if retrieved and retrieved[0] in relevant else 0.0)
-        reciprocal_ranks.append(1 / relevant_retrieved[0] if relevant_retrieved else 0.0)
-        dcg = sum(1 / math.log2(rank + 1) for rank in relevant_retrieved)
-        ideal_count = min(len(relevant), top_k)
-        ideal_dcg = sum(1 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
-        ndcgs.append(dcg / ideal_dcg if ideal_dcg else 0.0)
+        reciprocal_ranks.append(1 / relevant_rank if relevant_rank is not None else 0.0)
+        ndcgs.append(1 / math.log2(relevant_rank + 1) if relevant_rank is not None else 0.0)
         case_results.append(
             {
                 "name": case.name,
                 "answerable": True,
-                "hit": bool(relevant_retrieved),
-                "first_relevant_rank": relevant_retrieved[0] if relevant_retrieved else None,
+                "hit": relevant_rank is not None,
+                "first_relevant_rank": relevant_rank,
                 "retrieved": [candidates[index].document for index in retrieved],
                 "coverages": [round(query_coverage(case.query, candidates[index].content), 4) for index in retrieved],
             }

@@ -19,6 +19,7 @@ from app.rag.evaluation import (  # noqa: E402
     answer_citations,
     compare_end_to_end_reports,
     deterministic_citation_score,
+    first_relevant_rank,
     load_cases,
     load_documents,
     parse_answer_judge_response,
@@ -173,13 +174,19 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
                         query for query in case_result["queries"] if isinstance(query, str) and query
                     ]
         except (OSError, json.JSONDecodeError, TypeError) as exc:
-            return {"status": "configuration_error", "errors": [f"invalid baseline report: {exc}"]}, 2
+            return {
+                "status": "configuration_error",
+                "errors": [f"invalid baseline report: {exc}"],
+            }, 2
 
     if args.require_reranker:
         try:
             await active_reranker.healthcheck()
         except Exception as exc:
-            return {"status": "configuration_error", "errors": [f"reranker healthcheck failed: {exc}"]}, 2
+            return {
+                "status": "configuration_error",
+                "errors": [f"reranker healthcheck failed: {exc}"],
+            }, 2
 
     cases = load_cases(ROOT / "backend" / "tests" / "rag_eval_cases.json")
     documents = load_documents(cases, ROOT / "backend" / "tests" / "rag_eval_documents")
@@ -206,7 +213,10 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     except LLMGatewayError as exc:
         return {"status": "provider_error", "errors": [str(exc)]}, 2
     if len(candidate_vectors) != len(candidates):
-        return {"status": "provider_error", "errors": ["embedding count does not match child chunks"]}, 2
+        return {
+            "status": "provider_error",
+            "errors": ["embedding count does not match child chunks"],
+        }, 2
     embedding_tokens = semantic_boundary_tokens + sum(estimate_tokens(content) for content in contents)
     parent_vectors: dict[str, list[float]] = {}
     if settings.rag_multi_vector_enabled:
@@ -216,7 +226,10 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         except LLMGatewayError as exc:
             return {"status": "provider_error", "errors": [str(exc)]}, 2
         if len(generated_parents) != len(parent_contents):
-            return {"status": "provider_error", "errors": ["embedding count does not match parent chunks"]}, 2
+            return {
+                "status": "provider_error",
+                "errors": ["embedding count does not match parent chunks"],
+            }, 2
         parent_vectors = dict(zip(parent_contents, generated_parents))
         embedding_tokens += sum(estimate_tokens(content) for content in parent_contents)
     chat_input_tokens = 0
@@ -233,6 +246,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
     answer_relevance: list[float] = []
     judged_citations: list[float] = []
     refusal_scores: list[float] = []
+    judge_refusal_scores: list[float] = []
     results: list[dict] = []
     judge_errors: list[str] = []
 
@@ -277,30 +291,23 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             settings.rag_dense_override_score,
             settings.rag_rerank_override_score,
         )
-        relevant_count = sum(
-            1
-            for row in candidates
-            if case.answerable
-            and row["filename"] == case.document
-            and case.evidence is not None
-            and (case.evidence in row["content"] or case.evidence in row["parent_content"])
-        )
-        relevant_ranks = [
-            rank
-            for rank, row in enumerate(selected, start=1)
-            if case.answerable
-            and row["filename"] == case.document
-            and case.evidence is not None
-            and (case.evidence in row["content"] or case.evidence in row["parent_content"])
-        ]
+
+        def matches_evidence(row: dict) -> bool:
+            return bool(
+                case.answerable
+                and row["filename"] == case.document
+                and case.evidence is not None
+                and (case.evidence in row["content"] or case.evidence in row["parent_content"])
+            )
+
+        relevant_rank = first_relevant_rank(matches_evidence(row) for row in selected)
         if case.answerable:
-            recalls.append(1.0 if relevant_ranks else 0.0)
-            reciprocal_ranks.append(1 / relevant_ranks[0] if relevant_ranks else 0.0)
-            dcg = sum(1 / math.log2(rank + 1) for rank in relevant_ranks)
-            ideal_count = min(relevant_count, args.top_k)
-            ideal_dcg = sum(1 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
-            ndcgs.append(dcg / ideal_dcg if ideal_dcg else 0.0)
-            context_precisions.append(len(relevant_ranks) / max(len(selected), 1))
+            recalls.append(1.0 if relevant_rank is not None else 0.0)
+            reciprocal_ranks.append(1 / relevant_rank if relevant_rank is not None else 0.0)
+            ndcgs.append(1 / math.log2(relevant_rank + 1) if relevant_rank is not None else 0.0)
+            context_precisions.append((1.0 if relevant_rank is not None else 0.0) / max(len(selected), 1))
+        else:
+            refusal_scores.append(1.0 if not selected else 0.0)
 
         if selected:
             context = build_context(selected, settings.rag_context_max_tokens)
@@ -343,7 +350,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             answer_relevance.append(judged.answer_relevance)
             judged_citations.append(judged.citation_correctness)
             if not case.answerable:
-                refusal_scores.append(1.0 if judged.refusal_correct else 0.0)
+                judge_refusal_scores.append(1.0 if judged.refusal_correct else 0.0)
             judge_payload = {
                 "faithfulness": judged.faithfulness,
                 "answer_relevance": judged.answer_relevance,
@@ -355,12 +362,35 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             judge_errors.append(f"{case.name}: {exc}")
             judge_payload = {"error": str(exc)}
         latencies.append((perf_counter() - case_started) * 1000)
+        selected_ids = {row["vector_id"] for row in selected}
+        candidate_diagnostics = []
+        for rank, row in enumerate(ranked[: max(args.top_k * 2, 10)], start=1):
+            candidate_diagnostics.append(
+                {
+                    "rank": rank,
+                    "citation": row["citation"],
+                    "selected": row["vector_id"] in selected_ids,
+                    "relevant": matches_evidence(row),
+                    "score": round(float(row["score"]), 4),
+                    "sparse_score": round(float(row["sparse_score"]), 4),
+                    "dense_score": round(float(row["dense_score"]), 4),
+                    "rerank_score": round(float(row.get("rerank_score", 0.0)), 4),
+                    "query_coverage": round(float(row.get("query_coverage", 0.0)), 4),
+                    "passes_min_score": row["score"] >= args.min_score,
+                    "passes_coverage": row.get("query_coverage", 0.0) >= settings.rag_min_query_coverage,
+                    "dense_override": row["dense_score"] >= settings.rag_dense_override_score,
+                    "rerank_override": row.get("rerank_score", 0.0) >= settings.rag_rerank_override_score,
+                    "parent_stable_id": row["parent_stable_id"],
+                }
+            )
         results.append(
             {
                 "name": case.name,
                 "answerable": case.answerable,
                 "queries": queries,
                 "retrieved": [row["citation"] for row in selected],
+                "first_relevant_rank": relevant_rank,
+                "top_candidates": candidate_diagnostics,
                 "answer": answer,
                 "deterministic_citation_score": deterministic_score,
                 "judge": judge_payload,
@@ -379,6 +409,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         "answer_relevance": round(mean(answer_relevance), 4) if answer_relevance else 0.0,
         "judge_citation_correctness": round(mean(judged_citations), 4) if judged_citations else 0.0,
         "refusal_accuracy": round(mean(refusal_scores), 4) if refusal_scores else 0.0,
+        "judge_refusal_accuracy": round(mean(judge_refusal_scores), 4) if judge_refusal_scores else 0.0,
         "p95_end_to_end_ms": round(percentile(latencies, 0.95), 3),
     }
     embedding_cost = calculate_cost_micros(
@@ -423,9 +454,7 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
         if metrics[metric] < minimum:
             gate_failures.append(f"{metric} {metrics[metric]:.4f} < {minimum:.4f}")
     if metrics["p95_end_to_end_ms"] > args.max_p95_end_to_end_ms:
-        gate_failures.append(
-            f"p95_end_to_end_ms {metrics['p95_end_to_end_ms']:.3f} > {args.max_p95_end_to_end_ms:.3f}"
-        )
+        gate_failures.append(f"p95_end_to_end_ms {metrics['p95_end_to_end_ms']:.3f} > {args.max_p95_end_to_end_ms:.3f}")
     return (
         {
             "status": "completed",
@@ -443,7 +472,11 @@ async def evaluate(args: argparse.Namespace) -> tuple[dict, int]:
             "duration_ms": round((perf_counter() - started) * 1000, 3),
             "metrics": metrics,
             "cost": costs,
-            "gates": {"passed": not gate_failures, "failures": gate_failures, "thresholds": thresholds},
+            "gates": {
+                "passed": not gate_failures,
+                "failures": gate_failures,
+                "thresholds": thresholds,
+            },
             "evaluation_errors": judge_errors,
             "cases": results,
         },
@@ -458,7 +491,11 @@ def main() -> int:
     parser.add_argument("--judge-model")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--min-score", type=float, default=0.2)
-    parser.add_argument("--chunk-strategy", choices=("legacy", "structural", "semantic"), default="structural")
+    parser.add_argument(
+        "--chunk-strategy",
+        choices=("legacy", "structural", "semantic"),
+        default="structural",
+    )
     parser.add_argument("--baseline-report", type=Path)
     parser.add_argument("--min-ab-primary-gain", type=float, default=0.05)
     parser.add_argument("--ab-regression-tolerance", type=float, default=0.01)

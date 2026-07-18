@@ -70,6 +70,7 @@ jobs:
         with:
           name: rag-open-model-${{ github.run_id }}
           path: .run/rag-open-model*.json
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
 
@@ -141,5 +142,6 @@ jobs:
         with:
           name: rag-end-to-end-${{ github.run_id }}
           path: .run/rag-end-to-end*.json
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30

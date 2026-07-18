@@ -7,6 +7,7 @@ from app.rag.evaluation import (
     compare_end_to_end_reports,
     deterministic_citation_score,
     evaluate_candidates,
+    first_relevant_rank,
     legacy_candidates,
     load_cases,
     load_documents,
@@ -41,6 +42,8 @@ def test_repository_rag_chunking_evaluation_is_reproducible() -> None:
     assert structural.recall_at_k >= legacy.recall_at_k
     assert structural.mrr >= legacy.mrr
     assert structural.ndcg_at_k >= legacy.ndcg_at_k
+    assert legacy.context_precision_at_k == 0.1639
+    assert structural.context_precision_at_k == 0.2278
     assert structural.context_precision_at_k > legacy.context_precision_at_k
     assert structural.citation_target_accuracy >= legacy.citation_target_accuracy
     assert 0 <= structural.refusal_accuracy <= 1
@@ -55,16 +58,22 @@ def test_answer_judge_parser_and_citation_gate_are_strict() -> None:
 
     assert judged.faithfulness == 0.95
     assert judged.refusal_correct is True
-    assert deterministic_citation_score(
-        "Use PITR [runbook.md#chunk-2]",
-        {"runbook.md#chunk-2"},
-        answerable=True,
-    ) == 1.0
-    assert deterministic_citation_score(
-        "Use PITR [unknown.md#chunk-9]",
-        {"runbook.md#chunk-2"},
-        answerable=True,
-    ) == 0.0
+    assert (
+        deterministic_citation_score(
+            "Use PITR [runbook.md#chunk-2]",
+            {"runbook.md#chunk-2"},
+            answerable=True,
+        )
+        == 1.0
+    )
+    assert (
+        deterministic_citation_score(
+            "Use PITR [unknown.md#chunk-9]",
+            {"runbook.md#chunk-2"},
+            answerable=True,
+        )
+        == 0.0
+    )
     assert deterministic_citation_score("上下文不足。", set(), answerable=False) == 1.0
 
     with pytest.raises(ValueError, match="valid JSON"):
@@ -74,6 +83,11 @@ def test_answer_judge_parser_and_citation_gate_are_strict() -> None:
             '{"faithfulness":1.1,"answer_relevance":1,"citation_correctness":1,'
             '"refusal_correct":false,"reason":"invalid"}'
         )
+
+
+def test_repeated_chunks_count_as_one_evidence_target() -> None:
+    assert first_relevant_rank([False, True, True]) == 2
+    assert first_relevant_rank([False, False]) is None
 
 
 def test_end_to_end_ab_gate_requires_significant_gain_without_regression() -> None:
