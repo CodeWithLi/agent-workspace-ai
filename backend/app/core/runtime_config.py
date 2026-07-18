@@ -126,6 +126,23 @@ CONFIG_DEFINITIONS = {
         ConfigDefinition("agent_concurrency_lease_seconds", "Agent Lease Seconds", "runtime", int, minimum=30, maximum=900),
         ConfigDefinition("workflow_lease_seconds", "Workflow Lease Seconds", "runtime", int, minimum=60, maximum=7200),
         ConfigDefinition("workflow_max_attempts", "Workflow Max Attempts", "runtime", int, minimum=1, maximum=10),
+        ConfigDefinition("workflow_branch_max_attempts", "Branch Max Attempts", "runtime", int, minimum=1, maximum=5),
+        ConfigDefinition(
+            "workflow_branch_retry_base_seconds",
+            "Branch Retry Base Seconds",
+            "runtime",
+            float,
+            minimum=0.1,
+            maximum=60,
+        ),
+        ConfigDefinition(
+            "workflow_branch_retry_max_seconds",
+            "Branch Retry Maximum Seconds",
+            "runtime",
+            float,
+            minimum=0.1,
+            maximum=300,
+        ),
         ConfigDefinition(
             "workflow_compensation_max_attempts",
             "Workflow Compensation Max Attempts",
@@ -304,6 +321,16 @@ def update_runtime_settings(db: Session, values: dict[str, Any], user_id: int) -
     parser_backend = normalized.get("rag_parser_backend", settings.rag_parser_backend)
     if parser_backend not in {"native", "auto", "docling"}:
         raise ValueError("RAG parser backend must be native, auto or docling")
+    branch_retry_base = normalized.get(
+        "workflow_branch_retry_base_seconds",
+        settings.workflow_branch_retry_base_seconds,
+    )
+    branch_retry_max = normalized.get(
+        "workflow_branch_retry_max_seconds",
+        settings.workflow_branch_retry_max_seconds,
+    )
+    if branch_retry_max < branch_retry_base:
+        raise ValueError("Workflow branch retry maximum must not be smaller than its base delay")
 
     changed: list[str] = []
     for key, value in normalized.items():

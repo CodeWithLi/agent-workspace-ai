@@ -244,7 +244,7 @@ def _pair_event_spans(
     spans: list[_SpanDraft] = []
     node_attempts: dict[str, int] = defaultdict(int)
     open_nodes: dict[tuple[str, int], deque[tuple[WorkflowEvent, int]]] = defaultdict(deque)
-    open_branches: dict[tuple[str, int, int], deque[WorkflowEvent]] = defaultdict(deque)
+    open_branches: dict[tuple[str, int, int, int], deque[WorkflowEvent]] = defaultdict(deque)
     open_pause: WorkflowEvent | None = None
 
     if workflow.created_at:
@@ -301,12 +301,14 @@ def _pair_event_spans(
             role = str(payload.get("role") or "specialist")
             revision_round = int(payload.get("revision_round") or 0)
             workflow_attempt = int(payload.get("workflow_attempt") or 0)
-            open_branches[(role, revision_round, workflow_attempt)].append(event)
+            branch_attempt = int(payload.get("branch_attempt") or 0)
+            open_branches[(role, revision_round, workflow_attempt, branch_attempt)].append(event)
         elif event.event_type in {"BRANCH_COMPLETED", "BRANCH_FAILED"}:
             role = str(payload.get("role") or "specialist")
             revision_round = int(payload.get("revision_round") or 0)
             workflow_attempt = int(payload.get("workflow_attempt") or 0)
-            key = (role, revision_round, workflow_attempt)
+            branch_attempt = int(payload.get("branch_attempt") or 0)
+            key = (role, revision_round, workflow_attempt, branch_attempt)
             if open_branches[key]:
                 started = open_branches[key].popleft()
                 spans.append(
@@ -317,7 +319,7 @@ def _pair_event_spans(
                         label=ROLE_LABELS.get(role, role),
                         agent_role=role,
                         status="FAILED" if event.event_type == "BRANCH_FAILED" else "COMPLETED",
-                        attempt=revision_round + 1,
+                        attempt=branch_attempt or revision_round + 1,
                         started_at=started.created_at,
                         finished_at=event.created_at,
                         duration_ms=_duration_ms(started.created_at, event.created_at),
@@ -370,7 +372,7 @@ def _pair_event_spans(
                     duration_ms=_duration_ms(started.created_at, open_end),
                 )
             )
-    for (role, revision_round, _workflow_attempt), started_events in open_branches.items():
+    for (role, revision_round, _workflow_attempt, branch_attempt), started_events in open_branches.items():
         while started_events:
             started = started_events.popleft()
             spans.append(
@@ -381,7 +383,7 @@ def _pair_event_spans(
                     label=ROLE_LABELS.get(role, role),
                     agent_role=role,
                     status=open_status,
-                    attempt=revision_round + 1,
+                    attempt=branch_attempt or revision_round + 1,
                     started_at=started.created_at,
                     finished_at=workflow.finished_at,
                     duration_ms=_duration_ms(started.created_at, open_end),

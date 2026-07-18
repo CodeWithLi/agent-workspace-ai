@@ -1,5 +1,65 @@
-from app.core.llm import LLMGateway
 import json
+
+import httpx
+import pytest
+
+from app.core.llm import LLMGateway, LLMGatewayError, LLMRetryableError
+
+
+def http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://llm.example.test/chat/completions")
+    response = httpx.Response(status_code, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("Expected an HTTP status error")
+
+
+@pytest.mark.parametrize("status_code", [408, 409, 429, 500, 503])
+def test_gateway_classifies_transient_provider_statuses_as_retryable(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = LLMGateway()
+    monkeypatch.setattr(gateway.settings, "llm_fallback_enabled", False)
+
+    with pytest.raises(LLMRetryableError):
+        gateway._fallback_or_raise(http_status_error(status_code))
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_gateway_keeps_request_and_configuration_statuses_non_retryable(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = LLMGateway()
+    monkeypatch.setattr(gateway.settings, "llm_fallback_enabled", False)
+
+    with pytest.raises(LLMGatewayError) as failure:
+        gateway._fallback_or_raise(http_status_error(status_code))
+    assert not isinstance(failure.value, LLMRetryableError)
+
+
+def test_gateway_classifies_network_failures_as_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = LLMGateway()
+    monkeypatch.setattr(gateway.settings, "llm_fallback_enabled", False)
+    request = httpx.Request("POST", "https://llm.example.test/chat/completions")
+
+    with pytest.raises(LLMRetryableError):
+        gateway._fallback_or_raise(httpx.ConnectError("connection reset", request=request))
+
+
+@pytest.mark.asyncio
+async def test_gateway_keeps_missing_api_key_non_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = LLMGateway()
+    monkeypatch.setattr(gateway.settings, "llm_api_key", None)
+    monkeypatch.setattr(gateway.settings, "openai_api_key", None)
+    monkeypatch.setattr(gateway.settings, "llm_fallback_enabled", False)
+
+    with pytest.raises(LLMGatewayError) as failure:
+        await gateway.chat("system", "user")
+    assert not isinstance(failure.value, LLMRetryableError)
 
 
 def test_development_fallback_does_not_expose_system_or_tool_context() -> None:

@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     workflow_poll_seconds: int = Field(default=1, ge=1, le=60)
     workflow_lease_seconds: int = Field(default=900, ge=60, le=7200)
     workflow_max_attempts: int = Field(default=2, ge=1, le=10)
+    workflow_branch_max_attempts: int = Field(default=2, ge=1, le=5)
+    workflow_branch_retry_base_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
+    workflow_branch_retry_max_seconds: float = Field(default=15.0, ge=0.1, le=300.0)
     workflow_compensation_max_attempts: int = Field(default=3, ge=1, le=10)
     prototype_generation_worker_enabled: bool = True
     prototype_generation_poll_seconds: int = Field(default=1, ge=1, le=60)
@@ -175,6 +178,8 @@ class Settings(BaseSettings):
             raise ValueError("Prototype generation retry maximum must not be smaller than its base delay")
         if self.agent_optimization_retry_max_seconds < self.agent_optimization_retry_base_seconds:
             raise ValueError("Agent optimization retry maximum must not be smaller than its base delay")
+        if self.workflow_branch_retry_max_seconds < self.workflow_branch_retry_base_seconds:
+            raise ValueError("Workflow branch retry maximum must not be smaller than its base delay")
         if self.environment == "production":
             if self.secret_key in {"change-me-in-production", "please-change-this-secret"} or len(self.secret_key) < 32:
                 raise ValueError("Production SECRET_KEY must be unique and at least 32 characters")

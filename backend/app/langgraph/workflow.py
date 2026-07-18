@@ -9,9 +9,10 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.llm import get_llm
+from app.core.config import get_settings
+from app.core.llm import LLMRetryableError, get_llm
 from app.core.llm_usage import bind_llm_usage
-from app.agent.concurrency import acquire_agent_slot
+from app.agent.concurrency import AgentBusyError, acquire_agent_slot
 from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
@@ -32,6 +33,7 @@ from app.tools.project_tools import architecture_generate, requirement_create, t
 
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 class WorkflowCancelled(RuntimeError):
@@ -66,6 +68,7 @@ class ProjectState(TypedDict, total=False):
     revision_feedback: str
     manual_revision_count: int
     interventions: list[dict[str, Any]]
+    branch_retry_policy: dict[str, int | float]
 
 
 class WorkspaceGraphState(ProjectState, total=False):
@@ -121,6 +124,11 @@ def initial_state(
         "revision_feedback": "",
         "manual_revision_count": 0,
         "interventions": [],
+        "branch_retry_policy": {
+            "max_attempts": settings.workflow_branch_max_attempts,
+            "base_seconds": settings.workflow_branch_retry_base_seconds,
+            "max_seconds": settings.workflow_branch_retry_max_seconds,
+        },
     }
 
 
@@ -496,6 +504,22 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         working_handoffs = dict(previous_handoffs)
         messages = list(state.get("messages", []))
         workflow_attempt = int(workflow.attempt_count)
+        branch_retry_policy = state.get("branch_retry_policy") or {}
+        branch_max_attempts = int(
+            branch_retry_policy.get("max_attempts", settings.workflow_branch_max_attempts)
+        )
+        branch_retry_base_seconds = float(
+            branch_retry_policy.get(
+                "base_seconds",
+                settings.workflow_branch_retry_base_seconds,
+            )
+        )
+        branch_retry_max_seconds = float(
+            branch_retry_policy.get(
+                "max_seconds",
+                settings.workflow_branch_retry_max_seconds,
+            )
+        )
 
         async def run_assignment(assignment) -> AgentHandoff:
             previous = previous_handoffs.get(assignment.role)
@@ -587,116 +611,177 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "workflow_attempt": workflow_attempt,
                 },
             )
-            for assignment in assignments:
-                record_workflow_event(
-                    db,
-                    workflow,
-                    "BRANCH_STARTED",
-                    f"Started specialist branch {assignment.role}",
-                    node="specialists",
-                    payload={
-                        "role": assignment.role,
-                        "deliverable": assignment.deliverable,
-                        "depends_on": assignment.depends_on,
-                        "dependency_count": len(assignment.depends_on),
-                        "wave": wave_number,
-                        "revision_round": revision_round,
-                        "workflow_attempt": workflow_attempt,
-                    },
+            pending_assignments = assignments
+            branch_attempt = 1
+            while pending_assignments:
+                for assignment in pending_assignments:
+                    record_workflow_event(
+                        db,
+                        workflow,
+                        "BRANCH_STARTED",
+                        f"Started specialist branch {assignment.role}",
+                        node="specialists",
+                        payload={
+                            "role": assignment.role,
+                            "deliverable": assignment.deliverable,
+                            "depends_on": assignment.depends_on,
+                            "dependency_count": len(assignment.depends_on),
+                            "wave": wave_number,
+                            "revision_round": revision_round,
+                            "workflow_attempt": workflow_attempt,
+                            "branch_attempt": branch_attempt,
+                        },
+                    )
+                db.commit()
+                results = await asyncio.gather(
+                    *(run_assignment(assignment) for assignment in pending_assignments),
+                    return_exceptions=True,
                 )
-            db.commit()
-            results = await asyncio.gather(
-                *(run_assignment(assignment) for assignment in assignments),
-                return_exceptions=True,
-            )
-            cancellation = next(
-                (result for result in results if isinstance(result, asyncio.CancelledError)),
-                None,
-            )
-            if cancellation:
-                raise cancellation
-            wave_handoffs = [result for result in results if isinstance(result, AgentHandoff)]
-            failures = [
-                (assignment, result)
-                for assignment, result in zip(assignments, results, strict=True)
-                if isinstance(result, Exception)
-            ]
-            working_handoffs.update({handoff.role: handoff for handoff in wave_handoffs})
-            for handoff in wave_handoffs:
-                assignment = next(item for item in assignments if item.role == handoff.role)
-                messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
-                record_workflow_event(
-                    db,
-                    workflow,
-                    "BRANCH_COMPLETED",
-                    f"Completed specialist branch {handoff.role}",
-                    node="specialists",
-                    payload={
-                        "role": handoff.role,
-                        "deliverable": handoff.deliverable,
-                        "depends_on": assignment.depends_on,
-                        "dependency_count": len(assignment.depends_on),
-                        "wave": wave_number,
-                        "revision_round": handoff.revision_round,
-                        "workflow_attempt": workflow_attempt,
-                        "output_chars": len(handoff.content),
-                    },
+                cancellation = next(
+                    (result for result in results if isinstance(result, asyncio.CancelledError)),
+                    None,
                 )
-            for assignment, failure in failures:
-                record_workflow_event(
-                    db,
-                    workflow,
-                    "BRANCH_FAILED",
-                    f"Failed specialist branch {assignment.role}",
-                    node="specialists",
-                    payload={
-                        "role": assignment.role,
-                        "depends_on": assignment.depends_on,
-                        "dependency_count": len(assignment.depends_on),
-                        "wave": wave_number,
-                        "revision_round": revision_round,
-                        "workflow_attempt": workflow_attempt,
-                        "error": str(failure)[:2000],
-                    },
-                )
-            record_workflow_event(
-                db,
-                workflow,
-                "WAVE_CHECKPOINTED" if failures else "WAVE_COMPLETED",
-                (
-                    f"Checkpointed partial specialist execution wave {wave_number}"
+                if cancellation:
+                    raise cancellation
+                wave_handoffs = [result for result in results if isinstance(result, AgentHandoff)]
+                failures = [
+                    (assignment, result)
+                    for assignment, result in zip(pending_assignments, results, strict=True)
+                    if isinstance(result, Exception)
+                ]
+                failure_retryability = {
+                    assignment.role: isinstance(failure, (LLMRetryableError, AgentBusyError, TimeoutError))
+                    for assignment, failure in failures
+                }
+                retrying_failures = (
+                    failures
                     if failures
-                    else f"Completed specialist execution wave {wave_number}"
-                ),
-                node="specialists",
-                payload={
-                    "wave": wave_number,
-                    "roles": [handoff.role for handoff in wave_handoffs],
-                    "branch_count": len(assignments),
-                    "completed_count": len(wave_handoffs),
-                    "failed_count": len(failures),
-                    "revision_round": revision_round,
-                    "workflow_attempt": workflow_attempt,
-                },
-            )
-            checkpoint_node(
-                db,
-                workflow,
-                "specialists",
-                state,
-                {
+                    and branch_attempt < branch_max_attempts
+                    and all(failure_retryability.values())
+                    else []
+                )
+                retrying_roles = {assignment.role for assignment, _failure in retrying_failures}
+                retry_delay = (
+                    min(
+                        branch_retry_max_seconds,
+                        branch_retry_base_seconds * (2 ** (branch_attempt - 1)),
+                    )
+                    if retrying_failures
+                    else 0.0
+                )
+                working_handoffs.update({handoff.role: handoff for handoff in wave_handoffs})
+                for handoff in wave_handoffs:
+                    assignment = next(item for item in pending_assignments if item.role == handoff.role)
+                    messages.append({"role": f"specialist_{handoff.role}", "content": handoff.content})
+                    record_workflow_event(
+                        db,
+                        workflow,
+                        "BRANCH_COMPLETED",
+                        f"Completed specialist branch {handoff.role}",
+                        node="specialists",
+                        payload={
+                            "role": handoff.role,
+                            "deliverable": handoff.deliverable,
+                            "depends_on": assignment.depends_on,
+                            "dependency_count": len(assignment.depends_on),
+                            "wave": wave_number,
+                            "revision_round": handoff.revision_round,
+                            "workflow_attempt": workflow_attempt,
+                            "branch_attempt": branch_attempt,
+                            "output_chars": len(handoff.content),
+                        },
+                    )
+                for assignment, failure in failures:
+                    record_workflow_event(
+                        db,
+                        workflow,
+                        "BRANCH_FAILED",
+                        f"Failed specialist branch {assignment.role}",
+                        node="specialists",
+                        payload={
+                            "role": assignment.role,
+                            "depends_on": assignment.depends_on,
+                            "dependency_count": len(assignment.depends_on),
+                            "wave": wave_number,
+                            "revision_round": revision_round,
+                            "workflow_attempt": workflow_attempt,
+                            "branch_attempt": branch_attempt,
+                            "retryable": failure_retryability[assignment.role],
+                            "will_retry": assignment.role in retrying_roles,
+                            "error": str(failure)[:2000],
+                        },
+                    )
+                for assignment, _failure in retrying_failures:
+                    record_workflow_event(
+                        db,
+                        workflow,
+                        "BRANCH_RETRY_SCHEDULED",
+                        f"Scheduled specialist branch retry {assignment.role}",
+                        node="specialists",
+                        payload={
+                            "role": assignment.role,
+                            "wave": wave_number,
+                            "revision_round": revision_round,
+                            "workflow_attempt": workflow_attempt,
+                            "branch_attempt": branch_attempt,
+                            "next_branch_attempt": branch_attempt + 1,
+                            "retry_delay_seconds": retry_delay,
+                        },
+                    )
+                record_workflow_event(
+                    db,
+                    workflow,
+                    "WAVE_CHECKPOINTED" if failures else "WAVE_COMPLETED",
+                    (
+                        f"Checkpointed specialist execution wave {wave_number} attempt {branch_attempt}"
+                        if failures
+                        else f"Completed specialist execution wave {wave_number}"
+                    ),
+                    node="specialists",
+                    payload={
+                        "wave": wave_number,
+                        "roles": [handoff.role for handoff in wave_handoffs],
+                        "branch_count": len(pending_assignments),
+                        "completed_count": len(wave_handoffs),
+                        "failed_count": len(failures),
+                        "retrying_count": len(retrying_failures),
+                        "revision_round": revision_round,
+                        "workflow_attempt": workflow_attempt,
+                        "branch_attempt": branch_attempt,
+                    },
+                )
+                checkpoint_output = {
                     "specialist_handoffs": [
                         working_handoffs[assignment.role].model_dump(mode="json")
                         for assignment in plan.assignments
                         if assignment.role in working_handoffs
                     ],
                     "messages": messages,
-                },
-                expected_lease_token,
-            )
-            if failures:
-                failure = failures[0][1]
-                raise RuntimeError(str(failure)) from failure
+                }
+                checkpoint_node(
+                    db,
+                    workflow,
+                    "specialists",
+                    state,
+                    checkpoint_output,
+                    expected_lease_token,
+                )
+                if failures and not retrying_failures:
+                    failure = failures[0][1]
+                    raise RuntimeError(str(failure)) from failure
+                if not retrying_failures:
+                    break
+                await asyncio.sleep(retry_delay)
+                checkpoint_node(
+                    db,
+                    workflow,
+                    "specialists",
+                    state,
+                    checkpoint_output,
+                    expected_lease_token,
+                )
+                pending_assignments = [assignment for assignment, _failure in retrying_failures]
+                branch_attempt += 1
 
         merged_handoffs = [
             working_handoffs[assignment.role]

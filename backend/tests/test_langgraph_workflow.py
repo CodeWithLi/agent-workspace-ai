@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.llm import get_llm
+from app.core.llm import LLMRetryableError, get_llm
 from app.agent.service import ensure_default_agents
 from app.langgraph.workflow import (
     WorkflowPauseRequested,
@@ -573,6 +573,7 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
     assert event_types.count("WAVE_RESTORED") == 1
     assert event_types.count("WAVE_CHECKPOINTED") == 1
     assert event_types.count("BRANCH_FAILED") == 1
+    assert event_types.count("BRANCH_RETRY_SCHEDULED") == 0
     node_events = list(
         db.scalars(
             select(WorkflowEvent)
@@ -591,6 +592,116 @@ async def test_specialist_wave_checkpoint_survives_retry_without_repeating_compl
         "NODE_COMPLETED",
     ]
     assert [json.loads(event.payload_json)["workflow_attempt"] for event in node_events] == [1, 1, 2, 2]
+
+
+@pytest.mark.asyncio
+async def test_specialist_retries_only_transient_failed_branch_inside_same_workflow_attempt(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="branch-retry@example.com", name="Branch Retry", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Branch Retry", description="Retry one transient branch", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    state = initial_state(project, "验证专业分支局部重试")
+    state.update(
+        {
+            "requirements": {"summary": "分支级瞬时错误恢复"},
+            "architecture": {"style": "dependency-dag"},
+            "execution_plan": {
+                "objective": "局部恢复瞬时失败的 Agent",
+                "rationale": "成功分支不重复，失败分支在同一 worker 尝试内有界重试",
+                "assignments": [
+                    {
+                        "role": "operations_analyst",
+                        "objective": "定义发布和回滚策略",
+                        "deliverable": "发布运行手册",
+                        "depends_on": [],
+                    },
+                    {
+                        "role": "knowledge_admin",
+                        "objective": "整理证据和权限边界",
+                        "deliverable": "知识证据清单",
+                        "depends_on": [],
+                    },
+                ],
+                "success_criteria": ["成功 Agent 只执行一次", "瞬时失败仅重试对应 Agent"],
+            },
+            "plan_version": 1,
+            "plan_approved": True,
+        }
+    )
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.queued,
+        current_node="specialists",
+        state_json=json.dumps(state, ensure_ascii=False),
+        pause_before_report=True,
+        max_attempts=2,
+    )
+    db.add(workflow)
+    db.commit()
+    specialist_calls: dict[str, int] = {}
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "专业交接 Agent" in system_prompt:
+            role = json.loads(user_prompt)["assignment"]["role"]
+            specialist_calls[role] = specialist_calls.get(role, 0) + 1
+            if role == "knowledge_admin" and specialist_calls[role] == 1:
+                raise LLMRetryableError("transient provider failure")
+            return (
+                f"{role} 已给出明确范围、关键决策、直接依赖、失败信号、监控指标、告警阈值、"
+                "边界场景、容量假设、灰度策略、回滚条件、证据来源、权限约束、可复现验收步骤、"
+                "后续负责人、完成时限和升级处理路径。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 97,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "局部重试后的交接通过门禁。",
+                },
+                ensure_ascii=False,
+            )
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+    monkeypatch.setattr("app.langgraph.workflow.settings.workflow_branch_max_attempts", 1)
+
+    completed = await process_workflow(db, workflow.id)
+
+    assert completed.status == WorkflowStatus.paused
+    assert completed.current_node == "report"
+    assert completed.attempt_count == 1
+    assert specialist_calls == {"operations_analyst": 1, "knowledge_admin": 2}
+    events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(WorkflowEvent.workflow_id == workflow.id)
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    event_types = [event.event_type for event in events]
+    assert event_types.count("BRANCH_RETRY_SCHEDULED") == 1
+    assert event_types.count("RETRY_SCHEDULED") == 0
+    assert event_types.count("NODE_FAILED") == 0
+    knowledge_starts = [
+        json.loads(event.payload_json)
+        for event in events
+        if event.event_type == "BRANCH_STARTED"
+        and json.loads(event.payload_json).get("role") == "knowledge_admin"
+    ]
+    assert [payload["branch_attempt"] for payload in knowledge_starts] == [1, 2]
+    retry_event = next(event for event in events if event.event_type == "BRANCH_RETRY_SCHEDULED")
+    retry_payload = json.loads(retry_event.payload_json)
+    assert retry_payload["branch_attempt"] == 1
+    assert retry_payload["next_branch_attempt"] == 2
+    assert retry_payload["retry_delay_seconds"] == 1.0
 
 
 @pytest.mark.asyncio

@@ -823,6 +823,82 @@ def test_trace_detail_closes_failed_branch_attempts_independently(db: Session) -
     assert "secret provider failure" not in detail.model_dump_json()
 
 
+def test_trace_detail_pairs_local_branch_retry_attempts_independently(db: Session) -> None:
+    data = _seed_trace_data(db)
+    workflow = data["completed"]
+    base = workflow.started_at + timedelta(minutes=3)
+    db.add_all(
+        [
+            _event(
+                workflow,
+                "BRANCH_STARTED",
+                base,
+                node="specialists",
+                payload={
+                    "role": "knowledge_admin",
+                    "revision_round": 0,
+                    "workflow_attempt": 1,
+                    "branch_attempt": 1,
+                },
+            ),
+            _event(
+                workflow,
+                "BRANCH_FAILED",
+                base + timedelta(seconds=5),
+                node="specialists",
+                payload={
+                    "role": "knowledge_admin",
+                    "revision_round": 0,
+                    "workflow_attempt": 1,
+                    "branch_attempt": 1,
+                    "retryable": True,
+                    "will_retry": True,
+                    "error": "secret transient failure",
+                },
+            ),
+            _event(
+                workflow,
+                "BRANCH_STARTED",
+                base + timedelta(seconds=10),
+                node="specialists",
+                payload={
+                    "role": "knowledge_admin",
+                    "revision_round": 0,
+                    "workflow_attempt": 1,
+                    "branch_attempt": 2,
+                },
+            ),
+            _event(
+                workflow,
+                "BRANCH_COMPLETED",
+                base + timedelta(seconds=30),
+                node="specialists",
+                payload={
+                    "role": "knowledge_admin",
+                    "revision_round": 0,
+                    "workflow_attempt": 1,
+                    "branch_attempt": 2,
+                },
+            ),
+        ]
+    )
+    db.commit()
+
+    detail = get_trace_detail(db, data["alice"], workflow.id)
+    spans = [
+        span
+        for span in detail.spans
+        if span.kind == "branch" and span.agent_role == "knowledge_admin"
+    ]
+    assert [(span.status, span.attempt, span.duration_ms) for span in spans] == [
+        ("FAILED", 1, 5_000),
+        ("COMPLETED", 2, 20_000),
+    ]
+    assert spans[0].payload["retryable"] is True
+    assert spans[0].payload["will_retry"] is True
+    assert "secret transient failure" not in detail.model_dump_json()
+
+
 def test_trace_detail_pairs_node_retries_and_legacy_starts_by_workflow_attempt(db: Session) -> None:
     data = _seed_trace_data(db)
     workflow = data["completed"]

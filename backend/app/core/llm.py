@@ -15,6 +15,23 @@ from app.core.llm_usage import estimate_tokens, record_llm_usage
 logger = logging.getLogger(__name__)
 
 
+class LLMGatewayError(RuntimeError):
+    pass
+
+
+class LLMRetryableError(LLMGatewayError):
+    pass
+
+
+def _provider_error_is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code in {408, 409, 429} or status_code >= 500
+    if isinstance(exc, httpx.RequestError):
+        return True
+    return isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError))
+
+
 class LLMGateway:
     """OpenAI-compatible gateway used by every Agent."""
 
@@ -48,6 +65,8 @@ class LLMGateway:
         if self.settings.llm_fallback_enabled:
             logger.warning("LLM request failed; development fallback is enabled: %s", exc)
             return "fallback"
+        if _provider_error_is_retryable(exc):
+            raise LLMRetryableError("LLM provider request failed transiently") from exc
         raise LLMGatewayError("LLM provider request failed") from exc
 
     async def chat(
@@ -337,10 +356,6 @@ class LLMGateway:
 
 
 _gateway: LLMGateway | None = None
-
-
-class LLMGatewayError(RuntimeError):
-    pass
 
 
 def get_llm() -> LLMGateway:

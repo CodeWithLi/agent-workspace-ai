@@ -41,6 +41,9 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
                     "rag_top_k": 8,
                     "observability_slo_success_rate": 92.5,
                     "observability_alert_poll_seconds": 45,
+                    "workflow_branch_max_attempts": 3,
+                    "workflow_branch_retry_base_seconds": 2.5,
+                    "workflow_branch_retry_max_seconds": 20.0,
                     "llm_api_key": "runtime-secret-value",
                 }
             ),
@@ -55,6 +58,9 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
         assert items["observability_slo_success_rate"].category == "observability"
         assert items["observability_alert_poll_seconds"].value == 45
         assert items["observability_alert_poll_seconds"].category == "observability"
+        assert items["workflow_branch_max_attempts"].value == 3
+        assert items["workflow_branch_retry_base_seconds"].value == 2.5
+        assert items["workflow_branch_retry_max_seconds"].value == 20.0
         assert items["llm_api_key"].value is None
         assert items["llm_api_key"].configured is True
         assert get_settings().llm_model == "glm-settings-test"
@@ -71,6 +77,9 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
             "observability_slo_success_rate",
             "observability_alert_poll_seconds",
             "rag_top_k",
+            "workflow_branch_max_attempts",
+            "workflow_branch_retry_base_seconds",
+            "workflow_branch_retry_max_seconds",
         }
 
         preserved = update_system_settings(
@@ -92,6 +101,20 @@ def test_runtime_settings_are_validated_masked_encrypted_and_audited(db: Session
         with pytest.raises(HTTPException) as invalid_slo_sample:
             update_system_settings(SettingUpdate(values={"observability_slo_min_runs": 2}), request(), admin, db)
         assert invalid_slo_sample.value.status_code == 400
+
+        with pytest.raises(HTTPException) as invalid_branch_backoff:
+            update_system_settings(
+                SettingUpdate(
+                    values={
+                        "workflow_branch_retry_base_seconds": 30.0,
+                        "workflow_branch_retry_max_seconds": 5.0,
+                    }
+                ),
+                request(),
+                admin,
+                db,
+            )
+        assert invalid_branch_backoff.value.status_code == 400
     finally:
         restore_runtime_defaults()
 
@@ -124,5 +147,6 @@ def test_settings_get_returns_categories_and_sources(db: Session) -> None:
     items = {item.key: item for item in result.items}
     assert items["llm_model"].category == "model"
     assert items["workflow_max_attempts"].category == "runtime"
+    assert items["workflow_branch_max_attempts"].category == "runtime"
     assert items["smtp_password"].secret is True
     assert items["observability_slo_min_runs"].category == "observability"

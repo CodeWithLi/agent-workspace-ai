@@ -695,6 +695,7 @@ function workflowEventLabel(eventType: string) {
     BRANCH_STARTED: '分支已启动',
     BRANCH_COMPLETED: '分支已交接',
     BRANCH_FAILED: '分支执行失败',
+    BRANCH_RETRY_SCHEDULED: '分支准备重试',
     QUALITY_GATE_PASSED: '质量门禁通过',
     QUALITY_GATE_FAILED: '质量门禁未通过',
     REVISION_REQUESTED: '请求自动修订',

@@ -44,17 +44,17 @@
 9. Tester Agent
 10. Report Generator
 
-工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时冻结各角色的 Prompt、模型、并发限制和 Prompt 版本；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
+工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时冻结各角色的 Prompt、模型、并发限制、Prompt 版本和专业分支重试策略；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
 
 规划器只允许选择 `test_engineer`、`operations_analyst`、`knowledge_admin`、`notification_secretary`，每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次，并选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并重新校验已保存快照；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志，防止恢复或客户端绕过门禁。
 
-专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每波结束原子持久化当前执行轮次内的成功 Handoff 和消息；即使同波另一分支失败，成功结果仍会成为耐久检查点，worker 重试按角色和执行轮次恢复并只补跑缺失分支。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
+专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。每个尝试批次结束后原子持久化成功 Handoff、消息和失败事件；如果全部失败都属于 `LLMRetryableError`、Agent 并发饱和或超时，运行只对失败角色执行有界指数退避，退避后再次检查租约、暂停和取消，再开始下一批次。网关只把网络/超时、408/409/429、5xx 和畸形成功响应归为 `LLMRetryableError`；认证、请求配置、业务或依赖错误以及局部次数耗尽会立即升级到现有 worker 级恢复。任何已成功角色都不会重复执行。质量门禁请求修订上游角色时，运行时计算传递下游闭包并一并重跑，防止下游继续使用过期结论；只修订叶子角色时不会扩大执行范围。质量门禁检查角色覆盖、交付内容、成功标准和专业广度，再合并独立评审结果。自动修订仍未通过时，工作流暂停在 `quality_review`，等待人工修订方向。
 
-除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、质量分数和人工修订状态。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、修订轮次、worker 尝试等运行元数据；Handoff、错误、Prompt、质量问题与人工反馈正文只保留在受控持久化边界，不会进入 SSE 或追踪响应。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
+除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`，前端可据此展示计划、波次、恢复、交接、局部重试、质量分数和人工修订状态。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败计数、修订轮次、worker/分支尝试和退避时长等运行元数据；Handoff、错误、Prompt、质量问题与人工反馈正文只保留在受控持久化边界，不会进入 SSE 或追踪响应。人工重试时，父运行写入 `RETRY_CREATED`，新子运行写入 `RETRY_QUEUED/QUEUED`；运行干预写入 `PAUSE_REQUESTED`、`PAUSED` 和 `INTERVENTION_APPLIED`。
 
 ## 运行追踪与成本归属
 
-`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、按节点与 `workflow_attempt` 配对的 `NODE_STARTED/NODE_COMPLETED|NODE_FAILED` 节点、以角色、修订轮次和 `workflow_attempt` 配对的 `BRANCH_STARTED/BRANCH_COMPLETED|BRANCH_FAILED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。失败尝试独立闭合为 `FAILED`，不会吞掉后续成功重试；跨版本运行的旧开始事件可与带尝试号的完成事件回退配对。未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
+`/traces` 运行追踪中心复用 `workflow_runs`、`workflow_events`、`llm_usage` 和 `agents`，不复制工作流状态或新增影子遥测表。服务端将事件配对为四类 Span：创建到首次启动的排队、按节点与 `workflow_attempt` 配对的 `NODE_STARTED/NODE_COMPLETED|NODE_FAILED` 节点、以角色、修订轮次、`workflow_attempt` 和 `branch_attempt` 配对的 `BRANCH_STARTED/BRANCH_COMPLETED|BRANCH_FAILED` 并行分支，以及 `PAUSED` 到重新入队/继续之间的人工等待。失败尝试独立闭合为 `FAILED`，不会吞掉后续成功重试；跨版本运行的旧开始事件可与带尝试号的完成事件回退配对。未闭合 Span 使用当前时间或工作流终态时间计算，并保留 `ACTIVE`、`PAUSED`、`FAILED`、`CANCELLED` 状态。
 
 模型调用先按 `workflow_id` 关联，再使用 Agent 角色和调用完成时间归属到最具体的并行分支；无法匹配分支时才归属外层节点，因此同一调用不会在分支与父节点重复累计。运行详情分别展示总耗时、排队、Agent 计算、人工等待和剩余协调开销。汇总中的运行数、状态、Token、成本和趋势是数据库聚合；P95、Agent 性能与节点瓶颈为显式标记截断的最近样本分析。
 
