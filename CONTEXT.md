@@ -51,3 +51,15 @@ _Avoid_: Generated HTML, mockup image
 **Prototype Version**:
 An immutable Product Prototype generation that preserves its source request, Agent trace and quality evidence.
 _Avoid_: Draft, snapshot
+
+**Redacted Evidence**:
+A reviewable representation of production feedback in which personal identifiers and secrets are replaced while the protected source record remains authoritative.
+_Avoid_: Raw feedback, anonymized data
+
+**Failure Cluster**:
+A role-scoped group of active negative feedback that represents the same recurring Agent behavior or unmet user expectation.
+_Avoid_: Error bucket, feedback tag
+
+**Regression Coverage**:
+The degree to which Failure Clusters are represented by enabled evaluation cases that can prevent the same behavior from being released again.
+_Avoid_: Role coverage, test count

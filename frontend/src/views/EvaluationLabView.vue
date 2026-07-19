@@ -141,7 +141,7 @@
       <el-button v-if="canCancel(activeRun)" :icon="Close" @click="cancelRun(activeRun)">取消</el-button>
     </div>
 
-    <el-tabs v-model="activeView" class="evaluation-tabs">
+    <el-tabs v-model="activeView" class="evaluation-tabs" @tab-change="handleActiveViewChange">
       <el-tab-pane label="运行历史" name="runs">
         <div class="view-toolbar">
           <div class="toolbar-copy">
@@ -397,6 +397,141 @@
           </article>
         </div>
         <el-empty v-if="!loading && !filteredCases.length" description="没有符合条件的评测用例" />
+      </el-tab-pane>
+
+      <el-tab-pane label="失败洞察" name="insights">
+        <div class="view-toolbar">
+          <div class="toolbar-copy">
+            <strong>相似失败与回归覆盖</strong>
+            <span>{{ failureInsights ? `${failureInsights.source_feedback_count} 条有效负反馈` : '等待分析' }}</span>
+          </div>
+          <div class="toolbar-filters">
+            <el-button
+              :icon="Refresh"
+              circle
+              aria-label="刷新失败洞察"
+              title="刷新"
+              :loading="loadingFailureInsights"
+              @click="loadFailureInsights()"
+            />
+          </div>
+        </div>
+
+        <el-alert
+          v-if="failureInsightsError"
+          type="error"
+          :closable="false"
+          show-icon
+          title="失败洞察加载失败"
+          :description="failureInsightsError"
+          role="alert"
+        >
+          <template #default><el-button @click="loadFailureInsights()">重新加载</el-button></template>
+        </el-alert>
+
+        <div v-loading="loadingFailureInsights" class="failure-insights-body">
+          <template v-if="failureInsights">
+            <div class="failure-insight-summary" aria-label="失败模式回归覆盖摘要">
+              <div>
+                <span>回归覆盖</span>
+                <strong>{{ percent(failureInsights.coverage_percent) }}</strong>
+                <small>{{ failureInsights.covered_cluster_count }}/{{ failureInsights.total_cluster_count }} 个失败模式</small>
+              </div>
+              <div>
+                <span>覆盖缺口</span>
+                <strong>{{ failureInsights.gap_cluster_count }}</strong>
+                <small>{{ failureInsights.partial_cluster_count }} 个部分覆盖</small>
+              </div>
+              <div>
+                <span>待复核反馈</span>
+                <strong>{{ failureInsights.pending_feedback_count }}</strong>
+                <small>{{ failureInsights.converted_feedback_count }} 条已进入回归集</small>
+              </div>
+              <div>
+                <span>敏感值替换</span>
+                <strong>{{ failureInsights.redacted_value_count }}</strong>
+                <small>响应与回归输入均使用脱敏证据</small>
+              </div>
+            </div>
+
+            <div class="insight-privacy-band" role="status">
+              <Lock aria-hidden="true" />
+              <span>用户身份已伪匿名化，个人标识与凭据已在聚类前替换。</span>
+            </div>
+
+            <el-alert
+              v-if="failureInsights.source_limit_reached"
+              type="warning"
+              :closable="false"
+              show-icon
+              title="洞察基于最近 500 条待复核与 500 条已转用例反馈"
+            />
+
+            <ol v-if="failureInsights.clusters.length" class="failure-cluster-list">
+              <li v-for="cluster in failureInsights.clusters" :key="cluster.cluster_id" class="failure-cluster">
+                <header class="failure-cluster-head">
+                  <div>
+                    <div class="failure-cluster-identity">
+                      <el-tag size="small" :type="clusterPriorityType(cluster.priority)" effect="plain">
+                        {{ clusterPriorityLabel(cluster.priority) }}
+                      </el-tag>
+                      <span>{{ roleLabel(cluster.agent_role) }}</span>
+                    </div>
+                    <h2>{{ cluster.label }}</h2>
+                  </div>
+                  <el-tag :type="clusterCoverageType(cluster.coverage_status)" effect="plain">
+                    {{ clusterCoverageLabel(cluster.coverage_status) }}
+                  </el-tag>
+                </header>
+
+                <div class="failure-cluster-coverage">
+                  <el-progress
+                    :percentage="Math.round(cluster.coverage_score * 100)"
+                    :stroke-width="7"
+                    :show-text="false"
+                  />
+                  <span>相似覆盖 {{ percent(cluster.coverage_score) }}</span>
+                </div>
+
+                <dl class="failure-cluster-metrics">
+                  <div><dt>同类反馈</dt><dd>{{ cluster.failure_count }}</dd></div>
+                  <div><dt>待复核</dt><dd>{{ cluster.pending_count }}</dd></div>
+                  <div><dt>已转用例</dt><dd>{{ cluster.converted_count }}</dd></div>
+                  <div><dt>敏感值替换</dt><dd>{{ cluster.redacted_value_count }}</dd></div>
+                </dl>
+
+                <div class="failure-signatures" aria-label="失败模式特征信号">
+                  <span>模式信号</span>
+                  <el-tag v-for="term in cluster.signature_terms" :key="term" size="small" effect="plain">{{ term }}</el-tag>
+                </div>
+
+                <details class="failure-sample">
+                  <summary>查看脱敏代表样本 #{{ cluster.representative.feedback_id }}</summary>
+                  <dl>
+                    <div><dt>用户输入</dt><dd>{{ cluster.representative.input_text }}</dd></div>
+                    <div><dt>Agent 回答</dt><dd>{{ cluster.representative.answer }}</dd></div>
+                    <div><dt>负反馈</dt><dd>{{ cluster.representative.comment || '未填写评论' }}</dd></div>
+                  </dl>
+                </details>
+
+                <footer class="failure-cluster-actions">
+                  <span v-if="cluster.matching_case_ids.length">匹配用例 {{ cluster.matching_case_ids.map(id => `#${id}`).join('、') }}</span>
+                  <span v-else>尚无匹配的启用用例</span>
+                  <el-button
+                    v-if="cluster.representative.status === 'PENDING' && cluster.coverage_status !== 'COVERED'"
+                    type="primary"
+                    plain
+                    :icon="Plus"
+                    @click="openPromoteDialog(cluster.representative)"
+                  >
+                    {{ cluster.recommended_action === 'STRENGTHEN_CASE' ? '补强回归用例' : '补为回归用例' }}
+                  </el-button>
+                </footer>
+              </li>
+            </ol>
+            <el-empty v-else description="尚无可分析的有效负反馈" />
+          </template>
+        </div>
       </el-tab-pane>
 
       <el-tab-pane label="反馈队列" name="feedback">
@@ -771,7 +906,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { CircleCheck, CircleClose, Close, MagicStick, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
+import { CircleCheck, CircleClose, Close, Lock, MagicStick, Plus, Refresh, RefreshLeft, RefreshRight, Search, Upload, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
@@ -787,6 +922,7 @@ import type {
   EvaluationCase,
   EvaluationCaseBootstrapResult,
   EvaluationCoverage,
+  EvaluationFailureInsights,
   EvaluationFeedbackCandidate,
   EvaluationRun,
   EvaluationRunDetail
@@ -820,11 +956,14 @@ const route = useRoute()
 const agents = ref<Agent[]>([])
 const cases = ref<EvaluationCase[]>([])
 const coverage = ref<EvaluationCoverage | null>(null)
+const failureInsights = ref<EvaluationFailureInsights | null>(null)
 const feedback = ref<EvaluationFeedbackCandidate[]>([])
 const runs = ref<EvaluationRun[]>([])
 const optimizationJobs = ref<AgentOptimizationJob[]>([])
 const loading = ref(false)
 const loadingFeedback = ref(false)
+const loadingFailureInsights = ref(false)
+const failureInsightsError = ref('')
 const loadingOptimizations = ref(false)
 const creatingRun = ref(false)
 const loadingVersions = ref(false)
@@ -1218,6 +1357,45 @@ function feedbackStatusType(status: string) {
   return 'warning'
 }
 
+function clusterCoverageLabel(status: string) {
+  return ({ COVERED: '已覆盖', PARTIAL: '部分覆盖', GAP: '覆盖缺口' } as Record<string, string>)[status] || status
+}
+
+function clusterCoverageType(status: string) {
+  if (status === 'COVERED') return 'success'
+  if (status === 'PARTIAL') return 'warning'
+  return 'danger'
+}
+
+function clusterPriorityLabel(priority: string) {
+  return ({ HIGH: '高优先级', MEDIUM: '中优先级', LOW: '低优先级' } as Record<string, string>)[priority] || priority
+}
+
+function clusterPriorityType(priority: string) {
+  if (priority === 'HIGH') return 'danger'
+  if (priority === 'MEDIUM') return 'warning'
+  return 'info'
+}
+
+async function loadFailureInsights(showLoading = true) {
+  if (showLoading) loadingFailureInsights.value = true
+  failureInsightsError.value = ''
+  try {
+    const { data } = await api.get<EvaluationFailureInsights>('/evaluations/failure-insights')
+    failureInsights.value = data
+  } catch {
+    failureInsightsError.value = '无法读取失败聚类与回归覆盖，请检查服务状态后重试。'
+  } finally {
+    loadingFailureInsights.value = false
+  }
+}
+
+function handleActiveViewChange(value: unknown) {
+  if (String(value) === 'insights' && !failureInsights.value && !loadingFailureInsights.value) {
+    void loadFailureInsights()
+  }
+}
+
 async function loadFeedback() {
   loadingFeedback.value = true
   try {
@@ -1271,6 +1449,7 @@ async function bootstrapEvaluationCases() {
     coverage.value = data.coverage
     const casesResponse = await api.get<EvaluationCase[]>('/evaluations/cases')
     cases.value = casesResponse.data
+    if (failureInsights.value) await loadFailureInsights(false)
     if (data.created_case_ids.length) {
       ElMessage.success(`已生成 ${data.created_case_ids.length} 个基础评测用例`)
     } else {
@@ -1618,6 +1797,7 @@ async function saveCase() {
       ? cases.value.map((item) => item.id === data.id ? data : item)
       : [...cases.value, data]
     await loadCoverage()
+    if (failureInsights.value) await loadFailureInsights(false)
     caseDialog.value = false
     ElMessage.success(editingCaseId.value ? '评测用例已更新' : '评测用例已创建')
   } finally {
@@ -1631,6 +1811,7 @@ async function archiveCase(value: unknown) {
   await api.delete(`/evaluations/cases/${item.id}`)
   cases.value = cases.value.map((current) => current.id === item.id ? { ...current, enabled: false } : current)
   await loadCoverage()
+  if (failureInsights.value) await loadFailureInsights(false)
   ElMessage.success('评测用例已归档')
 }
 
@@ -1662,11 +1843,14 @@ async function promoteFeedback() {
       minimum_score: promoteForm.minimum_score,
       weight: promoteForm.weight
     })
+    const feedbackWasLoaded = feedback.value.some((candidate) => candidate.feedback_id === data.feedback_id)
     feedback.value = feedback.value.map((candidate) => candidate.feedback_id === data.feedback_id ? data : candidate)
+    if (!feedbackWasLoaded) await loadFeedback()
     feedbackRequestIds.delete(`promote:${item.feedback_id}`)
     const casesResponse = await api.get<EvaluationCase[]>('/evaluations/cases')
     cases.value = casesResponse.data
     await loadCoverage()
+    if (failureInsights.value) await loadFailureInsights(false)
     promoteDialog.value = false
     ElMessage.success('反馈已转为评测用例')
   } finally {
@@ -1695,6 +1879,7 @@ async function dismissFeedback(value: unknown) {
   })
   feedback.value = feedback.value.map((candidate) => candidate.feedback_id === data.feedback_id ? data : candidate)
   feedbackRequestIds.delete(`dismiss:${item.feedback_id}`)
+  if (failureInsights.value) await loadFailureInsights(false)
   ElMessage.success('反馈已忽略')
 }
 
@@ -1763,6 +1948,38 @@ onBeforeUnmount(() => {
 .feedback-answer { display: -webkit-box; margin-top: 3px; overflow: hidden; color: var(--color-muted-text); font-size: 12px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .feedback-meta { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; }
 .feedback-reviewed { color: var(--color-muted-text); font-size: 12px; }
+.failure-insights-body { min-height: 180px; }
+.failure-insight-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-block: 1px solid var(--color-border); background: var(--color-surface); }
+.failure-insight-summary > div { min-width: 0; padding: 16px 18px; }
+.failure-insight-summary > div + div { border-left: 1px solid var(--color-border); }
+.failure-insight-summary span, .failure-insight-summary small, .failure-insight-summary strong { display: block; }
+.failure-insight-summary span { color: var(--color-secondary-text); font-size: 12px; font-weight: 650; }
+.failure-insight-summary strong { margin-top: 5px; color: var(--color-foreground); font-size: 24px; font-variant-numeric: tabular-nums; }
+.failure-insight-summary small { margin-top: 3px; color: var(--color-muted-text); font-size: 11px; line-height: 1.45; }
+.insight-privacy-band { display: flex; align-items: center; gap: 8px; padding: 12px 2px; color: var(--color-secondary-text); font-size: 12px; }
+.insight-privacy-band svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--color-success); }
+.failure-cluster-list { margin: 0; padding: 0; list-style: none; }
+.failure-cluster { padding: 20px 2px; border-bottom: 1px solid var(--color-border); }
+.failure-cluster-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.failure-cluster-head > div { min-width: 0; }
+.failure-cluster-head h2 { margin: 7px 0 0; color: var(--color-foreground); font-size: 17px; line-height: 1.45; overflow-wrap: anywhere; }
+.failure-cluster-identity { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--color-secondary-text); font-size: 12px; font-weight: 650; }
+.failure-cluster-coverage { display: grid; grid-template-columns: minmax(140px, 280px) auto; align-items: center; gap: 12px; margin-top: 14px; }
+.failure-cluster-coverage span { color: var(--color-secondary-text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.failure-cluster-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 14px 0 0; overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-border); }
+.failure-cluster-metrics > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 10px 12px; background: var(--color-surface); }
+.failure-cluster-metrics dt { color: var(--color-muted-text); font-size: 11px; }
+.failure-cluster-metrics dd { margin: 0; color: var(--color-foreground); font-weight: 700; font-variant-numeric: tabular-nums; }
+.failure-signatures { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.failure-signatures > span { margin-right: 2px; color: var(--color-muted-text); font-size: 11px; font-weight: 650; }
+.failure-sample { margin-top: 14px; border-top: 1px dashed var(--color-border); }
+.failure-sample summary { min-height: 40px; padding: 11px 2px 7px; color: var(--color-primary); cursor: pointer; font-size: 12px; font-weight: 650; }
+.failure-sample dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 6px 0 0; }
+.failure-sample dl > div { min-width: 0; padding: 11px 12px; border-left: 2px solid var(--color-border); background: var(--color-background); }
+.failure-sample dt { color: var(--color-muted-text); font-size: 11px; font-weight: 650; }
+.failure-sample dd { margin: 4px 0 0; color: var(--color-secondary-text); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.failure-cluster-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; color: var(--color-muted-text); font-size: 12px; }
+.failure-cluster-actions .el-button { margin: 0; }
 .optimization-stage, .optimization-stage + small { display: block; }
 .optimization-stage { color: var(--color-secondary-text); font-size: 12px; }
 .optimization-stage + small { margin-top: 2px; color: var(--color-muted-text); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -1957,6 +2174,14 @@ onBeforeUnmount(() => {
   .feedback-source-head { align-items: flex-start; flex-direction: column; }
   .feedback-source dl div { grid-template-columns: 1fr; gap: 4px; }
   .feedback-rule-grid { grid-template-columns: 1fr 1fr; }
+  .failure-insight-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .failure-insight-summary > div:nth-child(3) { border-top: 1px solid var(--color-border); border-left: 0; }
+  .failure-insight-summary > div:nth-child(4) { border-top: 1px solid var(--color-border); }
+  .failure-cluster-head { gap: 10px; }
+  .failure-cluster-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .failure-sample dl { grid-template-columns: 1fr; }
+  .failure-cluster-actions { align-items: stretch; flex-direction: column; }
+  .failure-cluster-actions .el-button { width: 100%; min-height: 44px; }
   :deep(.evaluation-feedback-dialog .el-dialog__footer .el-button) { min-height: 44px; }
 }
 </style>

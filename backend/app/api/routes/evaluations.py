@@ -42,6 +42,7 @@ from app.schemas import (
     EvaluationFeedbackCandidateOut,
     EvaluationFeedbackDismissRequest,
     EvaluationFeedbackPromoteRequest,
+    EvaluationFailureInsightsOut,
     EvaluationResultOut,
     EvaluationReleaseRequest,
     EvaluationRunCreate,
@@ -60,6 +61,8 @@ from app.services.evaluation_feedback import (
     promote_feedback_to_case,
     reviewed_feedback_candidate,
 )
+from app.services.evaluation_failure_insights import build_failure_insights
+from app.services.evaluation_privacy import redact_evaluation_case_values
 from app.services.evaluation_coverage import evaluation_suite_coverage
 from app.services.evaluation_case_bootstrap import bootstrap_missing_evaluation_cases
 from app.services.agent_optimizations import (
@@ -411,13 +414,14 @@ def create_evaluation_case(
     current_admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> EvaluationCaseOut:
+    values = redact_evaluation_case_values(payload.model_dump())
     item = EvaluationCase(
-        name=payload.name.strip(),
+        name=str(values["name"]).strip(),
         agent_role=payload.agent_role.value,
-        input_text=payload.input_text.strip(),
-        expected_keywords_json=json.dumps(payload.expected_keywords, ensure_ascii=False),
-        forbidden_keywords_json=json.dumps(payload.forbidden_keywords, ensure_ascii=False),
-        rubric=payload.rubric.strip(),
+        input_text=str(values["input_text"]).strip(),
+        expected_keywords_json=json.dumps(values["expected_keywords"], ensure_ascii=False),
+        forbidden_keywords_json=json.dumps(values["forbidden_keywords"], ensure_ascii=False),
+        rubric=str(values["rubric"]).strip(),
         minimum_score=payload.minimum_score,
         weight=payload.weight,
         enabled=payload.enabled,
@@ -450,12 +454,13 @@ def update_evaluation_case(
     item = db.get(EvaluationCase, case_id)
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evaluation case not found")
-    item.name = payload.name.strip()
+    values = redact_evaluation_case_values(payload.model_dump())
+    item.name = str(values["name"]).strip()
     item.agent_role = payload.agent_role.value
-    item.input_text = payload.input_text.strip()
-    item.expected_keywords_json = json.dumps(payload.expected_keywords, ensure_ascii=False)
-    item.forbidden_keywords_json = json.dumps(payload.forbidden_keywords, ensure_ascii=False)
-    item.rubric = payload.rubric.strip()
+    item.input_text = str(values["input_text"]).strip()
+    item.expected_keywords_json = json.dumps(values["expected_keywords"], ensure_ascii=False)
+    item.forbidden_keywords_json = json.dumps(values["forbidden_keywords"], ensure_ascii=False)
+    item.rubric = str(values["rubric"]).strip()
     item.minimum_score = payload.minimum_score
     item.weight = payload.weight
     item.enabled = payload.enabled
@@ -506,6 +511,14 @@ def list_evaluation_feedback(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     return [feedback_candidate_out(row) for row in rows]
+
+
+@router.get("/failure-insights", response_model=EvaluationFailureInsightsOut)
+def get_evaluation_failure_insights(
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationFailureInsightsOut:
+    return EvaluationFailureInsightsOut(**build_failure_insights(db))
 
 
 @router.post(

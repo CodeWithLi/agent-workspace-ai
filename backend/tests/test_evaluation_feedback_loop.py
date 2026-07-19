@@ -281,6 +281,61 @@ def test_feedback_promotion_is_idempotent_and_freezes_source_evidence(db: Sessio
     assert conflict.value.status_code == 409
 
 
+def test_feedback_responses_and_regression_inputs_redact_sensitive_values(db: Session) -> None:
+    admin, _, feedback, _, _, source_input, source_answer = seed_feedback(db)
+    source_input.content = (
+        "Feedback Member asks to design isolation for alice@example.com and phone 13800138000"
+    )
+    source_answer.content = "Reuse api_key=sk-production-secret-value across tenants"
+    feedback.comment = "Call 13800138000 because the cited source is missing"
+    db.commit()
+
+    pending = list_evaluation_feedback("PENDING", admin, db)
+    item = next(candidate for candidate in pending if candidate.feedback_id == feedback.id)
+    assert item.user_name.startswith("User #")
+    assert item.redaction_count == 5
+    assert set(item.redacted_fields) == {"input_text", "answer", "comment"}
+    assert "alice@example.com" not in item.input_text
+    assert "Feedback Member" not in item.input_text
+    assert "13800138000" not in f"{item.input_text} {item.comment}"
+    assert "sk-production-secret-value" not in item.answer
+
+    converted = promote_evaluation_feedback(
+        feedback.id,
+        EvaluationFeedbackPromoteRequest(
+            request_id="privacy-safe-feedback-case",
+            name="Tenant isolation regression for alice@example.com",
+            expected_keywords=["tenant", "alice@example.com"],
+            forbidden_keywords=["sk-production-secret-value"],
+            rubric="Never expose api_key=sk-production-secret-value",
+        ),
+        request(),
+        admin,
+        db,
+    )
+    case = db.get(EvaluationCase, converted.evaluation_case_id)
+    assert case is not None
+    serialized_case = " ".join(
+        (
+            case.name,
+            case.input_text,
+            case.expected_keywords_json,
+            case.forbidden_keywords_json,
+            case.rubric,
+        )
+    )
+    assert "alice@example.com" not in serialized_case
+    assert "Feedback Member" not in serialized_case
+    assert "13800138000" not in serialized_case
+    assert "sk-production-secret-value" not in serialized_case
+
+    review = db.get(EvaluationFeedbackReview, converted.review_id)
+    assert review is not None
+    protected_snapshot = json.loads(review.source_snapshot_json)
+    assert "alice@example.com" in protected_snapshot["input_text"]
+    assert "sk-production-secret-value" in protected_snapshot["answer"]
+
+
 def test_feedback_dismissal_is_idempotent_and_positive_feedback_is_ineligible(db: Session) -> None:
     admin, _, _, feedback, positive, _, _ = seed_feedback(db)
     payload = EvaluationFeedbackDismissRequest(

@@ -653,14 +653,16 @@ async function mockApi(page: Page) {
       conversation_id: 31,
       project_id: 1,
       user_id: 2,
-      user_name: '研发成员',
+      user_name: 'User #2',
       agent_id: 2,
       agent_name: 'AI架构师',
       agent_role: 'architect',
-      input_text: '设计租户隔离并给出证据引用',
-      answer: '使用共享数据库即可。',
+      input_text: '设计租户隔离并给出证据引用，联系人 [EMAIL_REDACTED]',
+      answer: '使用共享数据库即可，密钥 [CREDENTIAL_REDACTED]。',
       comment: '缺少租户边界和引用证据',
       resolution_note: '',
+      redaction_count: 2,
+      redacted_fields: ['input_text', 'answer'],
       created_at: '2026-07-18T09:30:00Z',
       reviewed_at: null
     },
@@ -673,7 +675,7 @@ async function mockApi(page: Page) {
       conversation_id: 32,
       project_id: 1,
       user_id: 3,
-      user_name: '产品成员',
+      user_name: 'User #3',
       agent_id: 1,
       agent_name: 'AI产品经理',
       agent_role: 'product_manager',
@@ -681,6 +683,8 @@ async function mockApi(page: Page) {
       answer: '尽快完成发布。',
       comment: '没有验收标准',
       resolution_note: '',
+      redaction_count: 0,
+      redacted_fields: [],
       created_at: '2026-07-18T09:20:00Z',
       reviewed_at: null
     }
@@ -699,6 +703,44 @@ async function mockApi(page: Page) {
   let evaluationPolls = 0
   let optimizationPolls = 0
   const optimizationJobs: Array<Record<string, any>> = []
+
+  function evaluationFailureInsights() {
+    const activeFeedback = evaluationFeedback.filter((item) => item.status !== 'DISMISSED')
+    const clusters = activeFeedback.map((item) => {
+      const covered = item.status === 'CONVERTED'
+      return {
+        cluster_id: `${item.agent_role}-${item.feedback_id}`,
+        agent_role: item.agent_role,
+        label: item.comment,
+        failure_count: 1,
+        pending_count: item.status === 'PENDING' ? 1 : 0,
+        converted_count: covered ? 1 : 0,
+        redacted_value_count: item.redaction_count,
+        signature_terms: item.agent_role === 'architect' ? ['引用', '租户', '证据', '隔离'] : ['标准', '验收'],
+        coverage_status: covered ? 'COVERED' : 'GAP',
+        coverage_score: covered ? 1 : item.agent_role === 'architect' ? 0.18 : 0.12,
+        matching_case_ids: covered && item.evaluation_case_id ? [item.evaluation_case_id] : [],
+        priority: covered ? 'LOW' : 'MEDIUM',
+        recommended_action: covered ? 'MONITOR' : 'CREATE_CASE',
+        feedback_ids: [item.feedback_id],
+        representative: item
+      }
+    })
+    const covered = clusters.filter((item) => item.coverage_status === 'COVERED').length
+    return {
+      source_feedback_count: activeFeedback.length,
+      pending_feedback_count: activeFeedback.filter((item) => item.status === 'PENDING').length,
+      converted_feedback_count: activeFeedback.filter((item) => item.status === 'CONVERTED').length,
+      redacted_value_count: activeFeedback.reduce((total, item) => total + item.redaction_count, 0),
+      total_cluster_count: clusters.length,
+      covered_cluster_count: covered,
+      partial_cluster_count: 0,
+      gap_cluster_count: clusters.length - covered,
+      coverage_percent: clusters.length ? covered / clusters.length : 1,
+      source_limit_reached: false,
+      clusters
+    }
+  }
 
   function optimizationJob(status: 'QUEUED' | 'COMPLETED' = 'QUEUED') {
     const completed = status === 'COMPLETED'
@@ -1326,6 +1368,7 @@ async function mockApi(page: Page) {
       projects = [created, ...projects]
       body = created
     } else if (method === 'GET' && path === '/evaluations/coverage') body = evaluationCoverage
+    else if (method === 'GET' && path === '/evaluations/failure-insights') body = evaluationFailureInsights()
     else if (method === 'GET' && path === '/evaluations/optimization-jobs') {
       if (optimizationJobs.some((item) => item.status === 'QUEUED') && optimizationPolls++ >= 0) {
         optimizationJobs.splice(0, optimizationJobs.length, optimizationJob('COMPLETED'))
@@ -1377,7 +1420,12 @@ async function mockApi(page: Page) {
       evaluationCases = evaluationCases.map((item) => item.id === id ? { ...item, enabled: false } : item)
       return route.fulfill({ status: 204 })
     }
-    else if (method === 'GET' && path === '/evaluations/feedback') body = evaluationFeedback
+    else if (method === 'GET' && path === '/evaluations/feedback') {
+      const status = url.searchParams.get('status') || 'PENDING'
+      body = status === 'ALL'
+        ? evaluationFeedback
+        : evaluationFeedback.filter((item) => item.status === status)
+    }
     else if (method === 'POST' && /^\/evaluations\/feedback\/\d+\/promote$/.test(path)) {
       const feedbackId = Number(path.split('/')[3])
       const input = request.postDataJSON() as {
@@ -1817,8 +1865,8 @@ test('triages negative production feedback into the evaluation dataset', async (
   const architectFeedback = visibleFeedbackList.locator('[data-feedback-id="41"]')
   await architectFeedback.getByRole('button', { name: '转为用例' }).click()
   const promoteDialog = page.getByRole('dialog', { name: '转为评测用例' })
-  await expect(promoteDialog.getByText('设计租户隔离并给出证据引用', { exact: true })).toBeVisible()
-  await expect(promoteDialog.getByText('使用共享数据库即可。', { exact: true })).toBeVisible()
+  await expect(promoteDialog.getByText('设计租户隔离并给出证据引用，联系人 [EMAIL_REDACTED]', { exact: true })).toBeVisible()
+  await expect(promoteDialog.getByText('使用共享数据库即可，密钥 [CREDENTIAL_REDACTED]。', { exact: true })).toBeVisible()
   await expect(promoteDialog.getByText('缺少租户边界和引用证据', { exact: true })).toBeVisible()
   await promoteDialog.getByLabel('用例名称').fill('租户隔离与证据引用回归')
   await promoteDialog.getByLabel('期望证据关键词').fill('租户隔离，引用证据')
@@ -1852,6 +1900,44 @@ test('triages negative production feedback into the evaluation dataset', async (
 
   await page.getByRole('tab', { name: '用例库' }).click()
   await expect(page.locator('.desktop-case-table:visible, .mobile-case-list:visible').getByText('租户隔离与证据引用回归', { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+})
+
+test('clusters redacted production failures and opens a regression gap', async ({ page }, testInfo) => {
+  await page.goto('/evaluations')
+  await page.getByRole('tab', { name: '反馈队列' }).click()
+  await page.locator('.feedback-toolbar-filters .el-select').click()
+  await page.getByRole('option', { name: '已转用例', exact: true }).click()
+  await expect(page.getByText('没有符合条件的反馈', { exact: true })).toBeVisible()
+  await page.getByRole('tab', { name: '失败洞察' }).click()
+
+  await expect(page.getByText('相似失败与回归覆盖', { exact: true })).toBeVisible()
+  await expect(page.getByText('2 条有效负反馈', { exact: true })).toBeVisible()
+  const architectureCluster = page.locator('.failure-cluster').filter({ hasText: '缺少租户边界和引用证据' })
+  await expect(architectureCluster).toContainText('覆盖缺口')
+  await expect(architectureCluster).toContainText('敏感值替换')
+  await expect(architectureCluster.getByText('2', { exact: true })).toBeVisible()
+
+  await architectureCluster.locator('summary').click()
+  await expect(architectureCluster.getByText(/\[EMAIL_REDACTED\]/)).toBeVisible()
+  await expect(architectureCluster.getByText(/\[CREDENTIAL_REDACTED\]/)).toBeVisible()
+  await expect(page.getByText('alice@example.com', { exact: false })).toHaveCount(0)
+  await expect(page.getByText('sk-production-secret-value', { exact: false })).toHaveCount(0)
+
+  const createRegression = architectureCluster.getByRole('button', { name: '补为回归用例' })
+  if (testInfo.project.name === 'mobile-chromium') await expect(createRegression).toHaveCSS('min-height', '44px')
+  await createRegression.click()
+  const promoteDialog = page.getByRole('dialog', { name: '转为评测用例' })
+  await expect(promoteDialog).toContainText('[EMAIL_REDACTED]')
+  await promoteDialog.getByLabel('期望证据关键词').fill('租户隔离，引用证据')
+  await promoteDialog.getByRole('button', { name: '创建评测用例' }).click()
+  await expect(page.getByText('反馈已转为评测用例', { exact: true })).toBeVisible()
+
+  await page.getByRole('tab', { name: '反馈队列' }).click()
+  const convertedFeedback = page.locator('.desktop-feedback-table:visible, .mobile-feedback-list:visible')
+  await expect(convertedFeedback.getByText('已转用例', { exact: true })).toBeVisible()
+  await expect(convertedFeedback.getByText(/\[EMAIL_REDACTED\]/)).toBeVisible()
+
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 

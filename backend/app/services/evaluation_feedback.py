@@ -14,6 +14,10 @@ from app.models import (
     MessageFeedback,
     User,
 )
+from app.services.evaluation_privacy import (
+    redact_evaluation_case_values,
+    redact_evaluation_text,
+)
 
 
 class EvaluationFeedbackConflict(RuntimeError):
@@ -82,6 +86,20 @@ def _candidate_data(
     snapshot: dict[str, Any],
     review: EvaluationFeedbackReview | None = None,
 ) -> dict[str, Any]:
+    redacted_fields: list[str] = []
+    redaction_count = 0
+    redacted_values: dict[str, str] = {}
+    personal_names = (str(snapshot.get("user_name") or ""),)
+    for field in ("input_text", "answer", "comment", "resolution_note"):
+        raw_value = review.resolution_note if field == "resolution_note" and review else snapshot.get(field)
+        result = redact_evaluation_text(
+            str(raw_value or ""),
+            personal_names=personal_names,
+        )
+        redacted_values[field] = result.text
+        redaction_count += result.count
+        if result.count:
+            redacted_fields.append(field)
     return {
         "feedback_id": int(snapshot["feedback_id"]),
         "review_id": review.id if review else None,
@@ -91,20 +109,22 @@ def _candidate_data(
         "conversation_id": int(snapshot["conversation_id"]),
         "project_id": snapshot.get("project_id"),
         "user_id": int(snapshot["user_id"]),
-        "user_name": str(snapshot.get("user_name") or f"User #{snapshot['user_id']}"),
+        "user_name": f"User #{snapshot['user_id']}",
         "agent_id": int(snapshot["agent_id"]),
         "agent_name": str(snapshot.get("agent_name") or f"Agent #{snapshot['agent_id']}"),
         "agent_role": str(snapshot.get("agent_role") or ""),
-        "input_text": str(snapshot.get("input_text") or ""),
-        "answer": str(snapshot.get("answer") or ""),
-        "comment": str(snapshot.get("comment") or ""),
-        "resolution_note": review.resolution_note if review else "",
+        "input_text": redacted_values["input_text"],
+        "answer": redacted_values["answer"],
+        "comment": redacted_values["comment"],
+        "resolution_note": redacted_values["resolution_note"],
+        "redaction_count": redaction_count,
+        "redacted_fields": redacted_fields,
         "created_at": snapshot["feedback_created_at"],
         "reviewed_at": review.reviewed_at if review else None,
     }
 
 
-def _pending_feedback(db: Session) -> list[dict[str, Any]]:
+def _pending_feedback(db: Session, *, limit: int = 100) -> list[dict[str, Any]]:
     parent = aliased(Message)
     rows = db.execute(
         select(
@@ -130,7 +150,7 @@ def _pending_feedback(db: Session) -> list[dict[str, Any]]:
             EvaluationFeedbackReview.id.is_(None),
         )
         .order_by(MessageFeedback.created_at.desc(), MessageFeedback.id.desc())
-        .limit(100)
+        .limit(limit)
     ).all()
     output: list[dict[str, Any]] = []
     for feedback, message, conversation, agent, source_user, user_message in rows:
@@ -164,7 +184,12 @@ def _pending_feedback(db: Session) -> list[dict[str, Any]]:
     return output
 
 
-def _reviewed_feedback(db: Session, status: str | None = None) -> list[dict[str, Any]]:
+def _reviewed_feedback(
+    db: Session,
+    status: str | None = None,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
     stmt = select(EvaluationFeedbackReview)
     if status:
         stmt = stmt.where(EvaluationFeedbackReview.status == status)
@@ -172,7 +197,7 @@ def _reviewed_feedback(db: Session, status: str | None = None) -> list[dict[str,
         stmt.order_by(
             EvaluationFeedbackReview.reviewed_at.desc(),
             EvaluationFeedbackReview.id.desc(),
-        ).limit(100)
+        ).limit(limit)
     )
     return [
         _candidate_data(_json_object(review.source_snapshot_json), review)
@@ -180,18 +205,23 @@ def _reviewed_feedback(db: Session, status: str | None = None) -> list[dict[str,
     ]
 
 
-def list_feedback_candidates(db: Session, status: str) -> list[dict[str, Any]]:
+def list_feedback_candidates(
+    db: Session,
+    status: str,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
     if status == "PENDING":
-        return _pending_feedback(db)
+        return _pending_feedback(db, limit=limit)
     if status in {"CONVERTED", "DISMISSED"}:
-        return _reviewed_feedback(db, status)
+        return _reviewed_feedback(db, status, limit=limit)
     if status == "ALL":
-        rows = [*_pending_feedback(db), *_reviewed_feedback(db)]
+        rows = [*_pending_feedback(db, limit=limit), *_reviewed_feedback(db, limit=limit)]
         return sorted(
             rows,
             key=lambda item: str(item.get("reviewed_at") or item["created_at"]),
             reverse=True,
-        )[:100]
+        )[:limit]
     raise ValueError("Feedback status must be PENDING, CONVERTED, DISMISSED or ALL")
 
 
@@ -252,13 +282,17 @@ def promote_feedback_to_case(
     snapshot = _source_snapshot(db, feedback)
     if not snapshot["input_text"]:
         raise EvaluationFeedbackConflict("Feedback source user input is unavailable")
+    redacted = redact_evaluation_case_values(
+        {**case_values, "input_text": snapshot["input_text"]},
+        personal_names=(str(snapshot.get("user_name") or ""),),
+    )
     case = EvaluationCase(
-        name=str(case_values["name"]).strip(),
+        name=str(redacted["name"]).strip(),
         agent_role=snapshot["agent_role"],
-        input_text=snapshot["input_text"],
-        expected_keywords_json=json.dumps(case_values["expected_keywords"], ensure_ascii=False),
-        forbidden_keywords_json=json.dumps(case_values["forbidden_keywords"], ensure_ascii=False),
-        rubric=str(case_values["rubric"]).strip(),
+        input_text=str(redacted["input_text"]).strip(),
+        expected_keywords_json=json.dumps(redacted["expected_keywords"], ensure_ascii=False),
+        forbidden_keywords_json=json.dumps(redacted["forbidden_keywords"], ensure_ascii=False),
+        rubric=str(redacted["rubric"]).strip(),
         minimum_score=float(case_values["minimum_score"]),
         weight=float(case_values["weight"]),
         enabled=True,

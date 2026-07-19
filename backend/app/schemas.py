@@ -1229,8 +1229,42 @@ class EvaluationFeedbackCandidateOut(BaseModel):
     answer: str
     comment: str
     resolution_note: str
+    redaction_count: int
+    redacted_fields: list[str]
     created_at: datetime
     reviewed_at: datetime | None
+
+
+class EvaluationFailureClusterOut(BaseModel):
+    cluster_id: str
+    agent_role: str
+    label: str
+    failure_count: int
+    pending_count: int
+    converted_count: int
+    redacted_value_count: int
+    signature_terms: list[str]
+    coverage_status: Literal["COVERED", "PARTIAL", "GAP"]
+    coverage_score: float
+    matching_case_ids: list[int]
+    priority: Literal["HIGH", "MEDIUM", "LOW"]
+    recommended_action: Literal["CREATE_CASE", "STRENGTHEN_CASE", "REVIEW_PENDING", "MONITOR"]
+    feedback_ids: list[int]
+    representative: EvaluationFeedbackCandidateOut
+
+
+class EvaluationFailureInsightsOut(BaseModel):
+    source_feedback_count: int
+    pending_feedback_count: int
+    converted_feedback_count: int
+    redacted_value_count: int
+    total_cluster_count: int
+    covered_cluster_count: int
+    partial_cluster_count: int
+    gap_cluster_count: int
+    coverage_percent: float
+    source_limit_reached: bool
+    clusters: list[EvaluationFailureClusterOut]
 
 
 class EvaluationRunCreate(BaseModel):

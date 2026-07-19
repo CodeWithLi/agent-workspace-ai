@@ -387,8 +387,42 @@ export interface EvaluationFeedbackCandidate {
   answer: string
   comment: string
   resolution_note: string
+  redaction_count: number
+  redacted_fields: string[]
   created_at: string
   reviewed_at?: string | null
+}
+
+export interface EvaluationFailureCluster {
+  cluster_id: string
+  agent_role: string
+  label: string
+  failure_count: number
+  pending_count: number
+  converted_count: number
+  redacted_value_count: number
+  signature_terms: string[]
+  coverage_status: 'COVERED' | 'PARTIAL' | 'GAP'
+  coverage_score: number
+  matching_case_ids: number[]
+  priority: 'HIGH' | 'MEDIUM' | 'LOW'
+  recommended_action: 'CREATE_CASE' | 'STRENGTHEN_CASE' | 'REVIEW_PENDING' | 'MONITOR'
+  feedback_ids: number[]
+  representative: EvaluationFeedbackCandidate
+}
+
+export interface EvaluationFailureInsights {
+  source_feedback_count: number
+  pending_feedback_count: number
+  converted_feedback_count: number
+  redacted_value_count: number
+  total_cluster_count: number
+  covered_cluster_count: number
+  partial_cluster_count: number
+  gap_cluster_count: number
+  coverage_percent: number
+  source_limit_reached: boolean
+  clusters: EvaluationFailureCluster[]
 }
 
 export interface EvaluationAgentSnapshot {

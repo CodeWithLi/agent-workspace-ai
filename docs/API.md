@@ -51,7 +51,8 @@
 - `GET|POST /evaluations/cases`、`PATCH|DELETE /evaluations/cases/{id}`
 - `POST /evaluations/cases/bootstrap`：仅管理员为缺失的核心 Agent 角色幂等生成可编辑基础用例；锁定角色后复核覆盖，不覆盖已有用例
 - `GET /evaluations/coverage`：仅管理员读取核心多 Agent 角色、各角色启用用例数、缺失角色、覆盖率和门禁就绪状态
-- `GET /evaluations/feedback?status=PENDING|CONVERTED|DISMISSED|ALL`：仅管理员筛选当前负反馈及历史复核结果
+- `GET /evaluations/failure-insights`：仅管理员读取按 Agent 角色隔离的有效负反馈聚类、脱敏计数、优先级、相似启用用例和 `COVERED|PARTIAL|GAP` 回归覆盖结论
+- `GET /evaluations/feedback?status=PENDING|CONVERTED|DISMISSED|ALL`：仅管理员筛选当前负反馈及历史复核结果；用户身份伪匿名化，输入、回答、评论和复核说明在响应前脱敏
 - `POST /evaluations/feedback/{feedback_id}/promote`：仅管理员使用唯一 `request_id` 将负反馈幂等转为启用用例，并冻结来源证据
 - `POST /evaluations/feedback/{feedback_id}/dismiss`：仅管理员使用唯一 `request_id` 和复核原因幂等忽略候选项
 - `POST /evaluations/runs`、`GET /evaluations/runs`、`GET /evaluations/runs/{id}`；创建 Challenger 时同时提交 `baseline_run_id` 与 `candidate_version_id`
@@ -71,7 +72,9 @@ SSE 事件：`thinking`、`tool`、`token`、`error`、`done`。`done` 包含 `c
 
 用户必须拥有 `agents:read`。审批执行前会重新检查项目写权限、Agent 硬白名单、数据库工具启停和发起者状态；重复审批返回 `409`。
 
-反馈评测接口只接受当前仍为 `rating=-1` 的助手消息。同一反馈最多生成一个评测用例；转化和忽略均以 `request_id` 幂等，已被其他请求复核时返回 `409`。来源输入、回答和评论只出现在管理员反馈响应及冻结快照中，审计详情只记录资源 ID 和 Agent 角色。
+反馈评测接口只接受当前仍为 `rating=-1` 的助手消息。同一反馈最多生成一个评测用例；转化和忽略均以 `request_id` 幂等，已被其他请求复核时返回 `409`。原始来源输入、回答和评论只保存在受控冻结快照中；管理员反馈响应使用伪匿名身份和脱敏正文，审计详情只记录资源 ID 和 Agent 角色。通过创建、编辑或反馈转化进入评测集的文本统一执行邮箱、手机号、证件号、银行卡、IP 和凭据脱敏。
+
+失败洞察只纳入 `PENDING` 与 `CONVERTED` 负反馈，已忽略项不参与。聚类在脱敏后按 Agent 角色隔离计算，最多分析最近 500 条待复核与 500 条已转用例反馈并显式返回截断状态。来源反馈已关联的启用用例优先证明覆盖；其他启用用例只按相似共同信号给出部分或完整覆盖建议，不改变核心角色覆盖门禁。
 
 评测运行要求当前测试集覆盖所有已配置的核心协作角色；缺少任一角色时创建运行返回 `422`。worker 完成和 Challenger 发布会再次使用冻结测试集与当前核心 Agent 配置校验覆盖，防止运行期间新增角色或历史绿灯绕过门禁。
 
