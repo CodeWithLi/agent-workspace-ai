@@ -10,6 +10,7 @@ from app.agent.orchestration import (
     SpecialistTeamUnavailableError,
     arbitrate_execution_plan_candidates,
     assess_execution_plan_candidate,
+    attach_execution_plan_commitments,
     build_specialist_capability_catalog,
     build_fallback_plan,
     build_execution_waves,
@@ -20,6 +21,7 @@ from app.agent.orchestration import (
     merge_reviewer_panel,
     parse_execution_plan,
     parse_execution_plan_candidate,
+    parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
 )
@@ -209,6 +211,165 @@ def test_plan_arbitration_preserves_selection_evidence_and_falls_back_determinis
     assert fallback.arbitration_mode == "deterministic_fallback"
     assert fallback.selected_candidate_id == expected.candidate_id
     assert "确定性评分" in fallback.selection_reason
+
+
+def test_specialist_plan_commitments_validate_acceptance_challenges_and_abstentions() -> None:
+    accepted = parse_specialist_plan_commitment(
+        json.dumps(
+            {
+                "decision": "ACCEPT",
+                "confidence": 0.93,
+                "summary": "输入、依赖和交付边界完整，可以按计划执行。",
+                "missing_inputs": [],
+                "dependency_concerns": [],
+                "proposed_changes": [],
+            },
+            ensure_ascii=False,
+        ),
+        "test_engineer",
+    )
+    challenged = parse_specialist_plan_commitment(
+        json.dumps(
+            {
+                "decision": "CHALLENGE",
+                "confidence": 0.88,
+                "summary": "缺少发布环境基线，当前恢复目标不可验证。",
+                "missing_inputs": ["生产环境错误预算基线"],
+                "dependency_concerns": ["运营结论不应依赖尚未生成的测试报告"],
+                "proposed_changes": ["先由运营提供基线，再并行执行测试与恢复演练"],
+            },
+            ensure_ascii=False,
+        ),
+        "operations_analyst",
+    )
+    invalid_acceptance = parse_specialist_plan_commitment(
+        json.dumps(
+            {
+                "decision": "ACCEPT",
+                "confidence": 0.91,
+                "summary": "口头接受但仍声明阻塞输入。",
+                "missing_inputs": ["尚未提供的安全边界"],
+                "dependency_concerns": [],
+                "proposed_changes": [],
+            },
+            ensure_ascii=False,
+        ),
+        "test_engineer",
+    )
+    empty_challenge = parse_specialist_plan_commitment(
+        json.dumps(
+            {
+                "decision": "CHALLENGE",
+                "confidence": 0.72,
+                "summary": "不同意当前安排。",
+                "missing_inputs": [],
+                "dependency_concerns": [],
+                "proposed_changes": [],
+            },
+            ensure_ascii=False,
+        ),
+        "operations_analyst",
+    )
+
+    assert accepted.structured is True
+    assert accepted.decision == "ACCEPT"
+    assert challenged.structured is True
+    assert challenged.decision == "CHALLENGE"
+    assert challenged.missing_inputs == ["生产环境错误预算基线"]
+    assert invalid_acceptance.decision == "ABSTAIN"
+    assert invalid_acceptance.structured is False
+    assert empty_challenge.decision == "ABSTAIN"
+
+
+def test_plan_arbitration_cannot_bypass_a_ready_specialist_commitment() -> None:
+    base_plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    ready = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        base_plan,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    challenged_plan = base_plan.model_copy(
+        update={
+            "objective": "高分但执行依赖尚未得到专业角色承诺",
+            "success_criteria": [
+                *base_plan.success_criteria,
+                "每个发布风险都有量化阈值、负责人和恢复时限",
+            ],
+        }
+    )
+    challenged = assess_execution_plan_candidate(
+        "risk_control",
+        "风险控制",
+        challenged_plan,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+
+    ready = attach_execution_plan_commitments(
+        ready,
+        [
+            parse_specialist_plan_commitment(
+                json.dumps(
+                    {
+                        "decision": "ACCEPT",
+                        "confidence": 0.9,
+                        "summary": "任务输入和交付边界完整。",
+                    },
+                    ensure_ascii=False,
+                ),
+                assignment.role,
+            )
+            for assignment in ready.plan.assignments
+        ],
+    )
+    challenged = attach_execution_plan_commitments(
+        challenged,
+        [
+            parse_specialist_plan_commitment(
+                json.dumps(
+                    {
+                        "decision": "CHALLENGE" if assignment.role == "operations_analyst" else "ACCEPT",
+                        "confidence": 0.94,
+                        "summary": (
+                            "缺少恢复演练环境，不能承诺当前交付。"
+                            if assignment.role == "operations_analyst"
+                            else "测试任务边界完整，可以执行。"
+                        ),
+                        "missing_inputs": (
+                            ["恢复演练环境"]
+                            if assignment.role == "operations_analyst"
+                            else []
+                        ),
+                        "dependency_concerns": [],
+                        "proposed_changes": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                assignment.role,
+            )
+            for assignment in challenged.plan.assignments
+        ],
+    )
+    arbiter_output = json.dumps(
+        {
+            "selected_candidate_id": "risk_control",
+            "selection_reason": "风险方案的确定性分数更高。",
+            "dissenting_candidate_ids": ["delivery_confidence"],
+            "dissent_summary": "交付方案分数略低。",
+        },
+        ensure_ascii=False,
+    )
+
+    deliberation = arbitrate_execution_plan_candidates(
+        arbiter_output,
+        [ready, challenged],
+    )
+
+    assert ready.commitment_status == "READY"
+    assert challenged.commitment_status == "CHALLENGED"
+    assert deliberation.selected_candidate_id == "delivery_confidence"
+    assert deliberation.arbitration_mode == "deterministic_fallback"
+    assert "执行者承诺" in deliberation.selection_reason
 
 
 def test_specialist_catalog_respects_frozen_tool_and_knowledge_permissions() -> None:

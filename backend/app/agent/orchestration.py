@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 from statistics import median
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -366,6 +366,40 @@ class ExecutionPlanCandidateCheck(BaseModel):
         return self
 
 
+CommitmentDetail = Annotated[str, Field(min_length=2, max_length=500)]
+
+
+class SpecialistPlanCommitment(BaseModel):
+    role: SpecialistRole
+    decision: Literal["ACCEPT", "CHALLENGE", "ABSTAIN"]
+    structured: bool
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    summary: str = Field(min_length=2, max_length=1000)
+    missing_inputs: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+    dependency_concerns: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+    proposed_changes: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_commitment_contract(self) -> "SpecialistPlanCommitment":
+        detail_groups = (
+            self.missing_inputs,
+            self.dependency_concerns,
+            self.proposed_changes,
+        )
+        if any(len(items) != len(set(items)) for items in detail_groups):
+            raise ValueError("specialist commitment details must be unique")
+        if self.structured:
+            if self.decision == "ABSTAIN" or self.confidence is None:
+                raise ValueError("structured commitments require a decision and confidence")
+        elif self.decision != "ABSTAIN" or self.confidence is not None:
+            raise ValueError("unstructured commitments must abstain without confidence")
+        if self.decision == "ACCEPT" and any(detail_groups):
+            raise ValueError("accepted commitments cannot contain blockers or proposed changes")
+        if self.decision == "CHALLENGE" and not any(detail_groups):
+            raise ValueError("challenged commitments require a concrete concern or proposed change")
+        return self
+
+
 class ExecutionPlanCandidate(BaseModel):
     candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
     perspective: str = Field(min_length=2, max_length=100)
@@ -374,6 +408,16 @@ class ExecutionPlanCandidate(BaseModel):
     checks: list[ExecutionPlanCandidateCheck] = Field(min_length=5, max_length=5)
     plan_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     duplicate_of: str | None = Field(default=None, pattern=r"^[a-z0-9_]{2,40}$")
+    commitments: list[SpecialistPlanCommitment] = Field(default_factory=list, max_length=4)
+    commitment_status: Literal[
+        "NOT_REVIEWED",
+        "READY",
+        "CHALLENGED",
+        "INCOMPLETE",
+    ] = "NOT_REVIEWED"
+    commitment_valid_count: int = Field(default=0, ge=0, le=4)
+    commitment_accept_count: int = Field(default=0, ge=0, le=4)
+    commitment_challenge_count: int = Field(default=0, ge=0, le=4)
 
     @model_validator(mode="after")
     def validate_score_contract(self) -> "ExecutionPlanCandidate":
@@ -386,6 +430,42 @@ class ExecutionPlanCandidate(BaseModel):
             raise ValueError("candidate score must equal the sum of its checks")
         if self.duplicate_of == self.candidate_id:
             raise ValueError("candidate cannot duplicate itself")
+        if not self.commitments:
+            if (
+                self.commitment_status != "NOT_REVIEWED"
+                or self.commitment_valid_count
+                or self.commitment_accept_count
+                or self.commitment_challenge_count
+            ):
+                raise ValueError("unreviewed candidates cannot contain commitment counts")
+            return self
+        assigned_roles = {assignment.role for assignment in self.plan.assignments}
+        commitment_roles = [commitment.role for commitment in self.commitments]
+        if len(commitment_roles) != len(set(commitment_roles)):
+            raise ValueError("specialist commitment roles must be unique")
+        if set(commitment_roles) != assigned_roles:
+            raise ValueError("specialist commitments must cover every assigned role")
+        valid_count = sum(commitment.structured for commitment in self.commitments)
+        accept_count = sum(
+            commitment.decision == "ACCEPT" for commitment in self.commitments
+        )
+        challenge_count = sum(
+            commitment.decision == "CHALLENGE" for commitment in self.commitments
+        )
+        expected_status = (
+            "READY"
+            if accept_count == len(self.commitments)
+            else "CHALLENGED"
+            if challenge_count
+            else "INCOMPLETE"
+        )
+        if (
+            self.commitment_valid_count != valid_count
+            or self.commitment_accept_count != accept_count
+            or self.commitment_challenge_count != challenge_count
+            or self.commitment_status != expected_status
+        ):
+            raise ValueError("specialist commitment summary does not match its evidence")
         return self
 
 
@@ -421,6 +501,14 @@ class ExecutionPlanDeliberation(BaseModel):
     def selected_plan(self) -> MultiAgentExecutionPlan:
         return next(
             candidate.plan
+            for candidate in self.candidates
+            if candidate.candidate_id == self.selected_candidate_id
+        )
+
+    @property
+    def selected_candidate(self) -> ExecutionPlanCandidate:
+        return next(
+            candidate
             for candidate in self.candidates
             if candidate.candidate_id == self.selected_candidate_id
         )
@@ -644,6 +732,40 @@ def assess_execution_plan_candidate(
         checks=checks,
         plan_fingerprint=fingerprint,
         duplicate_of=duplicate_of,
+    )
+
+
+def attach_execution_plan_commitments(
+    candidate: ExecutionPlanCandidate,
+    commitments: list[SpecialistPlanCommitment],
+) -> ExecutionPlanCandidate:
+    valid_count = sum(commitment.structured for commitment in commitments)
+    accept_count = sum(commitment.decision == "ACCEPT" for commitment in commitments)
+    challenge_count = sum(
+        commitment.decision == "CHALLENGE" for commitment in commitments
+    )
+    status = (
+        "READY"
+        if commitments and accept_count == len(commitments)
+        else "CHALLENGED"
+        if challenge_count
+        else "INCOMPLETE"
+    )
+    return ExecutionPlanCandidate.model_validate(
+        {
+            **candidate.model_dump(mode="json", exclude={
+                "commitments",
+                "commitment_status",
+                "commitment_valid_count",
+                "commitment_accept_count",
+                "commitment_challenge_count",
+            }),
+            "commitments": [commitment.model_dump(mode="json") for commitment in commitments],
+            "commitment_status": status,
+            "commitment_valid_count": valid_count,
+            "commitment_accept_count": accept_count,
+            "commitment_challenge_count": challenge_count,
+        }
     )
 
 
@@ -964,6 +1086,37 @@ def _json_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
+class _SpecialistPlanCommitmentResponse(BaseModel):
+    decision: Literal["ACCEPT", "CHALLENGE"]
+    confidence: float = Field(ge=0, le=1)
+    summary: str = Field(min_length=2, max_length=1000)
+    missing_inputs: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+    dependency_concerns: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+    proposed_changes: list[CommitmentDetail] = Field(default_factory=list, max_length=5)
+
+
+def parse_specialist_plan_commitment(
+    text: str,
+    role: SpecialistRole,
+) -> SpecialistPlanCommitment:
+    for candidate in _json_candidates(text):
+        try:
+            response = _SpecialistPlanCommitmentResponse.model_validate(json.loads(candidate))
+            return SpecialistPlanCommitment(
+                role=role,
+                structured=True,
+                **response.model_dump(mode="json"),
+            )
+        except (json.JSONDecodeError, ValidationError, ValueError):
+            continue
+    return SpecialistPlanCommitment(
+        role=role,
+        decision="ABSTAIN",
+        structured=False,
+        summary="Agent 未返回有效的结构化执行承诺，已记为弃权。",
+    )
+
+
 class _ExecutionPlanArbiterDecision(BaseModel):
     selected_candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
     selection_reason: str = Field(min_length=4, max_length=2000)
@@ -980,6 +1133,11 @@ def arbitrate_execution_plan_candidates(
     if not candidates:
         raise ValueError("execution plan arbitration requires at least one valid candidate")
     candidate_ids = {candidate.candidate_id for candidate in candidates}
+    ready_candidate_ids = {
+        candidate.candidate_id
+        for candidate in candidates
+        if candidate.commitment_status == "READY"
+    }
     distinct_candidate_count = len({candidate.plan_fingerprint for candidate in candidates})
     for raw_decision in _json_candidates(text):
         try:
@@ -987,6 +1145,8 @@ def arbitrate_execution_plan_candidates(
         except (json.JSONDecodeError, ValidationError):
             continue
         if decision.selected_candidate_id not in candidate_ids:
+            continue
+        if ready_candidate_ids and decision.selected_candidate_id not in ready_candidate_ids:
             continue
         dissenting_ids = list(dict.fromkeys(decision.dissenting_candidate_ids))
         if (
@@ -1005,7 +1165,20 @@ def arbitrate_execution_plan_candidates(
             distinct_candidate_count=distinct_candidate_count,
         )
 
-    selected = max(candidates, key=lambda candidate: (candidate.score, candidate.candidate_id))
+    commitment_rank = {
+        "READY": 2,
+        "NOT_REVIEWED": 1,
+        "INCOMPLETE": 1,
+        "CHALLENGED": 0,
+    }
+    selected = max(
+        candidates,
+        key=lambda candidate: (
+            commitment_rank[candidate.commitment_status],
+            candidate.score,
+            candidate.candidate_id,
+        ),
+    )
     alternatives = [
         candidate.candidate_id
         for candidate in candidates
@@ -1014,8 +1187,16 @@ def arbitrate_execution_plan_candidates(
     return ExecutionPlanDeliberation(
         selected_candidate_id=selected.candidate_id,
         selection_reason=(
-            f"独立仲裁输出不可用，已按确定性评分选择 {selected.perspective}方案"
+            f"独立仲裁未遵守执行者承诺门禁，已优先选择全员接受的"
+            f"{selected.perspective}方案（{selected.score}/100）。"
+            if ready_candidate_ids
+            else f"独立仲裁输出不可用，已按确定性评分选择 {selected.perspective}方案"
             f"（{selected.score}/100）。"
+            + (
+                "该方案仍有执行者质疑，必须经过人工审批。"
+                if selected.commitment_status == "CHALLENGED"
+                else ""
+            )
         ),
         arbitration_mode="deterministic_fallback",
         candidates=candidates,

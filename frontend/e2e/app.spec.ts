@@ -2833,6 +2833,41 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     { name: 'parallel_efficiency', label: '依赖并行效率', score: 8, max_score: 15, detail: '2 个分支编排为 2 个执行波次' },
     { name: 'delivery_balance', label: '交付防线完整性', score: 10, max_score: 10, detail: '质量、运营与目标显式领域能力均有责任分支' }
   ]
+  const acceptedCommitments = [
+    {
+      role: 'test_engineer',
+      decision: 'ACCEPT',
+      structured: true,
+      confidence: 0.93,
+      summary: '测试输入、能力与验收边界完整，可以执行。',
+      missing_inputs: [],
+      dependency_concerns: [],
+      proposed_changes: []
+    },
+    {
+      role: 'operations_analyst',
+      decision: 'ACCEPT',
+      structured: true,
+      confidence: 0.91,
+      summary: '发布基线、监控责任与恢复目标完整，可以执行。',
+      missing_inputs: [],
+      dependency_concerns: [],
+      proposed_changes: []
+    }
+  ]
+  const challengedCommitments = [
+    acceptedCommitments[0],
+    {
+      role: 'operations_analyst',
+      decision: 'CHALLENGE',
+      structured: true,
+      confidence: 0.89,
+      summary: '缺少生产错误预算基线，当前恢复目标不可验证。',
+      missing_inputs: ['生产错误预算基线'],
+      dependency_concerns: ['恢复演练不能依赖尚未确认的发布窗口'],
+      proposed_changes: ['补充错误预算和发布窗口后重新确认']
+    }
+  ]
   const deliveryCandidatePlan = {
     ...initialPlan,
     objective: '先建立完整验收责任，再汇总发布结论',
@@ -2857,7 +2892,12 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         score: 90,
         checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 8 } : check),
         plan_fingerprint: 'a'.repeat(64),
-        duplicate_of: null
+        duplicate_of: null,
+        commitments: acceptedCommitments,
+        commitment_status: 'READY',
+        commitment_valid_count: 2,
+        commitment_accept_count: 2,
+        commitment_challenge_count: 0
       },
       {
         candidate_id: 'risk_control',
@@ -2866,7 +2906,12 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         score: 92,
         checks: candidateChecks.map((check) => check.name === 'success_contract' ? { ...check, score: 24 } : check),
         plan_fingerprint: 'b'.repeat(64),
-        duplicate_of: null
+        duplicate_of: null,
+        commitments: acceptedCommitments,
+        commitment_status: 'READY',
+        commitment_valid_count: 2,
+        commitment_accept_count: 2,
+        commitment_challenge_count: 0
       },
       {
         candidate_id: 'parallel_efficiency',
@@ -2875,7 +2920,12 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         score: 97,
         checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 15 } : check),
         plan_fingerprint: 'c'.repeat(64),
-        duplicate_of: null
+        duplicate_of: null,
+        commitments: challengedCommitments,
+        commitment_status: 'CHALLENGED',
+        commitment_valid_count: 2,
+        commitment_accept_count: 1,
+        commitment_challenge_count: 1
       }
     ],
     dissenting_candidate_ids: ['delivery_confidence', 'parallel_efficiency'],
@@ -2940,9 +2990,10 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await page.route(/\/api\/v1\/workflow\/140\/saga-steps$/, (route) => route.fulfill({ json: [] }))
   await page.route(/\/api\/v1\/workflow\/140\/events\/history(?:\?.*)?$/, (route) => route.fulfill({
     json: [
-      { id: 1, workflow_id: 140, node: 'planning', event_type: 'PLAN_DELIBERATED', message: 'Plan deliberated', payload: { candidate_count: 3, distinct_candidate_count: 3, selected_candidate_id: 'risk_control' }, created_at: '2026-07-19T08:00:30Z' },
-      { id: 2, workflow_id: 140, node: 'planning', event_type: 'PLAN_CREATED', message: 'Plan created', payload: { approval_required: true }, created_at: '2026-07-19T08:00:31Z' },
-      { id: 3, workflow_id: 140, node: 'plan_review', event_type: 'PAUSED', message: 'Waiting for approval', payload: { approval_gate: 'plan_review' }, created_at: '2026-07-19T08:01:00Z' }
+      { id: 1, workflow_id: 140, node: 'planning', event_type: 'PLAN_COMMITMENTS_COLLECTED', message: 'Commitments collected', payload: { candidate_count: 3, ready_candidate_count: 2, commitment_count: 6, commitment_accept_count: 5, commitment_challenge_count: 1 }, created_at: '2026-07-19T08:00:29Z' },
+      { id: 2, workflow_id: 140, node: 'planning', event_type: 'PLAN_DELIBERATED', message: 'Plan deliberated', payload: { candidate_count: 3, distinct_candidate_count: 3, selected_candidate_id: 'risk_control' }, created_at: '2026-07-19T08:00:30Z' },
+      { id: 3, workflow_id: 140, node: 'planning', event_type: 'PLAN_CREATED', message: 'Plan created', payload: { approval_required: true }, created_at: '2026-07-19T08:00:31Z' },
+      { id: 4, workflow_id: 140, node: 'plan_review', event_type: 'PAUSED', message: 'Waiting for approval', payload: { approval_gate: 'plan_review' }, created_at: '2026-07-19T08:01:00Z' }
     ]
   }))
   await page.route(/\/api\/v1\/workflow\/140\/events$/, (route) => route.fulfill({
@@ -2967,9 +3018,17 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         ...initialDeliberation,
         selection_reason: '修订后的风险控制方案完整回应人工安全边界和负责人要求。',
         candidates: initialDeliberation.candidates.map((candidate) => (
-          candidate.candidate_id === 'risk_control'
-            ? { ...candidate, plan: revisedPlan, plan_fingerprint: 'd'.repeat(64) }
-            : candidate
+          {
+            ...candidate,
+            ...(candidate.candidate_id === 'risk_control'
+              ? { plan: revisedPlan, plan_fingerprint: 'd'.repeat(64) }
+              : {}),
+            commitments: challengedCommitments,
+            commitment_status: 'CHALLENGED',
+            commitment_valid_count: 2,
+            commitment_accept_count: 1,
+            commitment_challenge_count: 1
+          }
         ))
       }
       planWorkflow = {
@@ -3056,10 +3115,19 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await candidateEvidence.click()
   const riskCandidate = page.getByLabel('风险控制候选方案')
   await expect(riskCandidate.getByText('已选中', { exact: true })).toBeVisible()
+  await expect(riskCandidate.getByText('2/2 执行者接受', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('92/100', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('显式能力覆盖', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('30/30', { exact: true })).toBeVisible()
   await expect(page.getByLabel('并行效率候选方案').getByText('测试与运营并行验证后统一收敛', { exact: true })).toBeVisible()
+  const challengedCandidate = page.getByLabel('并行效率候选方案')
+  await expect(challengedCandidate.getByText('1 项执行质疑', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('运营分析师', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('质疑', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('承诺置信 89%', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('缺少生产错误预算基线，当前恢复目标不可验证。', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('生产错误预算基线', { exact: true })).toBeVisible()
+  await expect(challengedCandidate.getByText('补充错误预算和发布窗口后重新确认', { exact: true })).toBeVisible()
   await expect(page.locator('.plan-dissent-summary')).toContainText('并行方案总分更高，但对跨角色风险责任的先后约束不足；交付方案的失败恢复边界较弱。')
   await expect(page.locator('.orchestration-copy').getByText('测试先确认验收证据，运营再基于测试结论设计灰度和恢复。', { exact: true })).toBeVisible()
   await expect(page.locator('.orchestration-tags').getByText('2 个分支 · 2 波', { exact: true })).toBeVisible()
@@ -3083,6 +3151,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(reviseButton).toBeDisabled()
   await page.getByLabel('工作流人工反馈').fill('补充数据安全边界，并为回滚验收指定负责人')
   await reviseButton.click()
+  await expect(page.getByText('执行计划 v2 存在执行者质疑', { exact: true })).toBeVisible()
   await expect(page.locator('.orchestration-copy').getByText('补齐安全边界后的可恢复交付计划', { exact: true })).toBeVisible()
   await expect(page.getByText('相较 v1 的变化', { exact: true })).toBeVisible()
   await expect(page.getByText('调整总体目标', { exact: true })).toBeVisible()
@@ -3101,6 +3170,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(page.getByText('已批准', { exact: true })).toBeVisible()
   expect(decisions[1]).toMatchObject({ decision: 'APPROVE', human_feedback: '', plan_version: 1 })
   if (testInfo.project.name === 'mobile-chromium') {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
     for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
       await page.setViewportSize(viewport)
       await expect(page.getByLabel('多 Agent 执行计划')).toBeVisible()

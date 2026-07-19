@@ -19,6 +19,7 @@ from app.agent.orchestration import (
     SpecialistCapabilityProfile,
     arbitrate_execution_plan_candidates,
     assess_execution_plan_candidate,
+    attach_execution_plan_commitments,
     build_execution_waves,
     build_fallback_plan,
     build_specialist_capability_catalog,
@@ -31,6 +32,7 @@ from app.agent.orchestration import (
     infer_required_specialist_capabilities,
     merge_reviewer_panel,
     parse_execution_plan_candidate,
+    parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
 )
@@ -648,7 +650,134 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 fingerprints[assessment.plan_fingerprint] = assessment.candidate_id
             candidates.append(assessment)
 
-        if candidates:
+        generated_candidates = bool(candidates)
+        if not candidates:
+            fallback_plan = build_fallback_plan(state["user_input"], capability_catalog)
+            candidates = [
+                assess_execution_plan_candidate(
+                    "deterministic_fallback",
+                    "确定性兜底",
+                    fallback_plan,
+                    state["user_input"],
+                )
+            ]
+
+        async def run_commitment(candidate, assignment) -> str:
+            capability_profile = next(
+                profile
+                for profile in candidate.plan.team_capabilities
+                if profile.role == assignment.role
+            )
+            return await invoke_agent(
+                AgentRole(assignment.role),
+                (
+                    "你是执行前承诺 Agent。你只能审查分配给自己的 assignment，不能看到其他"
+                    "Agent 的承诺。只输出 JSON，字段为 decision、confidence、summary、"
+                    "missing_inputs、dependency_concerns、proposed_changes。decision 只能是 ACCEPT "
+                    "或 CHALLENGE。仅当输入、直接依赖、冻结能力和交付边界足以执行时选择 ACCEPT，"
+                    "且三个数组必须为空；存在阻塞时选择 CHALLENGE，并至少给出一项具体缺失输入、"
+                    "依赖风险或修改建议。不得虚构工具、权限、上游产物或改变其他角色任务。"
+                ),
+                json.dumps(
+                    agent_context(state, {
+                        "candidate_id": candidate.candidate_id,
+                        "planning_perspective": candidate.perspective,
+                        "workflow_objective": state["user_input"],
+                        "plan": {
+                            "objective": candidate.plan.objective,
+                            "rationale": candidate.plan.rationale,
+                            "success_criteria": candidate.plan.success_criteria,
+                        },
+                        "assignment": assignment.model_dump(mode="json"),
+                        "capability_profile": capability_profile.model_dump(mode="json"),
+                        "requirements": without_analysis(state["requirements"]),
+                        "architecture": state["architecture"],
+                    }),
+                    ensure_ascii=False,
+                ),
+                isolated_usage=True,
+            )
+
+        commitment_specs = [
+            (candidate.candidate_id, assignment.role, candidate, assignment)
+            for candidate in candidates
+            for assignment in candidate.plan.assignments
+        ]
+        commitment_results = await asyncio.gather(
+            *(
+                run_commitment(candidate, assignment)
+                for _candidate_id, _role, candidate, assignment in commitment_specs
+            ),
+            return_exceptions=True,
+        )
+        cancellation = next(
+            (
+                result
+                for result in commitment_results
+                if isinstance(result, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancellation:
+            raise cancellation
+        commitments_by_candidate = {
+            candidate.candidate_id: {}
+            for candidate in candidates
+        }
+        for (candidate_id, role, _candidate, _assignment), result in zip(
+            commitment_specs,
+            commitment_results,
+            strict=True,
+        ):
+            commitments_by_candidate[candidate_id][role] = parse_specialist_plan_commitment(
+                result if isinstance(result, str) else "",
+                role,
+            )
+        candidates = [
+            attach_execution_plan_commitments(
+                candidate,
+                [
+                    commitments_by_candidate[candidate.candidate_id][assignment.role]
+                    for assignment in candidate.plan.assignments
+                ],
+            )
+            for candidate in candidates
+        ]
+        commitments = [
+            commitment
+            for candidate in candidates
+            for commitment in candidate.commitments
+        ]
+        record_workflow_event(
+            db,
+            workflow,
+            "PLAN_COMMITMENTS_COLLECTED",
+            "Specialist execution commitments collected for plan candidates",
+            node="planning",
+            payload={
+                "candidate_count": len(candidates),
+                "ready_candidate_count": sum(
+                    candidate.commitment_status == "READY"
+                    for candidate in candidates
+                ),
+                "commitment_count": len(commitments),
+                "commitment_accept_count": sum(
+                    commitment.decision == "ACCEPT"
+                    for commitment in commitments
+                ),
+                "commitment_challenge_count": sum(
+                    commitment.decision == "CHALLENGE"
+                    for commitment in commitments
+                ),
+                "commitment_abstain_count": sum(
+                    commitment.decision == "ABSTAIN"
+                    for commitment in commitments
+                ),
+                "revision_count": int(state.get("plan_revision_count", 0)),
+            },
+        )
+
+        if generated_candidates:
             try:
                 arbiter_output = await invoke_agent(
                     AgentRole.architect,
@@ -656,7 +785,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "你是独立执行计划仲裁 Agent。只输出 JSON，字段为 selected_candidate_id、"
                         "selection_reason、dissenting_candidate_ids、dissent_summary。"
                         "只能选择输入中已通过服务端硬校验的 candidate_id，不得改写计划。"
-                        "综合目标适配、五项确定性评分和候选取舍作出选择；如选择非最高分方案，"
+                        "如存在 commitment_status=READY 的候选，只能从 READY 候选中选择。"
+                        "综合目标适配、五项确定性评分、执行者承诺和候选取舍作出选择；如选择非最高分方案，"
                         "selection_reason 必须说明评分未覆盖的关键原因。保留主要少数方案及其取舍。"
                     ),
                     json.dumps(
@@ -675,15 +805,6 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 logger.warning("Plan arbitration failed with %s", type(exc).__name__)
                 arbiter_output = ""
         else:
-            fallback_plan = build_fallback_plan(state["user_input"], capability_catalog)
-            candidates = [
-                assess_execution_plan_candidate(
-                    "deterministic_fallback",
-                    "确定性兜底",
-                    fallback_plan,
-                    state["user_input"],
-                )
-            ]
             arbiter_output = ""
 
         deliberation = arbitrate_execution_plan_candidates(
@@ -693,7 +814,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         )
         plan = deliberation.selected_plan
         deliberation_snapshot = deliberation.model_dump(mode="json")
-        approval_required = bool(state.get("require_plan_approval", False))
+        approval_required = bool(
+            state.get("require_plan_approval", False)
+            or deliberation.selected_candidate.commitment_status == "CHALLENGED"
+        )
         revisions = state.get("plan_revisions")
         revisions = revisions if isinstance(revisions, list) else []
         plan_version = max(
@@ -760,6 +884,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "plan_version": plan_version,
             "plan_revisions": plan_revisions,
             "plan_deliberation": deliberation_snapshot,
+            "require_plan_approval": approval_required,
             "messages": append_message(
                 state,
                 "planning_agent",

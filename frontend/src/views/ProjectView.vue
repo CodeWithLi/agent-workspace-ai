@@ -159,6 +159,9 @@
             </div>
             <div class="plan-deliberation-tags">
               <el-tag type="primary">{{ planArbitrationModeLabel }}</el-tag>
+              <el-tag v-if="selectedPlanCandidate" :type="candidateCommitmentType(selectedPlanCandidate)">
+                选中方案 · {{ candidateCommitmentLabel(selectedPlanCandidate) }}
+              </el-tag>
               <el-tag v-if="selectedPlanDeliberation.invalid_candidate_count" type="warning">
                 {{ selectedPlanDeliberation.invalid_candidate_count }} 个无效候选已隔离
               </el-tag>
@@ -187,6 +190,9 @@
                     <span>{{ candidate.plan.objective }}</span>
                   </div>
                   <div class="plan-candidate-status">
+                    <el-tag :type="candidateCommitmentType(candidate)">
+                      {{ candidateCommitmentLabel(candidate) }}
+                    </el-tag>
                     <el-tag :type="candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? 'success' : 'info'">
                       {{ candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? '已选中' : '备选' }}
                     </el-tag>
@@ -199,6 +205,48 @@
                   <span>{{ candidateTopologyLabel(candidate.plan) }}</span>
                   <span v-if="candidate.duplicate_of">与 {{ candidatePerspectiveLabel(candidate.duplicate_of) }} 结构相同</span>
                 </div>
+                <section
+                  v-if="candidate.commitments?.length"
+                  class="plan-commitment-evidence"
+                  :aria-label="`${candidate.perspective}执行前承诺`"
+                >
+                  <header>
+                    <strong>执行前承诺</strong>
+                    <span>{{ candidate.commitment_valid_count || 0 }}/{{ candidate.plan.assignments.length }} 份有效合同</span>
+                  </header>
+                  <ul>
+                    <li
+                      v-for="commitment in candidate.commitments"
+                      :key="commitment.role"
+                      :class="`is-${commitment.decision.toLowerCase()}`"
+                    >
+                      <header>
+                        <strong>{{ specialistRoleLabel(commitment.role) }}</strong>
+                        <div>
+                          <el-tag :type="commitmentDecisionType(commitment.decision)" size="small">
+                            {{ commitmentDecisionLabel(commitment.decision) }}
+                          </el-tag>
+                          <span v-if="commitment.confidence !== null">承诺置信 {{ Math.round(commitment.confidence * 100) }}%</span>
+                        </div>
+                      </header>
+                      <p>{{ commitment.summary }}</p>
+                      <dl v-if="commitmentHasDetails(commitment)">
+                        <div v-if="commitment.missing_inputs.length">
+                          <dt>缺失输入</dt>
+                          <dd><span v-for="item in commitment.missing_inputs" :key="item">{{ item }}</span></dd>
+                        </div>
+                        <div v-if="commitment.dependency_concerns.length">
+                          <dt>依赖风险</dt>
+                          <dd><span v-for="item in commitment.dependency_concerns" :key="item">{{ item }}</span></dd>
+                        </div>
+                        <div v-if="commitment.proposed_changes.length">
+                          <dt>修改建议</dt>
+                          <dd><span v-for="item in commitment.proposed_changes" :key="item">{{ item }}</span></dd>
+                        </div>
+                      </dl>
+                    </li>
+                  </ul>
+                </section>
                 <dl class="plan-candidate-checks">
                   <div v-for="check in candidate.checks" :key="check.name">
                     <dt><span>{{ check.label }}</span><strong>{{ check.score }}/{{ check.max_score }}</strong></dt>
@@ -620,6 +668,17 @@ interface WorkflowPlanCandidateCheck {
   detail: string
 }
 
+interface WorkflowPlanCommitment {
+  role: string
+  decision: 'ACCEPT' | 'CHALLENGE' | 'ABSTAIN'
+  structured: boolean
+  confidence: number | null
+  summary: string
+  missing_inputs: string[]
+  dependency_concerns: string[]
+  proposed_changes: string[]
+}
+
 interface WorkflowPlanCandidate {
   candidate_id: string
   perspective: string
@@ -628,6 +687,11 @@ interface WorkflowPlanCandidate {
   checks: WorkflowPlanCandidateCheck[]
   plan_fingerprint: string
   duplicate_of?: string | null
+  commitments?: WorkflowPlanCommitment[]
+  commitment_status?: 'NOT_REVIEWED' | 'READY' | 'CHALLENGED' | 'INCOMPLETE'
+  commitment_valid_count?: number
+  commitment_accept_count?: number
+  commitment_challenge_count?: number
 }
 
 interface WorkflowPlanDeliberation {
@@ -806,13 +870,21 @@ const workflowFeedbackRequired = computed(() => (
 ))
 const workflowApprovalTitle = computed(() => {
   if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
-  if (workflowPlanReview.value) return `执行计划 v${displayedPlanVersion.value} 等待批准`
+  if (workflowPlanReview.value) {
+    return selectedPlanCandidate.value?.commitment_status === 'CHALLENGED'
+      ? `执行计划 v${displayedPlanVersion.value} 存在执行者质疑`
+      : `执行计划 v${displayedPlanVersion.value} 等待批准`
+  }
   if (workflowSpecialistReview.value) return '专业分支等待人工恢复'
   return workflowCurrentNode.value === 'quality_review' ? '质量门禁等待修订意见' : '最终报告等待人工确认'
 })
 const workflowApprovalDescription = computed(() => {
   if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
-  if (workflowPlanReview.value) return '核对角色、依赖、交付物和成功标准。批准后将按依赖波次启动专业 Agent；需要调整时请填写具体意见。'
+  if (workflowPlanReview.value) {
+    return selectedPlanCandidate.value?.commitment_status === 'CHALLENGED'
+      ? '核对执行者提出的缺失输入、依赖风险和修改建议。批准会按当前计划继续；需要消除质疑时请填写具体意见并重新规划。'
+      : '核对角色、依赖、交付物、成功标准和执行者承诺。批准后将按依赖波次启动专业 Agent；需要调整时请填写具体意见。'
+  }
   if (workflowSpecialistReview.value) return '定向重试会保留成功交接并继续失败分支及其下游；重新规划会丢弃旧分支产物并生成新的计划版本。'
   return workflowCurrentNode.value === 'quality_review'
     ? '说明需要补充的证据、取舍或负责人；Agent 将重新执行未通过的专业分支。'
@@ -892,6 +964,11 @@ const selectedPlanDeliberation = computed<WorkflowPlanDeliberation | null>(() =>
   }
   return null
 })
+const selectedPlanCandidate = computed(() => (
+  selectedPlanDeliberation.value?.candidates.find((candidate) => (
+    candidate.candidate_id === selectedPlanDeliberation.value?.selected_candidate_id
+  )) || null
+))
 const planArbitrationModeLabel = computed(() => (
   selectedPlanDeliberation.value?.arbitration_mode === 'independent_arbiter'
     ? '架构师独立仲裁'
@@ -975,6 +1052,45 @@ function candidatePerspectiveLabel(candidateId: string) {
   return selectedPlanDeliberation.value?.candidates.find((candidate) => (
     candidate.candidate_id === candidateId
   ))?.perspective || candidateId
+}
+
+function candidateCommitmentLabel(candidate: WorkflowPlanCandidate) {
+  if (candidate.commitment_status === 'READY') {
+    return `${candidate.commitment_accept_count || 0}/${candidate.plan.assignments.length} 执行者接受`
+  }
+  if (candidate.commitment_status === 'CHALLENGED') {
+    return `${candidate.commitment_challenge_count || 0} 项执行质疑`
+  }
+  if (candidate.commitment_status === 'INCOMPLETE') {
+    return `${candidate.commitment_valid_count || 0}/${candidate.plan.assignments.length} 份有效承诺`
+  }
+  return '未收集执行承诺'
+}
+
+function candidateCommitmentType(candidate: WorkflowPlanCandidate): 'success' | 'warning' | 'info' {
+  if (candidate.commitment_status === 'READY') return 'success'
+  if (candidate.commitment_status === 'CHALLENGED') return 'warning'
+  return 'info'
+}
+
+function commitmentDecisionLabel(decision: WorkflowPlanCommitment['decision']) {
+  return { ACCEPT: '接受', CHALLENGE: '质疑', ABSTAIN: '弃权' }[decision]
+}
+
+function commitmentDecisionType(
+  decision: WorkflowPlanCommitment['decision']
+): 'success' | 'warning' | 'info' {
+  if (decision === 'ACCEPT') return 'success'
+  if (decision === 'CHALLENGE') return 'warning'
+  return 'info'
+}
+
+function commitmentHasDetails(commitment: WorkflowPlanCommitment) {
+  return Boolean(
+    commitment.missing_inputs.length
+    || commitment.dependency_concerns.length
+    || commitment.proposed_changes.length
+  )
 }
 const executionPlanApprovalLabel = computed(() => {
   if (!workflowState.value?.require_plan_approval) return ''
@@ -1204,6 +1320,7 @@ function workflowEventLabel(eventType: string) {
     NODE_STARTED: '开始节点',
     NODE_COMPLETED: '完成节点',
     NODE_FAILED: '节点执行失败',
+    PLAN_COMMITMENTS_COLLECTED: '执行承诺已收集',
     PLAN_DELIBERATED: '候选计划已仲裁',
     PLAN_CREATED: '计划已生成',
     PLAN_APPROVED: '计划已批准',
@@ -2162,6 +2279,106 @@ onBeforeUnmount(disposeWorkflowEventStream)
   content: "·";
 }
 
+.plan-commitment-evidence {
+  margin-top: 2px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.plan-commitment-evidence > header,
+.plan-commitment-evidence li > header,
+.plan-commitment-evidence li > header > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+}
+
+.plan-commitment-evidence > header {
+  min-height: 36px;
+  padding: 7px 0;
+}
+
+.plan-commitment-evidence > header strong,
+.plan-commitment-evidence li > header strong {
+  font-size: 11px;
+}
+
+.plan-commitment-evidence > header span,
+.plan-commitment-evidence li > header span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-commitment-evidence ul {
+  margin: 0;
+  padding: 0;
+  border-block: 1px solid var(--color-border);
+  list-style: none;
+}
+
+.plan-commitment-evidence li {
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+}
+
+.plan-commitment-evidence li + li {
+  border-top: 1px solid var(--color-border);
+}
+
+.plan-commitment-evidence li.is-challenge {
+  box-shadow: inset 3px 0 0 var(--color-warning);
+}
+
+.plan-commitment-evidence li.is-abstain {
+  box-shadow: inset 3px 0 0 var(--color-border-strong);
+}
+
+.plan-commitment-evidence li > p {
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.plan-commitment-evidence dl {
+  display: grid;
+  gap: 5px;
+  margin: 2px 0 0;
+  padding-top: 7px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.plan-commitment-evidence dl > div {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.plan-commitment-evidence dt,
+.plan-commitment-evidence dd {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plan-commitment-evidence dt {
+  color: var(--color-muted-text);
+  font-weight: 650;
+}
+
+.plan-commitment-evidence dd {
+  color: var(--color-secondary-text);
+}
+
+.plan-commitment-evidence dd span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .plan-candidate-checks {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -3044,6 +3261,11 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .plan-candidate-checks {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plan-commitment-evidence dl > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1px;
   }
 
   .decision-ledger-heading {

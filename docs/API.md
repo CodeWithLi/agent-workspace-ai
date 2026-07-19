@@ -122,6 +122,8 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 每个计划版本包含三个彼此隔离的 Planner 候选视角。服务端只接受通过能力和 DAG 合同的候选，并记录五项总计 100 分的确定性检查；架构师仲裁只能选择已有 `candidate_id`，不能通过响应改写计划。仲裁失败时自动选择确定性最高分候选，全部候选无效时使用能力感知的服务端计划。响应状态中的 `plan_deliberation` 和 `plan_revisions[].deliberation` 保存候选、结构指纹、评分、选择依据和少数意见；缺少这些字段的历史运行保持兼容。选择历史 `plan_version` 批准或重规划时，服务端同步切换计划与仲裁证据。`PLAN_DELIBERATED` 事件只公开候选数量、不同结构数、无效候选数、选中 ID、仲裁模式和分数，不返回候选正文。
 
+每个合法候选在仲裁前由其 assignment 对应的冻结专业 Agent 并发生成执行承诺。`commitments` 包含角色、`ACCEPT|CHALLENGE|ABSTAIN`、结构化状态、置信度、摘要、缺失输入、依赖风险和修改建议，并汇总为 `READY|CHALLENGED|INCOMPLETE`。存在 `READY` 候选时服务端拒绝架构师选择其他状态；最终选中 `CHALLENGED` 候选时自动把 `require_plan_approval` 设为 true。`PLAN_COMMITMENTS_COLLECTED` 事件只公开候选、就绪、接受、质疑和弃权计数，不公开承诺正文、置信度或具体问题。
+
 追踪接口中，管理员可汇总和查看全平台工作流；普通成员只查看本人发起且当前仍有项目读取权限的工作流。指定无权访问的 `project_id`、跨租户运行或无权限的对比对象统一返回 `404`。基线对比要求两个不同运行属于同一项目且均已结束，否则返回 `400`。总运行数、状态、Token、成本和每日趋势使用完整数据库聚合；P95、Agent 分布、节点瓶颈和 SLO 健康度使用有上限的最近样本，截断时 `window.analysis_truncated=true`。异常检测使用同项目较旧运行的中位数绝对偏差（MAD）构造动态上界，并同时报告失败和静态 SLO 超限。追踪、健康和对比响应不返回 `state_json`、Prompt、人工反馈或产物正文，事件 payload 只公开角色、轮次、下一节点、质量分数等允许的运行元数据。
 
 告警状态只能按 `OPEN -> ACKNOWLEDGED -> RESOLVED` 前进，也允许 `OPEN` 直接解决；已解决告警不可退回。`workflow_id` 唯一约束和嵌套事务保证多副本扫描不会重复创建告警或通知。新告警默认发送站内通知；开启 `OBSERVABILITY_ALERT_EMAIL_ENABLED` 后同时进入现有邮件投递队列。创建、确认和解决均写入审计日志，告警内容不保存 Prompt、错误正文、工作流状态或产物。

@@ -211,6 +211,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     db.add(project)
     db.commit()
     planner_prompts: list[str] = []
+    commitment_contexts: list[dict] = []
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         if "动态编排器" in system_prompt:
@@ -258,6 +259,20 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                 },
                 ensure_ascii=False,
             )
+        if "执行前承诺 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            commitment_contexts.append(context)
+            return json.dumps(
+                {
+                    "decision": "ACCEPT",
+                    "confidence": 0.92,
+                    "summary": "任务输入、依赖、能力和交付边界完整，可以执行。",
+                    "missing_inputs": [],
+                    "dependency_concerns": [],
+                    "proposed_changes": [],
+                },
+                ensure_ascii=False,
+            )
         if "专业交接 Agent" in system_prompt:
             return (
                 "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
@@ -301,6 +316,20 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert first_state["plan_deliberation"]["selected_candidate_id"] == "risk_control"
     assert first_state["plan_deliberation"]["arbitration_mode"] == "independent_arbiter"
     assert len(first_state["plan_deliberation"]["candidates"]) == 3
+    assert all(
+        candidate["commitment_status"] == "READY"
+        and candidate["commitment_accept_count"] == 2
+        for candidate in first_state["plan_deliberation"]["candidates"]
+    )
+    assert len(commitment_contexts) == 6
+    assert {
+        (context["candidate_id"], context["assignment"]["role"])
+        for context in commitment_contexts
+    } == {
+        (candidate_id, role)
+        for candidate_id in ("delivery_confidence", "risk_control", "parallel_efficiency")
+        for role in ("test_engineer", "operations_analyst")
+    }
     assert first_state["plan_revisions"][0]["deliberation"] == first_state["plan_deliberation"]
     first_assignments = first_state["execution_plan"]["assignments"]
     assert all(assignment["required_capabilities"] for assignment in first_assignments)
@@ -345,6 +374,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert revised_state["plan_approved"] is False
     assert revised_state["plan_revisions"][1]["deliberation"]["selected_candidate_id"] == "risk_control"
     assert len(planner_prompts) == 6
+    assert len(commitment_contexts) == 12
     assert "补充安全边界" in planner_prompts[-1]
     assert "首版交付计划" in planner_prompts[-1]
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
@@ -366,6 +396,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert len(historical_revision_state["plan_revisions"]) == 3
     assert historical_revision_state["plan_revisions"][2]["feedback"] == "基于首版重新规划，保留原始交付边界"
     assert len(planner_prompts) == 9
+    assert len(commitment_contexts) == 18
     assert "基于首版重新规划" in planner_prompts[-1]
     assert "首版交付计划" in planner_prompts[-1]
     assert "修订后的可审计交付计划" not in planner_prompts[-1]
@@ -401,6 +432,131 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
         .order_by(WorkflowEvent.id.desc())
     )
     assert json.loads(approved_event.payload_json)["plan_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="commitment-gate@example.com", name="Commitment Gate", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Commitment Gate", description="Challenge before dispatch", owner_id=user.id)
+    db.add(project)
+    db.commit()
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "动态编排器" in system_prompt:
+            return json.dumps(
+                {
+                    "objective": "形成执行者确认边界的可恢复交付计划",
+                    "rationale": "质量与运营角色分别确认任务和恢复责任",
+                    "assignments": [
+                        {
+                            "role": "test_engineer",
+                            "objective": "验证核心路径、边界状态和验收证据",
+                            "deliverable": "可复现验收清单",
+                        },
+                        {
+                            "role": "operations_analyst",
+                            "objective": "验证监控、灰度发布和故障恢复",
+                            "deliverable": "发布与回滚运行手册",
+                        },
+                    ],
+                    "success_criteria": [
+                        "核心路径都有可复现证据和负责人",
+                        "失败场景都有告警阈值和回滚条件",
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "执行前承诺 Agent" in system_prompt:
+            assignment = json.loads(user_prompt)["assignment"]
+            challenged = assignment["role"] == "operations_analyst"
+            return json.dumps(
+                {
+                    "decision": "CHALLENGE" if challenged else "ACCEPT",
+                    "confidence": 0.9,
+                    "summary": (
+                        "缺少生产错误预算基线，当前不能承诺恢复目标。"
+                        if challenged
+                        else "测试输入和交付边界完整，可以执行。"
+                    ),
+                    "missing_inputs": ["生产错误预算基线"] if challenged else [],
+                    "dependency_concerns": [],
+                    "proposed_changes": ["补充基线后再批准计划"] if challenged else [],
+                },
+                ensure_ascii=False,
+            )
+        if "独立执行计划仲裁 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "selected_candidate_id": "risk_control",
+                    "selection_reason": "保留风险方案并交由人工计划处理执行者质疑。",
+                    "dissenting_candidate_ids": ["delivery_confidence", "parallel_efficiency"],
+                    "dissent_summary": "三个候选均缺少同一生产基线。",
+                },
+                ensure_ascii=False,
+            )
+        if "专业交接 Agent" in system_prompt:
+            return (
+                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
+                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
+                "所有结论均与用户目标和成功标准建立可追溯关系。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 95,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "质量门禁通过。",
+                },
+                ensure_ascii=False,
+            )
+        if "报告生成器" in system_prompt:
+            return "# 最终报告\n\n执行者质疑已经人工计划批准。"
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    workflow = await run_workspace_graph(
+        db,
+        project,
+        user.id,
+        "构建需要灰度发布和故障恢复的会员平台",
+        pause_before_report=False,
+        require_plan_approval=False,
+    )
+    paused_state = json.loads(workflow.state_json)
+
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "plan_review"
+    assert paused_state["require_plan_approval"] is True
+    assert paused_state["plan_approved"] is False
+    selected = next(
+        candidate
+        for candidate in paused_state["plan_deliberation"]["candidates"]
+        if candidate["candidate_id"] == paused_state["plan_deliberation"]["selected_candidate_id"]
+    )
+    assert selected["commitment_status"] == "CHALLENGED"
+    assert selected["commitment_challenge_count"] == 1
+    assert paused_state["specialist_handoffs"] == []
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
+    event_types = list(
+        db.scalars(
+            select(WorkflowEvent.event_type)
+            .where(WorkflowEvent.workflow_id == workflow.id)
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert event_types.count("PLAN_COMMITMENTS_COLLECTED") == 1
+
+    workflow = await continue_workspace_graph(db, workflow, decision="APPROVE")
+    assert workflow.status == WorkflowStatus.completed
+    assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) >= 4
 
 
 @pytest.mark.asyncio
