@@ -16,6 +16,29 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
 
     statements: list[str] = []
 
+    def add_current_timestamp_column(table: str, column: str) -> None:
+        if dialect == "sqlite":
+            statements.append(f"ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP")
+            statements.append(
+                f"UPDATE {table} SET {column} = CURRENT_TIMESTAMP WHERE {column} IS NULL"
+            )
+            statements.append(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS set_{table}_{column}_after_insert
+                AFTER INSERT ON {table}
+                FOR EACH ROW WHEN NEW.{column} IS NULL
+                BEGIN
+                    UPDATE {table}
+                    SET {column} = CURRENT_TIMESTAMP
+                    WHERE rowid = NEW.rowid;
+                END
+                """
+            )
+            return
+        statements.append(
+            f"ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
+
     user_columns = columns("users")
     if "is_active" not in user_columns:
         statements.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT true")
@@ -28,7 +51,7 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     if "projects" in tables and "status" not in project_columns:
         statements.append("ALTER TABLE projects ADD COLUMN status VARCHAR(30) DEFAULT 'ACTIVE'")
     if "projects" in tables and "updated_at" not in project_columns:
-        statements.append("ALTER TABLE projects ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        add_current_timestamp_column("projects", "updated_at")
 
     tool_columns = columns("agent_tools")
     if "allowed_roles" not in tool_columns:
@@ -61,7 +84,7 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     for table in ("requirements", "meetings", "reports"):
         table_columns = columns(table)
         if table in tables and "updated_at" not in table_columns:
-            statements.append(f"ALTER TABLE {table} ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            add_current_timestamp_column(table, "updated_at")
 
     workflow_columns = columns("workflow_runs")
     if "workflow_runs" in tables and "request_id" not in workflow_columns:
@@ -170,7 +193,6 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
         "error": "TEXT DEFAULT ''",
         "locked_at": "TIMESTAMP",
         "indexed_at": "TIMESTAMP",
-        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         "active_index_version": "INTEGER DEFAULT 0",
         "pending_index_version": "INTEGER",
         "parser_name": "VARCHAR(100) DEFAULT ''",
@@ -184,6 +206,8 @@ def run_lightweight_migrations(bind: Engine | Connection) -> None:
     for name, definition in document_additions.items():
         if "documents" in tables and name not in document_columns:
             statements.append(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+    if "documents" in tables and "updated_at" not in document_columns:
+        add_current_timestamp_column("documents", "updated_at")
     if "documents" in tables and "dedup_key" not in document_columns:
         statements.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_documents_dedup_key ON documents(dedup_key)")
     if "documents" in tables and "active_index_version" not in document_columns:

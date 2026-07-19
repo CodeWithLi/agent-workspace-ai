@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agent.service import ensure_default_agents
-from app.agent.team_performance import build_team_performance_profile
+from app.agent.team_performance import TeamPerformanceProfile, build_team_performance_profile
 from app.langgraph.workflow import snapshot_agent_configs
 from app.models import (
     Agent,
@@ -235,6 +235,16 @@ def test_team_performance_profile_aggregates_final_role_outcomes_and_telemetry(
     assert unobserved is not None
     assert unobserved.sample_count == 0
     assert unobserved.evidence_level == "INSUFFICIENT"
+    legacy_snapshot = profile.model_dump(mode="json")
+    legacy_snapshot.pop("capability_contexts")
+    for item in legacy_snapshot["roles"]:
+        item.pop("required_capabilities")
+        item.pop("context_match")
+
+    restored = TeamPerformanceProfile.model_validate(legacy_snapshot)
+
+    assert restored.capability_contexts == []
+    assert all(item.context_match == "ROLE_AGGREGATE" for item in restored.roles)
 
 
 def test_team_performance_profile_excludes_stale_agent_configs_and_counts_quality_failures(
@@ -318,3 +328,145 @@ def test_team_performance_profile_excludes_stale_agent_configs_and_counts_qualit
     assert evidence.quality_failure_rate == pytest.approx(1 / 3, abs=0.0001)
     assert evidence.reliability_score == pytest.approx(0.7812)
     assert evidence.evidence_level == "LOW"
+
+
+def test_team_performance_profile_partitions_exact_capability_contracts(
+    db: Session,
+) -> None:
+    ensure_default_agents(db)
+    user = User(email="capability-context@example.com", name="Context", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Capability Context", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    current_snapshot = snapshot_agent_configs(db)
+    started = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    acceptance_contract = ["quality_assurance", "acceptance_evidence"]
+    boundary_contract = ["boundary_analysis"]
+
+    def add_sample(
+        index: int,
+        capabilities: list[str] | None,
+        *,
+        snapshot: dict | None = None,
+        succeeded: bool = True,
+    ) -> None:
+        state: dict = {"agent_snapshot": snapshot or current_snapshot}
+        if capabilities is not None:
+            state["execution_plan"] = {
+                "assignments": [
+                    {
+                        "role": "test_engineer",
+                        "required_capabilities": capabilities,
+                    }
+                ]
+            }
+        timestamp = started + timedelta(minutes=index)
+        workflow = create_terminal_workflow(
+            db,
+            project,
+            user,
+            WorkflowStatus.completed if succeeded else WorkflowStatus.failed,
+            timestamp,
+            state=state,
+        )
+        add_branch_event(db, workflow.id, "BRANCH_STARTED", "test_engineer", timestamp)
+        add_branch_event(
+            db,
+            workflow.id,
+            "BRANCH_COMPLETED" if succeeded else "BRANCH_FAILED",
+            "test_engineer",
+            timestamp + timedelta(seconds=1),
+        )
+
+    for index in range(3):
+        add_sample(index, list(reversed(acceptance_contract)))
+    add_sample(3, boundary_contract)
+    add_sample(4, boundary_contract, succeeded=False)
+    add_sample(5, None)
+    stale_snapshot = json.loads(json.dumps(current_snapshot))
+    stale_snapshot["test_engineer"]["model"] = "stale-model"
+    add_sample(6, acceptance_contract, snapshot=stale_snapshot)
+    db.commit()
+
+    profile = build_team_performance_profile(
+        db,
+        project.id,
+        roles=["test_engineer"],
+        current_agent_snapshot=current_snapshot,
+        now=started + timedelta(hours=1),
+    )
+
+    aggregate = profile.for_role("test_engineer")
+    assert aggregate is not None
+    assert aggregate.context_match == "ROLE_AGGREGATE"
+    assert aggregate.required_capabilities == []
+    assert aggregate.sample_count == 6
+    assert aggregate.success_count == 5
+    assert aggregate.excluded_sample_count == 1
+    assert [
+        (item.required_capabilities, item.sample_count, item.excluded_sample_count)
+        for item in profile.capability_contexts
+    ] == [
+        (["acceptance_evidence", "quality_assurance"], 3, 1),
+        (["boundary_analysis"], 2, 0),
+    ]
+    assert all(item.context_match == "EXACT" for item in profile.capability_contexts)
+
+
+def test_team_performance_profile_bounds_capability_contexts_per_role(
+    db: Session,
+) -> None:
+    ensure_default_agents(db)
+    user = User(email="bounded-context@example.com", name="Bounded", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Bounded Context", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    current_snapshot = snapshot_agent_configs(db)
+    started = datetime(2026, 7, 19, 14, 0, tzinfo=timezone.utc)
+
+    for index in range(12):
+        timestamp = started + timedelta(minutes=index)
+        workflow = create_terminal_workflow(
+            db,
+            project,
+            user,
+            WorkflowStatus.completed,
+            timestamp,
+            state={
+                "agent_snapshot": current_snapshot,
+                "execution_plan": {
+                    "assignments": [
+                        {
+                            "role": "test_engineer",
+                            "required_capabilities": [f"capability_{index:02d}"],
+                        }
+                    ]
+                },
+            },
+        )
+        add_branch_event(db, workflow.id, "BRANCH_STARTED", "test_engineer", timestamp)
+        add_branch_event(
+            db,
+            workflow.id,
+            "BRANCH_COMPLETED",
+            "test_engineer",
+            timestamp + timedelta(seconds=1),
+        )
+    db.commit()
+
+    profile = build_team_performance_profile(
+        db,
+        project.id,
+        roles=["test_engineer"],
+        current_agent_snapshot=current_snapshot,
+    )
+
+    assert profile.branch_sample_count == 12
+    assert len(profile.capability_contexts) == 10
+    assert [
+        item.required_capabilities for item in profile.capability_contexts
+    ] == [[f"capability_{index:02d}"] for index in range(10)]

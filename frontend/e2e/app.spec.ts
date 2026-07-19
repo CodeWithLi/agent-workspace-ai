@@ -2880,6 +2880,7 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
 })
 
 test('reviews, replans and approves an execution plan before specialist dispatch', async ({ page }, testInfo) => {
+  test.slow()
   let workflowStarted = false
   let runPayload: Record<string, unknown> = {}
   const decisions: Array<Record<string, unknown>> = []
@@ -2906,8 +2907,8 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     }
   ]
   const candidateRoleEvidence = [
-    { role: 'test_engineer', sample_count: 12, excluded_sample_count: 3, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, quality_failure_count: 1, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, quality_failure_rate: 0.0833, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
-    { role: 'operations_analyst', sample_count: 8, excluded_sample_count: 2, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, quality_failure_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, quality_failure_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' }
+    { role: 'test_engineer', required_capabilities: ['acceptance_evidence', 'quality_assurance'], context_match: 'EXACT', sample_count: 12, excluded_sample_count: 3, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, quality_failure_count: 1, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, quality_failure_rate: 0.0833, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
+    { role: 'operations_analyst', required_capabilities: ['operational_readiness', 'release_recovery'], context_match: 'EXACT', sample_count: 8, excluded_sample_count: 2, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, quality_failure_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, quality_failure_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' }
   ]
   const candidatePerformance = (adjustment: number, selectionScore: number, criticalPath = 3600) => ({
     evidence_level: 'LOW',
@@ -2921,6 +2922,32 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     projected_cost_micros: 820,
     projected_critical_path_latency_ms: criticalPath,
     role_evidence: candidateRoleEvidence
+  })
+  const noContextPerformance = (selectionScore: number) => ({
+    ...candidatePerformance(0, selectionScore),
+    evidence_level: 'INSUFFICIENT',
+    observed_role_count: 0,
+    sufficient_role_count: 0,
+    projected_cost_micros: null,
+    projected_critical_path_latency_ms: null,
+    role_evidence: candidateRoleEvidence.map((evidence) => ({
+      ...evidence,
+      context_match: 'NONE',
+      sample_count: 0,
+      success_count: 0,
+      failure_count: 0,
+      retry_count: 0,
+      revision_count: 0,
+      quality_failure_count: 0,
+      success_rate: 0,
+      retry_rate: 0,
+      revision_rate: 0,
+      quality_failure_rate: 0,
+      reliability_score: 0.75,
+      median_latency_ms: null,
+      average_cost_micros: null,
+      evidence_level: 'INSUFFICIENT'
+    }))
   })
   const initialPlan = {
     objective: '先验证可恢复交付，再启动专业 Agent',
@@ -3011,7 +3038,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         plan: deliveryCandidatePlan,
         score: 90,
         checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 8 } : check),
-        performance_evidence: candidatePerformance(1, 91),
+        performance_evidence: noContextPerformance(90),
         plan_fingerprint: 'a'.repeat(64),
         duplicate_of: null,
         commitments: acceptedCommitments,
@@ -3319,8 +3346,12 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(riskPerformance.getByText('$0.0008', { exact: true })).toBeVisible()
   await expect(riskPerformance.getByText('3.6 秒', { exact: true })).toBeVisible()
   await expect(riskPerformance.getByText('已排除 5 份与当前 Prompt、模型或运行配置不一致的旧样本。', { exact: true })).toBeVisible()
-  await riskPerformance.getByText('查看角色历史明细', { exact: true }).click()
-  await expect(riskPerformance.getByText(/12 份当前配置样本 · 可靠性 87% · 质检退回 8%/)).toBeVisible()
+  await riskPerformance.getByText('查看能力合同证据', { exact: true }).click()
+  await expect(riskPerformance.getByText(/12 份匹配当前能力合同的样本 · 可靠性 87% · 质检退回 8%/)).toBeVisible()
+  const deliveryPerformance = page.getByLabel('交付完整性候选方案').getByRole('region', { name: '交付完整性团队绩效证据' })
+  await expect(deliveryPerformance.getByText('没有足够的精确能力合同样本，历史记录不影响本次候选选择。', { exact: true })).toBeVisible()
+  await deliveryPerformance.getByText('查看能力合同证据', { exact: true }).click()
+  await expect(deliveryPerformance.getByText('没有匹配当前能力合同的历史样本，本角色不参与可靠性调整 · 已排除 3 份旧配置', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('显式能力覆盖', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('30/30', { exact: true })).toBeVisible()
   await expect(page.getByLabel('并行效率候选方案').getByText('测试与运营并行验证后统一收敛', { exact: true })).toBeVisible()

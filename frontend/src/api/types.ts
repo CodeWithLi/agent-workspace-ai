@@ -630,9 +630,12 @@ export interface WorkflowSpecialistPreflight {
 }
 
 export type PerformanceEvidenceLevel = 'INSUFFICIENT' | 'LOW' | 'MEDIUM' | 'HIGH'
+export type PerformanceContextMatch = 'ROLE_AGGREGATE' | 'EXACT' | 'NONE'
 
 export interface TeamRolePerformanceEvidence {
   role: string
+  required_capabilities?: string[]
+  context_match?: PerformanceContextMatch
   sample_count: number
   excluded_sample_count?: number
   success_count: number
@@ -659,6 +662,7 @@ export interface TeamPerformanceProfile {
   observed_role_count: number
   sufficient_role_count: number
   roles: TeamRolePerformanceEvidence[]
+  capability_contexts?: TeamRolePerformanceEvidence[]
   configuration_scope?: 'ALL_HISTORY' | 'CURRENT_CONFIGURATION'
 }
 

@@ -317,13 +317,13 @@
                   :aria-label="`${candidate.perspective}团队绩效证据`"
                 >
                   <header>
-                    <strong>同项目团队绩效</strong>
+                    <strong>能力合同历史证据</strong>
                     <el-tag size="small" :type="performanceEvidenceType(candidate.performance_evidence.evidence_level)" effect="plain">
                       {{ performanceEvidenceLevelLabel(candidate.performance_evidence.evidence_level) }}
                     </el-tag>
                   </header>
                   <p v-if="candidate.performance_evidence.sufficient_role_count === 0" class="plan-performance-notice">
-                    所有角色样本均不足，历史记录不影响本次候选选择。
+                    没有足够的精确能力合同样本，历史记录不影响本次候选选择。
                   </p>
                   <p v-if="candidate.performance_evidence.configuration_scope !== 'CURRENT_CONFIGURATION'" class="plan-performance-notice">
                     该计划生成于配置隔离启用前，历史证据仅作兼容展示。
@@ -350,15 +350,18 @@
                     </div>
                   </dl>
                   <details class="plan-performance-roles">
-                    <summary>查看角色历史明细</summary>
+                    <summary>查看能力合同证据</summary>
                     <ul>
                       <li v-for="evidence in candidate.performance_evidence.role_evidence" :key="evidence.role">
                         <strong>{{ specialistRoleLabel(evidence.role) }}</strong>
-                        <span v-if="evidence.evidence_level === 'INSUFFICIENT'">
-                          {{ evidence.sample_count }} 份{{ performanceSampleScopeLabel(candidate.performance_evidence) }} · 已排除 {{ evidence.excluded_sample_count || 0 }} 份旧配置 · 样本不足，不参与可靠性调整
+                        <span v-if="evidence.context_match === 'NONE'">
+                          没有匹配当前能力合同的历史样本，本角色不参与可靠性调整 · 已排除 {{ evidence.excluded_sample_count || 0 }} 份旧配置
+                        </span>
+                        <span v-else-if="evidence.evidence_level === 'INSUFFICIENT'">
+                          {{ performanceRoleSampleLabel(evidence, candidate.performance_evidence) }} · 已排除 {{ evidence.excluded_sample_count || 0 }} 份旧配置 · 样本不足，不参与可靠性调整
                         </span>
                         <span v-else>
-                          {{ evidence.sample_count }} 份{{ performanceSampleScopeLabel(candidate.performance_evidence) }} · 可靠性 {{ Math.round(evidence.reliability_score * 100) }}% ·
+                          {{ performanceRoleSampleLabel(evidence, candidate.performance_evidence) }} · 可靠性 {{ Math.round(evidence.reliability_score * 100) }}% ·
                           质检退回 {{ Math.round((evidence.quality_failure_rate || 0) * 100) }}% ·
                           中位耗时 {{ formatPerformanceDuration(evidence.median_latency_ms) }} ·
                           平均成本 {{ formatPerformanceCost(evidence.average_cost_micros) }} ·
@@ -779,7 +782,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'v
 import { useRoute, useRouter } from 'vue-router'
 import { CircleCheck, CircleClose, Clock, Connection, Delete, Edit, Loading, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
-import type { Agent, PerformanceEvidenceLevel, PlanPerformanceEvidence, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
+import type { Agent, PerformanceEvidenceLevel, PlanPerformanceEvidence, Project, ProjectActivity, ProjectMember, Task, TeamRolePerformanceEvidence, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
 import WorkflowLaunchDialog from '../components/WorkflowLaunchDialog.vue'
 import { useAuthStore } from '../stores/auth'
@@ -1347,6 +1350,16 @@ function performanceSampleScopeLabel(evidence: PlanPerformanceEvidence) {
   return evidence.configuration_scope === 'CURRENT_CONFIGURATION'
     ? '当前配置样本'
     : '历史样本'
+}
+
+function performanceRoleSampleLabel(
+  evidence: TeamRolePerformanceEvidence,
+  planEvidence: PlanPerformanceEvidence
+) {
+  if (evidence.context_match === 'EXACT') {
+    return `${evidence.sample_count} 份匹配当前能力合同的样本`
+  }
+  return `${evidence.sample_count} 份${performanceSampleScopeLabel(planEvidence)}`
 }
 
 function formatPerformanceDuration(value: number | null) {

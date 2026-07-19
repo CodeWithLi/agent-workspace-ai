@@ -772,6 +772,10 @@ def assess_execution_plan_candidate(
     performance_evidence = build_plan_performance_evidence(
         score,
         [assignment.role for assignment in plan.assignments],
+        {
+            assignment.role: assignment.required_capabilities
+            for assignment in plan.assignments
+        },
         [[assignment.role for assignment in wave] for wave in waves],
         team_performance_profile,
     )

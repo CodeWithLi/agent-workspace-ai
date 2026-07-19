@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -16,6 +17,7 @@ from app.models import Agent, LLMUsage, WorkflowEvent, WorkflowRun, WorkflowStat
 
 EvidenceLevel = Literal["INSUFFICIENT", "LOW", "MEDIUM", "HIGH"]
 ConfigurationScope = Literal["ALL_HISTORY", "CURRENT_CONFIGURATION"]
+CapabilityContextMatch = Literal["ROLE_AGGREGATE", "EXACT", "NONE"]
 TERMINAL_WORKFLOW_STATUSES = (
     WorkflowStatus.completed,
     WorkflowStatus.failed,
@@ -25,6 +27,7 @@ TERMINAL_WORKFLOW_STATUSES = (
 HISTORY_WORKFLOW_LIMIT = 50
 RELIABILITY_PRIOR_MEAN = 0.75
 RELIABILITY_PRIOR_STRENGTH = 5
+MAX_CAPABILITY_CONTEXTS_PER_ROLE = 10
 
 
 def evidence_level_for_samples(sample_count: int) -> EvidenceLevel:
@@ -39,6 +42,8 @@ def evidence_level_for_samples(sample_count: int) -> EvidenceLevel:
 
 class RolePerformanceEvidence(BaseModel):
     role: str = Field(min_length=2, max_length=50)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=8)
+    context_match: CapabilityContextMatch = "ROLE_AGGREGATE"
     sample_count: int = Field(ge=0)
     excluded_sample_count: int = Field(default=0, ge=0)
     success_count: int = Field(ge=0)
@@ -54,6 +59,13 @@ class RolePerformanceEvidence(BaseModel):
     median_latency_ms: int | None = Field(default=None, ge=0)
     average_cost_micros: int | None = Field(default=None, ge=0)
     evidence_level: EvidenceLevel
+
+    @field_validator("required_capabilities", mode="before")
+    @classmethod
+    def normalize_required_capabilities(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            return sorted({item.strip() for item in value if item.strip()})
+        return value
 
     @model_validator(mode="after")
     def validate_counts(self) -> "RolePerformanceEvidence":
@@ -73,6 +85,7 @@ class TeamPerformanceProfile(BaseModel):
     observed_role_count: int = Field(ge=0)
     sufficient_role_count: int = Field(ge=0)
     roles: list[RolePerformanceEvidence]
+    capability_contexts: list[RolePerformanceEvidence] = Field(default_factory=list)
     configuration_scope: ConfigurationScope = "ALL_HISTORY"
 
     @model_validator(mode="after")
@@ -90,10 +103,41 @@ class TeamPerformanceProfile(BaseModel):
             raise ValueError("team performance observed role count must match role evidence")
         if self.sufficient_role_count != sum(item.sample_count >= 3 for item in self.roles):
             raise ValueError("team performance sufficient role count must match role evidence")
+        context_keys = [
+            (item.role, tuple(item.required_capabilities))
+            for item in self.capability_contexts
+        ]
+        if len(context_keys) != len(set(context_keys)):
+            raise ValueError("team performance capability contexts must be unique")
+        contexts_per_role: dict[str, int] = defaultdict(int)
+        for item in self.capability_contexts:
+            if item.role not in role_names:
+                raise ValueError("team performance capability context role must be observed")
+            if item.context_match != "EXACT":
+                raise ValueError("team performance capability contexts must be exact")
+            contexts_per_role[item.role] += 1
+            if contexts_per_role[item.role] > MAX_CAPABILITY_CONTEXTS_PER_ROLE:
+                raise ValueError("team performance capability contexts exceed the per-role limit")
         return self
 
     def for_role(self, role: str) -> RolePerformanceEvidence | None:
         return next((item for item in self.roles if item.role == role), None)
+
+    def for_context(
+        self,
+        role: str,
+        required_capabilities: list[str],
+    ) -> RolePerformanceEvidence | None:
+        signature = tuple(sorted(set(required_capabilities)))
+        return next(
+            (
+                item
+                for item in self.capability_contexts
+                if item.role == role
+                and tuple(item.required_capabilities) == signature
+            ),
+            None,
+        )
 
 
 class ExecutionPlanPerformanceEvidence(BaseModel):
@@ -124,9 +168,32 @@ class ExecutionPlanPerformanceEvidence(BaseModel):
         return self
 
 
-def _empty_role_evidence(role: str, excluded_sample_count: int = 0) -> RolePerformanceEvidence:
+@dataclass(frozen=True)
+class BranchPerformanceSample:
+    role: str
+    succeeded: bool
+    retry_count: int
+    revision_count: int
+    quality_failure_count: int
+    retried: bool
+    revised: bool
+    quality_failed: bool
+    latency_ms: int | None
+    cost_micros: int | None
+    required_capabilities: tuple[str, ...] | None
+
+
+def _empty_role_evidence(
+    role: str,
+    excluded_sample_count: int = 0,
+    *,
+    required_capabilities: tuple[str, ...] = (),
+    context_match: CapabilityContextMatch = "ROLE_AGGREGATE",
+) -> RolePerformanceEvidence:
     return RolePerformanceEvidence(
         role=role,
+        required_capabilities=list(required_capabilities),
+        context_match=context_match,
         sample_count=0,
         excluded_sample_count=excluded_sample_count,
         success_count=0,
@@ -138,6 +205,66 @@ def _empty_role_evidence(role: str, excluded_sample_count: int = 0) -> RolePerfo
         revision_rate=0,
         reliability_score=RELIABILITY_PRIOR_MEAN,
         evidence_level="INSUFFICIENT",
+    )
+
+
+def _build_role_evidence(
+    role: str,
+    samples: list[BranchPerformanceSample],
+    excluded_sample_count: int = 0,
+    *,
+    required_capabilities: tuple[str, ...] = (),
+    context_match: CapabilityContextMatch = "ROLE_AGGREGATE",
+) -> RolePerformanceEvidence:
+    sample_count = len(samples)
+    if not sample_count:
+        return _empty_role_evidence(
+            role,
+            excluded_sample_count,
+            required_capabilities=required_capabilities,
+            context_match=context_match,
+        )
+    success_count = sum(sample.succeeded for sample in samples)
+    retry_samples = sum(sample.retried for sample in samples)
+    revision_samples = sum(sample.revised for sample in samples)
+    quality_failure_samples = sum(sample.quality_failed for sample in samples)
+    effective_successes = max(
+        0.0,
+        success_count
+        - 0.25 * retry_samples
+        - 0.20 * revision_samples
+        - 0.50 * quality_failure_samples,
+    )
+    reliability = (
+        effective_successes + RELIABILITY_PRIOR_MEAN * RELIABILITY_PRIOR_STRENGTH
+    ) / (sample_count + RELIABILITY_PRIOR_STRENGTH)
+    latency_samples = [
+        sample.latency_ms for sample in samples if sample.latency_ms is not None
+    ]
+    cost_samples = [
+        sample.cost_micros for sample in samples if sample.cost_micros is not None
+    ]
+    return RolePerformanceEvidence(
+        role=role,
+        required_capabilities=list(required_capabilities),
+        context_match=context_match,
+        sample_count=sample_count,
+        excluded_sample_count=excluded_sample_count,
+        success_count=success_count,
+        failure_count=sample_count - success_count,
+        retry_count=sum(sample.retry_count for sample in samples),
+        revision_count=sum(sample.revision_count for sample in samples),
+        quality_failure_count=sum(sample.quality_failure_count for sample in samples),
+        success_rate=round(success_count / sample_count, 4),
+        retry_rate=round(retry_samples / sample_count, 4),
+        revision_rate=round(revision_samples / sample_count, 4),
+        quality_failure_rate=round(quality_failure_samples / sample_count, 4),
+        reliability_score=round(reliability, 4),
+        median_latency_ms=(round(median(latency_samples)) if latency_samples else None),
+        average_cost_micros=(
+            round(sum(cost_samples) / len(cost_samples)) if cost_samples else None
+        ),
+        evidence_level=evidence_level_for_samples(sample_count),
     )
 
 
@@ -172,11 +299,15 @@ def _agent_roles(snapshot: dict[str, dict[str, Any]]) -> dict[int, str]:
     return roles
 
 
-def _workflow_agent_snapshot(workflow: WorkflowRun) -> dict[str, dict[str, Any]]:
+def _workflow_state(workflow: WorkflowRun) -> dict[str, Any]:
     try:
         state = json.loads(workflow.state_json or "{}")
     except (json.JSONDecodeError, TypeError):
         return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _workflow_agent_snapshot(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     snapshot = state.get("agent_snapshot") if isinstance(state, dict) else None
     if not isinstance(snapshot, dict):
         return {}
@@ -185,6 +316,33 @@ def _workflow_agent_snapshot(workflow: WorkflowRun) -> dict[str, dict[str, Any]]
         if isinstance(config, dict):
             normalized[str(role)] = config
     return normalized
+
+
+def _workflow_capability_contracts(
+    state: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    execution_plan = state.get("execution_plan")
+    if not isinstance(execution_plan, dict):
+        return {}
+    assignments = execution_plan.get("assignments")
+    if not isinstance(assignments, list):
+        return {}
+    contracts: dict[str, tuple[str, ...]] = {}
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        role = assignment.get("role")
+        capabilities = assignment.get("required_capabilities")
+        if (
+            not isinstance(role, str)
+            or not isinstance(capabilities, list)
+            or not all(isinstance(item, str) for item in capabilities)
+        ):
+            continue
+        contracts[role] = tuple(
+            sorted({item.strip() for item in capabilities if item.strip()})
+        )
+    return contracts
 
 
 def _agent_configuration_signature(config: Any) -> tuple[Any, ...] | None:
@@ -306,16 +464,12 @@ def build_team_performance_profile(
         agent.id: agent.role.value
         for agent in db.scalars(select(Agent).where(Agent.id.in_(agent_ids)))
     } if agent_ids else {}
-    outcomes: dict[str, list[bool]] = defaultdict(list)
-    retry_counts: dict[str, int] = defaultdict(int)
-    revision_counts: dict[str, int] = defaultdict(int)
-    quality_failure_counts: dict[str, int] = defaultdict(int)
-    retry_samples: dict[str, int] = defaultdict(int)
-    revision_samples: dict[str, int] = defaultdict(int)
-    quality_failure_samples: dict[str, int] = defaultdict(int)
+    samples_by_role: dict[str, list[BranchPerformanceSample]] = defaultdict(list)
+    samples_by_context: dict[
+        tuple[str, tuple[str, ...]], list[BranchPerformanceSample]
+    ] = defaultdict(list)
     excluded_sample_counts: dict[str, int] = defaultdict(int)
-    latency_samples: dict[str, list[int]] = defaultdict(list)
-    cost_samples: dict[str, list[int]] = defaultdict(list)
+    excluded_context_counts: dict[tuple[str, tuple[str, ...]], int] = defaultdict(int)
 
     for workflow in workflows:
         starts: dict[tuple[Any, ...], list[datetime]] = defaultdict(list)
@@ -358,11 +512,14 @@ def build_team_performance_profile(
                 workflow_retry_counts[role] += 1
                 retried_roles.add(role)
 
-        historical_snapshot = _workflow_agent_snapshot(workflow)
+        state = _workflow_state(workflow)
+        historical_snapshot = _workflow_agent_snapshot(state)
+        capability_contracts = _workflow_capability_contracts(state)
         agent_roles = {**persisted_agent_roles, **_agent_roles(historical_snapshot)}
         for role, succeeded in final_outcome.items():
             if role not in role_names:
                 continue
+            required_capabilities = capability_contracts.get(role)
             current_signature = current_signatures.get(role)
             if current_agent_snapshot is not None and (
                 current_signature is None
@@ -370,18 +527,18 @@ def build_team_performance_profile(
                 != current_signature
             ):
                 excluded_sample_counts[role] += 1
+                if required_capabilities is not None:
+                    excluded_context_counts[(role, required_capabilities)] += 1
                 continue
-            outcomes[role].append(succeeded)
-            retry_counts[role] += workflow_retry_counts[role]
-            revision_counts[role] += workflow_revision_counts[role]
-            quality_failure_counts[role] += workflow_quality_failure_counts[role]
-            retry_samples[role] += role in retried_roles
-            revision_samples[role] += role in revised_roles
-            quality_failure_samples[role] += role in quality_failed_roles
             role_windows = windows.get(role, [])
+            latency_ms = None
+            cost_micros = None
             if role_windows:
-                latency_samples[role].append(
-                    round(sum((ended - started).total_seconds() * 1000 for started, ended in role_windows))
+                latency_ms = round(
+                    sum(
+                        (ended - started).total_seconds() * 1000
+                        for started, ended in role_windows
+                    )
                 )
                 matching_usage = [
                     usage
@@ -394,57 +551,53 @@ def build_team_performance_profile(
                     )
                 ]
                 if matching_usage:
-                    cost_samples[role].append(
-                        sum(usage.estimated_cost_micros for usage in matching_usage)
+                    cost_micros = sum(
+                        usage.estimated_cost_micros for usage in matching_usage
                     )
-
-    role_evidence: list[RolePerformanceEvidence] = []
-    for role in role_names:
-        role_outcomes = outcomes[role]
-        sample_count = len(role_outcomes)
-        if not sample_count:
-            role_evidence.append(_empty_role_evidence(role, excluded_sample_counts[role]))
-            continue
-        success_count = sum(role_outcomes)
-        failure_count = sample_count - success_count
-        effective_successes = max(
-            0.0,
-            success_count
-            - 0.25 * retry_samples[role]
-            - 0.20 * revision_samples[role]
-            - 0.50 * quality_failure_samples[role],
-        )
-        reliability = (
-            effective_successes + RELIABILITY_PRIOR_MEAN * RELIABILITY_PRIOR_STRENGTH
-        ) / (sample_count + RELIABILITY_PRIOR_STRENGTH)
-        role_evidence.append(
-            RolePerformanceEvidence(
+            sample = BranchPerformanceSample(
                 role=role,
-                sample_count=sample_count,
-                excluded_sample_count=excluded_sample_counts[role],
-                success_count=success_count,
-                failure_count=failure_count,
-                retry_count=retry_counts[role],
-                revision_count=revision_counts[role],
-                quality_failure_count=quality_failure_counts[role],
-                success_rate=round(success_count / sample_count, 4),
-                retry_rate=round(retry_samples[role] / sample_count, 4),
-                revision_rate=round(revision_samples[role] / sample_count, 4),
-                quality_failure_rate=round(
-                    quality_failure_samples[role] / sample_count,
-                    4,
-                ),
-                reliability_score=round(reliability, 4),
-                median_latency_ms=(
-                    round(median(latency_samples[role])) if latency_samples[role] else None
-                ),
-                average_cost_micros=(
-                    round(sum(cost_samples[role]) / len(cost_samples[role]))
-                    if cost_samples[role]
-                    else None
-                ),
-                evidence_level=evidence_level_for_samples(sample_count),
+                succeeded=succeeded,
+                retry_count=workflow_retry_counts[role],
+                revision_count=workflow_revision_counts[role],
+                quality_failure_count=workflow_quality_failure_counts[role],
+                retried=role in retried_roles,
+                revised=role in revised_roles,
+                quality_failed=role in quality_failed_roles,
+                latency_ms=latency_ms,
+                cost_micros=cost_micros,
+                required_capabilities=required_capabilities,
             )
+            samples_by_role[role].append(sample)
+            if required_capabilities is not None:
+                samples_by_context[(role, required_capabilities)].append(sample)
+
+    role_evidence = [
+        _build_role_evidence(
+            role,
+            samples_by_role[role],
+            excluded_sample_counts[role],
+        )
+        for role in role_names
+    ]
+    capability_contexts: list[RolePerformanceEvidence] = []
+    context_keys = set(samples_by_context) | set(excluded_context_counts)
+    for role in role_names:
+        role_contexts = [
+            _build_role_evidence(
+                role,
+                samples_by_context[(role, capabilities)],
+                excluded_context_counts[(role, capabilities)],
+                required_capabilities=capabilities,
+                context_match="EXACT",
+            )
+            for context_role, capabilities in context_keys
+            if context_role == role
+        ]
+        capability_contexts.extend(
+            sorted(
+                role_contexts,
+                key=lambda item: (-item.sample_count, tuple(item.required_capabilities)),
+            )[:MAX_CAPABILITY_CONTEXTS_PER_ROLE]
         )
 
     return TeamPerformanceProfile(
@@ -458,6 +611,7 @@ def build_team_performance_profile(
         observed_role_count=sum(item.sample_count > 0 for item in role_evidence),
         sufficient_role_count=sum(item.sample_count >= 3 for item in role_evidence),
         roles=role_evidence,
+        capability_contexts=capability_contexts,
         configuration_scope=(
             "CURRENT_CONFIGURATION"
             if current_agent_snapshot is not None
@@ -469,6 +623,7 @@ def build_team_performance_profile(
 def build_plan_performance_evidence(
     structural_score: int,
     assigned_roles: list[str],
+    required_capabilities_by_role: dict[str, list[str]],
     execution_waves: list[list[str]],
     profile: TeamPerformanceProfile | dict[str, Any] | None,
 ) -> ExecutionPlanPerformanceEvidence:
@@ -479,12 +634,28 @@ def build_plan_performance_evidence(
         if profile
         else None
     )
-    role_evidence = [
-        parsed_profile.for_role(role) or _empty_role_evidence(role)
-        if parsed_profile
-        else _empty_role_evidence(role)
-        for role in assigned_roles
-    ]
+    role_evidence: list[RolePerformanceEvidence] = []
+    for role in assigned_roles:
+        required_capabilities = tuple(
+            sorted(set(required_capabilities_by_role.get(role, [])))
+        )
+        exact = (
+            parsed_profile.for_context(role, list(required_capabilities))
+            if parsed_profile
+            else None
+        )
+        if exact:
+            role_evidence.append(exact)
+            continue
+        aggregate = parsed_profile.for_role(role) if parsed_profile else None
+        role_evidence.append(
+            _empty_role_evidence(
+                role,
+                aggregate.excluded_sample_count if aggregate else 0,
+                required_capabilities=required_capabilities,
+                context_match="NONE",
+            )
+        )
     sufficient = [item for item in role_evidence if item.sample_count >= 3]
     adjustment = 0
     if sufficient:

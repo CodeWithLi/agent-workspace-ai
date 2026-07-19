@@ -21,8 +21,12 @@ The validated objective, specialist assignments, expected deliverables and succe
 _Avoid_: Prompt, task list
 
 **Team Performance Profile**:
-A frozen, same-project and configuration-comparable history of observed Specialist Branch delivery behavior used as planning evidence.
+A frozen, same-project history of observed Specialist Branch delivery behavior, comparable by both Agent configuration and Capability Context.
 _Avoid_: SLO, execution guarantee, cross-project benchmark
+
+**Capability Context**:
+The normalized, exact set of required capabilities assigned to one Specialist Branch. Role aggregates explain team history; only an exact Capability Context may influence candidate reliability, cost or latency.
+_Avoid_: Role, objective, Prompt, task description
 
 **Specialist Branch**:
 An independently executable assignment in an Execution Plan whose result can be produced concurrently with other branches.

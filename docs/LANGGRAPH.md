@@ -123,4 +123,6 @@ dispatcher 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 支持多副本。`locked_
 
 运行中的 worker 使用 `lease_token` fencing，并以租约时长三分之一为周期续租。所有节点提交和 Saga 写入都会锁定工作流行并校验 token；旧 worker 即使在超时后恢复，也不能提交业务写入。
 
+Team Performance Profile 的 `roles` 是用于预检解释的角色聚合；`capability_contexts` 只保存角色与规范化能力集合，不保存目标、Prompt、事件正文或 Handoff。候选依据 assignment 的能力集合精确选择 `EXACT` 上下文；缺失元数据或没有匹配时使用零样本 `NONE`，不允许回退到角色聚合影响可靠性、成本或关键路径。每个角色最多保留 10 个上下文，按样本量降序和能力签名升序冻结。
+
 实现文件：`backend/app/langgraph/workflow.py`、`backend/app/observability.py`、`backend/app/services/trace_alerts.py`、`frontend/src/views/TraceCenterView.vue`、`frontend/src/components/TraceComparisonDialog.vue`、`frontend/src/components/TraceHealthPanel.vue`。

@@ -29,15 +29,20 @@ from app.agent.orchestration import (
 from app.agent.team_performance import RolePerformanceEvidence, TeamPerformanceProfile
 
 
-def performance_profile(*roles: RolePerformanceEvidence) -> TeamPerformanceProfile:
+def performance_profile(
+    *roles: RolePerformanceEvidence,
+    capability_contexts: list[RolePerformanceEvidence] | None = None,
+) -> TeamPerformanceProfile:
     return TeamPerformanceProfile(
         project_id=1,
         generated_at="2026-07-19T09:00:00Z",
         workflow_count=max((role.sample_count for role in roles), default=0),
         branch_sample_count=sum(role.sample_count for role in roles),
+        excluded_branch_sample_count=sum(role.excluded_sample_count for role in roles),
         observed_role_count=sum(role.sample_count > 0 for role in roles),
         sufficient_role_count=sum(role.sample_count >= 3 for role in roles),
         roles=list(roles),
+        capability_contexts=capability_contexts or [],
     )
 
 
@@ -190,6 +195,8 @@ def test_execution_plan_candidate_keeps_legacy_snapshots_compatible() -> None:
         evidence.pop("excluded_sample_count")
         evidence.pop("quality_failure_count")
         evidence.pop("quality_failure_rate")
+        evidence.pop("required_capabilities")
+        evidence.pop("context_match")
 
     restored = ExecutionPlanCandidate.model_validate(legacy_snapshot)
 
@@ -201,43 +208,127 @@ def test_execution_plan_candidate_keeps_legacy_snapshots_compatible() -> None:
         evidence.excluded_sample_count == 0
         and evidence.quality_failure_count == 0
         and evidence.quality_failure_rate == 0
+        and evidence.required_capabilities == []
+        and evidence.context_match == "ROLE_AGGREGATE"
         for evidence in restored.performance_evidence.role_evidence
     )
 
 
-def test_candidate_performance_evidence_is_bounded_and_requires_sufficient_samples() -> None:
+def test_candidate_does_not_fall_back_to_role_history_without_exact_context() -> None:
     plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
     profile = performance_profile(
         RolePerformanceEvidence(
             role="test_engineer",
-            sample_count=10,
-            success_count=10,
+            sample_count=30,
+            excluded_sample_count=4,
+            success_count=30,
             failure_count=0,
             retry_count=0,
             revision_count=0,
             success_rate=1,
             retry_rate=0,
             revision_rate=0,
-            reliability_score=0.9167,
-            median_latency_ms=1200,
-            average_cost_micros=200,
-            evidence_level="MEDIUM",
+            reliability_score=0.9643,
+            median_latency_ms=800,
+            average_cost_micros=100,
+            evidence_level="HIGH",
         ),
         RolePerformanceEvidence(
             role="operations_analyst",
-            sample_count=10,
-            success_count=9,
-            failure_count=1,
-            retry_count=1,
+            sample_count=30,
+            success_count=30,
+            failure_count=0,
+            retry_count=0,
             revision_count=0,
-            success_rate=0.9,
-            retry_rate=0.1,
+            success_rate=1,
+            retry_rate=0,
             revision_rate=0,
-            reliability_score=0.8417,
-            median_latency_ms=1800,
-            average_cost_micros=300,
-            evidence_level="MEDIUM",
+            reliability_score=0.9643,
+            median_latency_ms=900,
+            average_cost_micros=120,
+            evidence_level="HIGH",
         ),
+    )
+
+    candidate = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        plan,
+        "构建可灰度发布并可回滚的会员平台",
+        team_performance_profile=profile,
+    )
+
+    assert candidate.performance_evidence.reliability_adjustment == 0
+    assert candidate.performance_evidence.selection_score == candidate.score
+    assert candidate.performance_evidence.observed_role_count == 0
+    assert candidate.performance_evidence.projected_cost_micros is None
+    assert candidate.performance_evidence.projected_critical_path_latency_ms is None
+    assert all(
+        evidence.context_match == "NONE" and evidence.sample_count == 0
+        for evidence in candidate.performance_evidence.role_evidence
+    )
+    test_evidence = next(
+        evidence
+        for evidence in candidate.performance_evidence.role_evidence
+        if evidence.role == "test_engineer"
+    )
+    assert test_evidence.excluded_sample_count == 4
+    assert test_evidence.required_capabilities
+
+
+def test_candidate_performance_evidence_is_bounded_and_requires_sufficient_samples() -> None:
+    plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    required = {
+        assignment.role: assignment.required_capabilities
+        for assignment in plan.assignments
+    }
+    test_evidence = RolePerformanceEvidence(
+        role="test_engineer",
+        sample_count=10,
+        success_count=10,
+        failure_count=0,
+        retry_count=0,
+        revision_count=0,
+        success_rate=1,
+        retry_rate=0,
+        revision_rate=0,
+        reliability_score=0.9167,
+        median_latency_ms=1200,
+        average_cost_micros=200,
+        evidence_level="MEDIUM",
+    )
+    operations_evidence = RolePerformanceEvidence(
+        role="operations_analyst",
+        sample_count=10,
+        success_count=9,
+        failure_count=1,
+        retry_count=1,
+        revision_count=0,
+        success_rate=0.9,
+        retry_rate=0.1,
+        revision_rate=0,
+        reliability_score=0.8417,
+        median_latency_ms=1800,
+        average_cost_micros=300,
+        evidence_level="MEDIUM",
+    )
+    profile = performance_profile(
+        test_evidence,
+        operations_evidence,
+        capability_contexts=[
+            test_evidence.model_copy(
+                update={
+                    "required_capabilities": sorted(required["test_engineer"]),
+                    "context_match": "EXACT",
+                }
+            ),
+            operations_evidence.model_copy(
+                update={
+                    "required_capabilities": sorted(required["operations_analyst"]),
+                    "context_match": "EXACT",
+                }
+            ),
+        ],
     )
 
     candidate = assess_execution_plan_candidate(
@@ -254,22 +345,31 @@ def test_candidate_performance_evidence_is_bounded_and_requires_sufficient_sampl
     assert candidate.performance_evidence.projected_critical_path_latency_ms == 1800
     assert candidate.performance_evidence.evidence_level == "MEDIUM"
 
+    insufficient_evidence = RolePerformanceEvidence(
+        role="test_engineer",
+        sample_count=2,
+        success_count=2,
+        failure_count=0,
+        retry_count=0,
+        revision_count=0,
+        success_rate=1,
+        retry_rate=0,
+        revision_rate=0,
+        reliability_score=0.8214,
+        median_latency_ms=1000,
+        average_cost_micros=100,
+        evidence_level="INSUFFICIENT",
+    )
     insufficient = performance_profile(
-        RolePerformanceEvidence(
-            role="test_engineer",
-            sample_count=2,
-            success_count=2,
-            failure_count=0,
-            retry_count=0,
-            revision_count=0,
-            success_rate=1,
-            retry_rate=0,
-            revision_rate=0,
-            reliability_score=0.8214,
-            median_latency_ms=1000,
-            average_cost_micros=100,
-            evidence_level="INSUFFICIENT",
-        )
+        insufficient_evidence,
+        capability_contexts=[
+            insufficient_evidence.model_copy(
+                update={
+                    "required_capabilities": sorted(required["test_engineer"]),
+                    "context_match": "EXACT",
+                }
+            )
+        ],
     )
     insufficient_candidate = assess_execution_plan_candidate(
         "risk_control",
