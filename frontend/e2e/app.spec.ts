@@ -2826,6 +2826,63 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     success_criteria: ['核心路径具备可复现证据', '失败场景具备负责人和回滚条件'],
     team_capabilities: teamCapabilities
   }
+  const candidateChecks = [
+    { name: 'capability_coverage', label: '显式能力覆盖', score: 30, max_score: 30, detail: '目标未声明额外领域能力，基础能力合同完整' },
+    { name: 'specialist_fit', label: '专业角色匹配', score: 20, max_score: 20, detail: '2/2 个分支已绑定能力、交付物和组队依据' },
+    { name: 'success_contract', label: '成功标准质量', score: 22, max_score: 25, detail: '2/2 项标准包含可执行或可审计约束' },
+    { name: 'parallel_efficiency', label: '依赖并行效率', score: 8, max_score: 15, detail: '2 个分支编排为 2 个执行波次' },
+    { name: 'delivery_balance', label: '交付防线完整性', score: 10, max_score: 10, detail: '质量、运营与目标显式领域能力均有责任分支' }
+  ]
+  const deliveryCandidatePlan = {
+    ...initialPlan,
+    objective: '先建立完整验收责任，再汇总发布结论',
+    rationale: '交付完整性视角优先保证责任、产物和标准可追溯。'
+  }
+  const parallelCandidatePlan = {
+    ...initialPlan,
+    objective: '测试与运营并行验证后统一收敛',
+    rationale: '并行效率视角减少非必要等待。',
+    assignments: initialPlan.assignments.map((assignment) => ({ ...assignment, depends_on: [] }))
+  }
+  const initialDeliberation = {
+    selected_candidate_id: 'risk_control',
+    selection_reason: '风险控制方案对失败边界、恢复条件和责任约束更完整，同时保持能力覆盖。',
+    arbitration_mode: 'independent_arbiter',
+    arbiter_role: 'architect',
+    candidates: [
+      {
+        candidate_id: 'delivery_confidence',
+        perspective: '交付完整性',
+        plan: deliveryCandidatePlan,
+        score: 90,
+        checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 8 } : check),
+        plan_fingerprint: 'a'.repeat(64),
+        duplicate_of: null
+      },
+      {
+        candidate_id: 'risk_control',
+        perspective: '风险控制',
+        plan: initialPlan,
+        score: 92,
+        checks: candidateChecks.map((check) => check.name === 'success_contract' ? { ...check, score: 24 } : check),
+        plan_fingerprint: 'b'.repeat(64),
+        duplicate_of: null
+      },
+      {
+        candidate_id: 'parallel_efficiency',
+        perspective: '并行效率',
+        plan: parallelCandidatePlan,
+        score: 97,
+        checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 15 } : check),
+        plan_fingerprint: 'c'.repeat(64),
+        duplicate_of: null
+      }
+    ],
+    dissenting_candidate_ids: ['delivery_confidence', 'parallel_efficiency'],
+    dissent_summary: '并行方案总分更高，但对跨角色风险责任的先后约束不足；交付方案的失败恢复边界较弱。',
+    invalid_candidate_count: 0,
+    distinct_candidate_count: 3
+  }
   let planWorkflow = {
     workflow_id: 140,
     project_id: 2,
@@ -2841,7 +2898,8 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     state: {
       execution_plan: initialPlan,
       plan_version: 1,
-      plan_revisions: [{ version: 1, plan: initialPlan, feedback: '', created_at: '2026-07-19T08:00:30Z' }],
+      plan_revisions: [{ version: 1, plan: initialPlan, deliberation: initialDeliberation, feedback: '', created_at: '2026-07-19T08:00:30Z' }],
+      plan_deliberation: initialDeliberation,
       require_plan_approval: true,
       plan_approved: false,
       plan_revision_count: 0,
@@ -2882,8 +2940,9 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await page.route(/\/api\/v1\/workflow\/140\/saga-steps$/, (route) => route.fulfill({ json: [] }))
   await page.route(/\/api\/v1\/workflow\/140\/events\/history(?:\?.*)?$/, (route) => route.fulfill({
     json: [
-      { id: 1, workflow_id: 140, node: 'planning', event_type: 'PLAN_CREATED', message: 'Plan created', payload: { approval_required: true }, created_at: '2026-07-19T08:00:30Z' },
-      { id: 2, workflow_id: 140, node: 'plan_review', event_type: 'PAUSED', message: 'Waiting for approval', payload: { approval_gate: 'plan_review' }, created_at: '2026-07-19T08:01:00Z' }
+      { id: 1, workflow_id: 140, node: 'planning', event_type: 'PLAN_DELIBERATED', message: 'Plan deliberated', payload: { candidate_count: 3, distinct_candidate_count: 3, selected_candidate_id: 'risk_control' }, created_at: '2026-07-19T08:00:30Z' },
+      { id: 2, workflow_id: 140, node: 'planning', event_type: 'PLAN_CREATED', message: 'Plan created', payload: { approval_required: true }, created_at: '2026-07-19T08:00:31Z' },
+      { id: 3, workflow_id: 140, node: 'plan_review', event_type: 'PAUSED', message: 'Waiting for approval', payload: { approval_gate: 'plan_review' }, created_at: '2026-07-19T08:01:00Z' }
     ]
   }))
   await page.route(/\/api\/v1\/workflow\/140\/events$/, (route) => route.fulfill({
@@ -2904,17 +2963,28 @@ test('reviews, replans and approves an execution plan before specialist dispatch
           : assignment),
         success_criteria: [...initialPlan.success_criteria, '数据安全边界具有明确负责人']
       }
+      const revisedDeliberation = {
+        ...initialDeliberation,
+        selection_reason: '修订后的风险控制方案完整回应人工安全边界和负责人要求。',
+        candidates: initialDeliberation.candidates.map((candidate) => (
+          candidate.candidate_id === 'risk_control'
+            ? { ...candidate, plan: revisedPlan, plan_fingerprint: 'd'.repeat(64) }
+            : candidate
+        ))
+      }
       planWorkflow = {
         ...planWorkflow,
         state: {
           ...planWorkflow.state,
           execution_plan: revisedPlan,
           plan_version: 2,
+          plan_deliberation: revisedDeliberation,
           plan_revisions: [
             ...planWorkflow.state.plan_revisions,
             {
               version: 2,
               plan: revisedPlan,
+              deliberation: revisedDeliberation,
               feedback: String(payload.human_feedback),
               created_at: '2026-07-19T08:02:00Z'
             }
@@ -2978,8 +3048,21 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await workflowReloaded
 
   await expect(page.getByText('执行计划 v1 等待批准', { exact: true })).toBeVisible()
-  await expect(page.getByText('测试先确认验收证据，运营再基于测试结论设计灰度和恢复。', { exact: true })).toBeVisible()
-  await expect(page.getByText('2 个分支 · 2 波', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '方案仲裁', exact: true })).toBeVisible()
+  await expect(page.getByText('架构师独立仲裁', { exact: true })).toBeVisible()
+  await expect(page.getByText('3 个候选 · 3 个不同结构', { exact: true })).toBeVisible()
+  await expect(page.locator('.plan-selection-evidence')).toContainText('风险控制方案对失败边界、恢复条件和责任约束更完整，同时保持能力覆盖。')
+  const candidateEvidence = page.getByText('候选方案与评分证据', { exact: true })
+  await candidateEvidence.click()
+  const riskCandidate = page.getByLabel('风险控制候选方案')
+  await expect(riskCandidate.getByText('已选中', { exact: true })).toBeVisible()
+  await expect(riskCandidate.getByText('92/100', { exact: true })).toBeVisible()
+  await expect(riskCandidate.getByText('显式能力覆盖', { exact: true })).toBeVisible()
+  await expect(riskCandidate.getByText('30/30', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('并行效率候选方案').getByText('测试与运营并行验证后统一收敛', { exact: true })).toBeVisible()
+  await expect(page.locator('.plan-dissent-summary')).toContainText('并行方案总分更高，但对跨角色风险责任的先后约束不足；交付方案的失败恢复边界较弱。')
+  await expect(page.locator('.orchestration-copy').getByText('测试先确认验收证据，运营再基于测试结论设计灰度和恢复。', { exact: true })).toBeVisible()
+  await expect(page.locator('.orchestration-tags').getByText('2 个分支 · 2 波', { exact: true })).toBeVisible()
   const firstWave = page.getByLabel('执行计划第 1 波')
   const secondWave = page.getByLabel('执行计划第 2 波')
   await expect(firstWave.getByText('测试工程师', { exact: true })).toBeVisible()
@@ -3000,7 +3083,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(reviseButton).toBeDisabled()
   await page.getByLabel('工作流人工反馈').fill('补充数据安全边界，并为回滚验收指定负责人')
   await reviseButton.click()
-  await expect(page.getByText('补齐安全边界后的可恢复交付计划', { exact: true })).toBeVisible()
+  await expect(page.locator('.orchestration-copy').getByText('补齐安全边界后的可恢复交付计划', { exact: true })).toBeVisible()
   await expect(page.getByText('相较 v1 的变化', { exact: true })).toBeVisible()
   await expect(page.getByText('调整总体目标', { exact: true })).toBeVisible()
   await expect(page.getByText('更新编排理由', { exact: true })).toBeVisible()
@@ -3013,7 +3096,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(versionSelector).toContainText('v1')
   await expect(versionSelector).toContainText('v2')
   await versionSelector.getByText('v1', { exact: true }).click()
-  await expect(page.getByText('先验证可恢复交付，再启动专业 Agent', { exact: true })).toBeVisible()
+  await expect(page.locator('.orchestration-copy').getByText('先验证可恢复交付，再启动专业 Agent', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '批准 v1 并启动 2 个分支', exact: true }).click()
   await expect(page.getByText('已批准', { exact: true })).toBeVisible()
   expect(decisions[1]).toMatchObject({ decision: 'APPROVE', human_feedback: '', plan_version: 1 })

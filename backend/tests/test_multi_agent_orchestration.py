@@ -8,6 +8,8 @@ from app.agent.orchestration import (
     MultiAgentExecutionPlan,
     ReviewerPanelQuorumError,
     SpecialistTeamUnavailableError,
+    arbitrate_execution_plan_candidates,
+    assess_execution_plan_candidate,
     build_specialist_capability_catalog,
     build_fallback_plan,
     build_execution_waves,
@@ -17,6 +19,7 @@ from app.agent.orchestration import (
     merge_reviewer_decision,
     merge_reviewer_panel,
     parse_execution_plan,
+    parse_execution_plan_candidate,
     seal_handoff,
     validate_execution_plan_capabilities,
 )
@@ -72,6 +75,140 @@ def test_execution_plan_parser_accepts_valid_json_and_falls_back_safely() -> Non
         "operations_analyst",
     ]
     assert [item.role for item in fallback.assignments][:2] == ["test_engineer", "operations_analyst"]
+
+
+def test_execution_plan_candidates_are_strictly_parsed_scored_and_fingerprinted() -> None:
+    efficient = parse_execution_plan_candidate(
+        json.dumps(
+            {
+                "objective": "并行形成可验证、可恢复的交付方案",
+                "rationale": "质量与运营独立评审后汇总，减少无必要的串行等待",
+                "assignments": [
+                    {
+                        "role": "test_engineer",
+                        "objective": "验证核心路径、边界状态和验收证据",
+                        "deliverable": "可复现测试与验收清单",
+                    },
+                    {
+                        "role": "operations_analyst",
+                        "objective": "验证监控、灰度发布和故障恢复边界",
+                        "deliverable": "发布、监控与回滚运行手册",
+                    },
+                ],
+                "success_criteria": [
+                    "核心路径都有可复现验收证据和明确负责人",
+                    "失败场景都有告警阈值、回滚条件和恢复时限",
+                    "发布前完成灰度演练并记录可审计结果",
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    sequential = parse_execution_plan_candidate(
+        json.dumps(
+            {
+                "objective": "串行形成可验证、可恢复的交付方案",
+                "rationale": "运营结论等待测试完成后再开始",
+                "assignments": [
+                    {
+                        "role": "test_engineer",
+                        "objective": "验证核心路径、边界状态和验收证据",
+                        "deliverable": "可复现测试与验收清单",
+                    },
+                    {
+                        "role": "operations_analyst",
+                        "objective": "验证监控、灰度发布和故障恢复边界",
+                        "deliverable": "发布、监控与回滚运行手册",
+                        "depends_on": ["test_engineer"],
+                    },
+                ],
+                "success_criteria": [
+                    "核心路径都有可复现验收证据和明确负责人",
+                    "失败场景都有告警阈值、回滚条件和恢复时限",
+                    "发布前完成灰度演练并记录可审计结果",
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        "构建可灰度发布并可回滚的会员平台",
+    )
+
+    assert efficient is not None
+    assert sequential is not None
+    assert parse_execution_plan_candidate("not-json", "构建会员平台") is None
+
+    efficient_candidate = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        efficient,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    sequential_candidate = assess_execution_plan_candidate(
+        "risk_control",
+        "风险控制",
+        sequential,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+
+    assert sum(check.max_score for check in efficient_candidate.checks) == 100
+    assert efficient_candidate.score == sum(check.score for check in efficient_candidate.checks)
+    assert efficient_candidate.score > sequential_candidate.score
+    assert len(efficient_candidate.plan_fingerprint) == 64
+    assert efficient_candidate.plan.assignments[0].selection_reason
+
+
+def test_plan_arbitration_preserves_selection_evidence_and_falls_back_deterministically() -> None:
+    plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    delivery = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        plan,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    risk_plan = plan.model_copy(
+        update={
+            "objective": "优先控制高风险边界并保留恢复证据",
+            "success_criteria": [
+                *plan.success_criteria,
+                "每个高风险失败场景都有告警阈值、负责人和回滚时限",
+            ],
+        }
+    )
+    risk = assess_execution_plan_candidate(
+        "risk_control",
+        "风险控制",
+        risk_plan,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    arbiter_output = json.dumps(
+        {
+            "selected_candidate_id": "risk_control",
+            "selection_reason": "风险方案补充了可执行的告警、责任和恢复时限，同时通过全部硬校验。",
+            "dissenting_candidate_ids": ["delivery_confidence"],
+            "dissent_summary": "交付方案并行度相同，但对高风险失败场景的责任约束较弱。",
+        },
+        ensure_ascii=False,
+    )
+
+    deliberation = arbitrate_execution_plan_candidates(
+        arbiter_output,
+        [delivery, risk],
+        invalid_candidate_count=1,
+    )
+
+    assert deliberation.selected_candidate_id == "risk_control"
+    assert deliberation.arbitration_mode == "independent_arbiter"
+    assert deliberation.dissenting_candidate_ids == ["delivery_confidence"]
+    assert deliberation.invalid_candidate_count == 1
+    assert deliberation.distinct_candidate_count == 2
+    assert deliberation.selected_plan.objective == risk_plan.objective
+
+    fallback = arbitrate_execution_plan_candidates("invalid", [delivery, risk])
+    expected = max((delivery, risk), key=lambda candidate: (candidate.score, candidate.candidate_id))
+    assert fallback.arbitration_mode == "deterministic_fallback"
+    assert fallback.selected_candidate_id == expected.candidate_id
+    assert "确定性评分" in fallback.selection_reason
 
 
 def test_specialist_catalog_respects_frozen_tool_and_knowledge_permissions() -> None:

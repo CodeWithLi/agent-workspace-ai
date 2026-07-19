@@ -215,11 +215,17 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         if "动态编排器" in system_prompt:
             planner_prompts.append(user_prompt)
-            revision = len(planner_prompts) > 1
+            context = json.loads(user_prompt)
+            revision = bool((context.get("plan_revision") or {}).get("round"))
+            perspective = context["planning_perspective"]
             return json.dumps(
                 {
                     "objective": "修订后的可审计交付计划" if revision else "首版交付计划",
-                    "rationale": "根据人工意见强化安全验收" if revision else "质量和运营需要独立评审",
+                    "rationale": (
+                        "根据人工意见强化安全验收"
+                        if revision
+                        else f"质量和运营需要独立评审，当前采用{perspective['label']}视角"
+                    ),
                     "assignments": [
                         {
                             "role": "test_engineer",
@@ -236,6 +242,19 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                         "每个核心路径都有可复现证据",
                         "每个失败场景都有负责人和回滚条件",
                     ],
+                },
+                ensure_ascii=False,
+            )
+        if "独立执行计划仲裁 Agent" in system_prompt:
+            candidates = json.loads(user_prompt)["candidates"]
+            assert len(candidates) == 3
+            assert all(candidate["checks"] for candidate in candidates)
+            return json.dumps(
+                {
+                    "selected_candidate_id": "risk_control",
+                    "selection_reason": "风险控制方案对失败边界和责任约束更完整，同时保持能力覆盖。",
+                    "dissenting_candidate_ids": ["delivery_confidence", "parallel_efficiency"],
+                    "dissent_summary": "其他方案更偏交付完整性或并行速度，风险责任约束略弱。",
                 },
                 ensure_ascii=False,
             )
@@ -279,6 +298,10 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert first_state["plan_revisions"][0]["plan"]["objective"] == "首版交付计划"
     assert first_state["plan_revision_count"] == 0
     assert first_state["specialist_handoffs"] == []
+    assert first_state["plan_deliberation"]["selected_candidate_id"] == "risk_control"
+    assert first_state["plan_deliberation"]["arbitration_mode"] == "independent_arbiter"
+    assert len(first_state["plan_deliberation"]["candidates"]) == 3
+    assert first_state["plan_revisions"][0]["deliberation"] == first_state["plan_deliberation"]
     first_assignments = first_state["execution_plan"]["assignments"]
     assert all(assignment["required_capabilities"] for assignment in first_assignments)
     assert all(assignment["selection_reason"] for assignment in first_assignments)
@@ -294,6 +317,11 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
         "notification_secretary",
     }
     assert all(profile["capabilities"] for profile in planner_context["eligible_specialists"])
+    assert {
+        json.loads(prompt)["planning_perspective"]["id"]
+        for prompt in planner_prompts
+    } == {"delivery_confidence", "risk_control", "parallel_efficiency"}
+    assert len(planner_prompts) == 3
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
 
     with pytest.raises(ValueError, match="APPROVE or REVISE"):
@@ -315,6 +343,8 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert revised_state["plan_revisions"][1]["feedback"] == "补充安全边界，并为失败场景指定负责人"
     assert revised_state["plan_revision_count"] == 1
     assert revised_state["plan_approved"] is False
+    assert revised_state["plan_revisions"][1]["deliberation"]["selected_candidate_id"] == "risk_control"
+    assert len(planner_prompts) == 6
     assert "补充安全边界" in planner_prompts[-1]
     assert "首版交付计划" in planner_prompts[-1]
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
@@ -335,6 +365,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert historical_revision_state["plan_version"] == 3
     assert len(historical_revision_state["plan_revisions"]) == 3
     assert historical_revision_state["plan_revisions"][2]["feedback"] == "基于首版重新规划，保留原始交付边界"
+    assert len(planner_prompts) == 9
     assert "基于首版重新规划" in planner_prompts[-1]
     assert "首版交付计划" in planner_prompts[-1]
     assert "修订后的可审计交付计划" not in planner_prompts[-1]
@@ -347,6 +378,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert approved_state["plan_version"] == 1
     assert approved_state["execution_plan"]["objective"] == "首版交付计划"
     assert len(approved_state["plan_revisions"]) == 3
+    assert approved_state["plan_deliberation"] == approved_state["plan_revisions"][0]["deliberation"]
     assert len(approved_state["specialist_handoffs"]) == 2
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 4
     event_types = list(
@@ -359,6 +391,7 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert event_types.count("PLAN_REVISION_REQUESTED") == 2
     assert event_types.count("PLAN_APPROVED") == 1
     assert event_types.count("PLAN_CREATED") == 3
+    assert event_types.count("PLAN_DELIBERATED") == 3
     approved_event = db.scalar(
         select(WorkflowEvent)
         .where(

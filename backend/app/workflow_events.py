@@ -7,13 +7,16 @@ PUBLIC_WORKFLOW_EVENT_PAYLOAD_FIELDS = frozenset(
         "approval_gate",
         "branch_count",
         "branch_attempt",
+        "candidate_count",
         "completed_count",
         "decision",
         "decision_count",
         "dependency_count",
         "depends_on",
+        "distinct_candidate_count",
         "conflict_count",
         "failed_count",
+        "invalid_candidate_count",
         "lineage_sealed",
         "next_node",
         "next_branch_attempt",
@@ -35,6 +38,7 @@ PUBLIC_WORKFLOW_EVENT_PAYLOAD_FIELDS = frozenset(
         "reviewer_valid_count",
         "role",
         "roles",
+        "selected_candidate_id",
         "score",
         "source_plan_version",
         "success_criteria_count",
@@ -43,6 +47,7 @@ PUBLIC_WORKFLOW_EVENT_PAYLOAD_FIELDS = frozenset(
         "wave_count",
         "workflow_attempt",
         "will_retry",
+        "arbitration_mode",
     }
 )
 

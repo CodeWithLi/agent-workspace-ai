@@ -36,7 +36,7 @@
 1. Requirement Agent
 2. Product Agent
 3. Architect Agent
-4. Planning Agent：生成经过结构校验的动态执行 DAG。
+4. Planning Agent：从三个隔离视角生成候选，经确定性评分和架构师仲裁后形成动态执行 DAG。
 5. Plan Review：可选人工门禁，批准后才允许启动并行分支，或携带反馈退回 Planner 重做。
 6. Specialist Branches：根据已批准 DAG 按拓扑波次执行 2 至 4 个专业分支，同波并行并生成结构化 Handoff。
 7. Quality Gate：合并确定性检查和测试 Agent 评审，最多触发一轮自动修订。
@@ -46,11 +46,13 @@
 
 工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时按发起者角色冻结各 Agent 的 Prompt、模型、Prompt 版本、可用工具、知识权限、人工审批配置和并发限制，同时冻结专业分支重试策略；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
 
-服务端从四类专业角色的冻结快照生成确定性能力目录。角色固有能力与当前启用工具映射为能力集合；知识检索只有在 `knowledge_access=true` 且 `knowledge_search` 可用时存在；缺少 Agent、并发额度或全部专业工具的角色标记为不合格。Planner 只接收本次合格角色及其能力、工具、知识权限和并发额度；少于两个合格角色，或用户明确要求的知识检索/通知投递能力在目录中不存在时，都在调用模型前失败。每个 assignment 必须声明 `required_capabilities` 和 `selection_reason`，所需能力必须是该角色冻结能力的子集，整份计划还必须覆盖从用户目标推导出的明确领域能力。模型选择不可用角色、虚构能力或遗漏明确领域能力时，服务端丢弃候选并生成保留这些能力的确定性降级计划；降级计划也无法满足时明确失败，不会静默缩小需求。旧快照没有工具字段时使用角色历史默认工具恢复，旧计划没有能力元数据时由服务端补齐角色基线能力和可审计理由。
+服务端从四类专业角色的冻结快照生成确定性能力目录。角色固有能力与当前启用工具映射为能力集合；知识检索只有在 `knowledge_access=true` 且 `knowledge_search` 可用时存在；缺少 Agent、并发额度或全部专业工具的角色标记为不合格。Planner 只接收本次合格角色及其能力、工具、知识权限和并发额度；少于两个合格角色，或用户明确要求的知识检索/通知投递能力在目录中不存在时，都在调用模型前失败。每轮规划以相同输入分别调用交付完整性、风险控制和并行效率三个视角，候选彼此不可见。每个候选严格解析，不合法时只隔离该候选；全部候选无效才生成保留显式领域能力的确定性计划。
+
+有效候选按显式能力覆盖 30 分、专业角色匹配 20 分、成功标准质量 25 分、依赖并行效率 15 分和交付防线完整性 10 分形成 100 分证据。独立架构师只能返回已验证 `candidate_id`，不能修改候选计划；仲裁合同无效或调用失败时，服务端按总分及稳定候选 ID 确定性选择。`plan_deliberation` 保存候选完整计划、检查项、SHA-256 结构指纹、重复关系、选择依据和少数意见；同一快照写入 `plan_revisions[].deliberation`。从历史版本批准或重规划时，顶层计划与仲裁证据一起切换，避免跨版本错配。每个 assignment 仍必须声明 `required_capabilities` 和 `selection_reason`，所需能力必须是该角色冻结能力的子集，整份计划必须覆盖从用户目标推导出的明确领域能力。旧快照没有工具字段时使用角色历史默认工具恢复，没有仲裁字段时继续按单计划读取。
 
 项目页在启动前调用只读团队预检，展示目标所需能力、每名专业 Agent 的可用状态和阻断原因。真正的 `/workflow/run` 在项目互斥检查后用同一确定性规则重新检查，并把通过检查的配置快照直接交给初始状态；团队不就绪时发生在排队和计费之前，因此不会为注定无法编排的需求消耗额度或触发 Requirement、Product、Architect 模型调用。
 
-每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次、所需能力和组队依据，并展开冻结工具、完整能力、知识权限与并发额度。用户可选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并在批准时重新校验能力合同；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志和冻结能力，防止恢复、状态篡改或客户端绕过门禁。
+每个 assignment 可通过 `depends_on` 引用同一计划内的前置角色。Pydantic 合同拒绝重复、自依赖、未知依赖和环；缺少 `depends_on` 的旧快照按空依赖兼容。项目 UI 创建运行时开启 `require_plan_approval`，图在 `plan_review` 持久化暂停。每次规划都向 `plan_revisions` 追加不可变版本快照；UI 可比较版本、检查拓扑波次、所需能力和组队依据，并渐进展开候选目标、角色、波次、五项评分、选择依据与保留意见。用户可选择任一历史版本执行 `APPROVE` 或 `REVISE`。服务端只接受版本号，读取并在批准时重新校验能力合同；`REVISE` 必须携带反馈，并以所选版本作为 `planning` 的基线生成新版本。`APPROVE` 设置 `plan_approved` 后进入专业分支，`specialists` 节点再次校验批准标志和冻结能力，防止恢复、状态篡改或客户端绕过门禁。
 
 专业分支使用确定性拓扑排序分波执行：同一波通过 `asyncio.gather` 并行，下一波只接收 `depends_on` 指定的直接上游 Handoff，避免把无关产物塞入所有 Prompt。服务端为每条新 Handoff 规范化并封存完整计划、计划版本、assignment、修订轮次、直接上游输出指纹和自身输入/输出 SHA-256 指纹；Quality Gate 按拓扑顺序重新计算，正文被改写、计划漂移或仍引用旧上游的下游都会被识别并定向返修。没有封存字段的历史快照仍可读取，新旧 Handoff 可以在检查点恢复期间共存。每个尝试批次结束后原子持久化成功 Handoff、消息和失败事件；如果全部失败都属于 `LLMRetryableError`、Agent 并发饱和或超时，运行只对失败角色执行有界指数退避，退避后再次检查租约、暂停和取消，再开始下一批次。网关只把网络/超时、408/409/429、5xx 和畸形成功响应归为 `LLMRetryableError`。
 
@@ -58,7 +60,7 @@
 
 质量门禁先检查角色覆盖、交付内容、Handoff 证据链、成功标准和专业广度，再用 `asyncio.gather` 并行调用测试、运营和架构三个互不可见结论的 Reviewer。至少两份合法结构化合同构成 quorum；有效票按 Reviewer 自身分数、结论与阻塞项归约，最终分数取确定性分数与有效 Reviewer 分数中位数的较低值，并要求多数票通过。单个调用异常或合同无效只弃权，低于 quorum 则抛出专用错误，由 worker 在同一 `quality_gate` 检查点重试并持久化脱敏人数。账本合同包含共同决策、来源角色、审查置信度、冲突双方立场、解决状态、待确认问题和责任角色；服务端过滤计划外角色，精确去重多 Reviewer 的相同结论，并在任一阻塞冲突或阻塞问题仍开放时把评分封顶为 79、强制 `passed=false`、推导定向返修角色。自动修订仍未通过时，工作流暂停在 `quality_review`；后续节点消费同一仲裁账本，不重新猜测结论。
 
-除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`SPECIALIST_REVIEW_REQUIRED`、`SPECIALIST_RETRY_REQUESTED`、`SPECIALIST_REPLAN_REQUESTED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、成功/失败/可重试计数、恢复次数、证据链封存状态与上游数量、Reviewer 总数/有效数/quorum/通过票/分歧数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据。Reviewer 原始正文和无效输出不持久化，只有归一化摘要、票型与账本进入受控状态；完整指纹、Handoff、失败与恢复指令、决策与冲突正文、错误、Prompt、质量问题与人工反馈不会进入 SSE 或追踪响应。人工检查点重试仍创建不可变子运行；分支恢复则在原运行的已提交波次上继续。
+除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_DELIBERATED`、`PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`SPECIALIST_REVIEW_REQUIRED`、`SPECIALIST_RETRY_REQUESTED`、`SPECIALIST_REPLAN_REQUESTED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、波次、角色、依赖角色、分支数、候选数、不同结构数、无效候选数、仲裁模式、选中候选、成功/失败/可重试计数、恢复次数、证据链封存状态与上游数量、Reviewer 总数/有效数/quorum/通过票/分歧数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据。候选计划正文、Reviewer 原始正文和无效输出不会进入事件；只有归一化仲裁证据、摘要、票型与账本进入受控状态。完整指纹、Handoff、失败与恢复指令、决策与冲突正文、错误、Prompt、质量问题与人工反馈不会进入 SSE 或追踪响应。人工检查点重试仍创建不可变子运行；分支恢复则在原运行的已提交波次上继续。
 
 项目页在加载时回放最近的持久化事件，并在 SSE 更新后按角色重新归约状态；`workflow_attempt`、`branch_attempt`、`will_retry`、退避秒数和 `WAVE_RESTORED.roles` 共同区分等待、执行中、等待重试、失败、检查点恢复和已交接。SSE 中断或刷新不会把已知 Agent 退回“等待执行”。完成或恢复的分支可展开 Handoff 并查看来源指纹；质量门禁下方先展示三名 Reviewer 的关注域、有效性、票型、评分、摘要、quorum 和分歧数，再展示共同决策、冲突与待确认责任。失败门禁仍提供定向重试与重新规划。移动端使用相同文字、图标和元数据，不依赖 hover 或单一颜色。追踪中的质量节点归属 `reviewer_panel`，三个模型调用仍分别归属实际 Agent。
 

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api.routes import workflow as workflow_routes
 from app.api.routes.workflow import list_workflow_event_history, stream_workflow_events
 from app.models import Project, User, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.workflow_events import public_workflow_event_payload
 
 
 def workflow_context(
@@ -70,6 +71,33 @@ def add_event(db: Session, workflow: WorkflowRun, event_type: str, sequence: int
     db.commit()
     db.refresh(event)
     return event
+
+
+def test_plan_deliberation_event_exposes_summary_without_candidate_content() -> None:
+    payload = public_workflow_event_payload(
+        {
+            "candidate_count": 3,
+            "distinct_candidate_count": 2,
+            "invalid_candidate_count": 1,
+            "selected_candidate_id": "risk_control",
+            "arbitration_mode": "independent_arbiter",
+            "score": 94,
+            "plan_version": 2,
+            "candidates": [{"objective": "secret candidate plan"}],
+            "selection_reason": "secret arbiter reasoning",
+            "plan_fingerprint": "a" * 64,
+        }
+    )
+
+    assert payload == {
+        "candidate_count": 3,
+        "distinct_candidate_count": 2,
+        "invalid_candidate_count": 1,
+        "selected_candidate_id": "risk_control",
+        "arbitration_mode": "independent_arbiter",
+        "score": 94,
+        "plan_version": 2,
+    }
 
 
 def test_event_history_returns_latest_window_in_chronological_order_and_is_tenant_scoped(

@@ -17,7 +17,10 @@ from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
     SpecialistCapabilityProfile,
+    arbitrate_execution_plan_candidates,
+    assess_execution_plan_candidate,
     build_execution_waves,
+    build_fallback_plan,
     build_specialist_capability_catalog,
     build_task_blueprints,
     default_specialist_capability_catalog,
@@ -27,7 +30,7 @@ from app.agent.orchestration import (
     expand_revision_roles,
     infer_required_specialist_capabilities,
     merge_reviewer_panel,
-    parse_execution_plan,
+    parse_execution_plan_candidate,
     seal_handoff,
     validate_execution_plan_capabilities,
 )
@@ -43,6 +46,25 @@ from app.tools.registry import allowed_tools_for_role
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+PLANNING_PERSPECTIVES = (
+    {
+        "id": "delivery_confidence",
+        "label": "交付完整性",
+        "instruction": "优先保证目标、专业责任、交付物和成功标准完整且可追溯。",
+    },
+    {
+        "id": "risk_control",
+        "label": "风险控制",
+        "instruction": "优先识别失败边界、治理责任、恢复条件和不可绕过的验收门禁。",
+    },
+    {
+        "id": "parallel_efficiency",
+        "label": "并行效率",
+        "instruction": "在不破坏真实依赖的前提下减少串行波次和重复专业工作。",
+    },
+)
 
 
 class WorkflowCancelled(RuntimeError):
@@ -67,6 +89,7 @@ class ProjectState(TypedDict, total=False):
     execution_plan: dict[str, Any]
     plan_version: int
     plan_revisions: list[dict[str, Any]]
+    plan_deliberation: dict[str, Any]
     require_plan_approval: bool
     plan_approved: bool
     plan_revision_count: int
@@ -172,6 +195,7 @@ def initial_state(
         "execution_plan": {},
         "plan_version": 0,
         "plan_revisions": [],
+        "plan_deliberation": {},
         "require_plan_approval": require_plan_approval,
         "plan_approved": not require_plan_approval,
         "plan_revision_count": 0,
@@ -288,6 +312,28 @@ def select_execution_plan_version(
         raise ValueError(f"Execution plan version {selected_version} was not found")
     plan = MultiAgentExecutionPlan.model_validate(candidate)
     return plan.model_dump(mode="json"), selected_version
+
+
+def select_execution_plan_deliberation(
+    state: dict[str, Any],
+    selected_version: int,
+) -> dict[str, Any]:
+    revisions = state.get("plan_revisions")
+    revisions = revisions if isinstance(revisions, list) else []
+    revision = next(
+        (
+            item
+            for item in revisions
+            if isinstance(item, dict) and item.get("version") == selected_version
+        ),
+        None,
+    )
+    deliberation = revision.get("deliberation") if isinstance(revision, dict) else None
+    if isinstance(deliberation, dict):
+        return deliberation
+    current_version = int(state.get("plan_version") or 0)
+    current = state.get("plan_deliberation")
+    return current if selected_version == current_version and isinstance(current, dict) else {}
 
 
 def without_analysis(value: dict[str, Any]) -> dict[str, Any]:
@@ -530,44 +576,123 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             infer_required_specialist_capabilities(state["user_input"]),
         )
         eligible_roles = ", ".join(profile.role for profile in eligible_specialists)
-        planner_output = await invoke_agent(
-            AgentRole.project_manager,
-            (
-                "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
-                "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
-                "role、objective、deliverable、depends_on、required_capabilities、selection_reason。"
-                "depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
-                f"role 仅允许本次冻结目录中的合格角色：{eligible_roles}。"
-                "required_capabilities 必须是对应角色 capabilities 的非空子集；selection_reason 必须说明"
-                "任务所需能力为何与该角色的冻结能力、工具和知识权限匹配，不得虚构能力。"
-                "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
-                "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
-            ),
-            json.dumps(
-                agent_context(state, {
-                    "user_input": state["user_input"],
-                    "requirements": without_analysis(state["requirements"]),
-                    "architecture": state["architecture"],
-                    "product_prd": document_content(state, "PRD"),
-                    "system_design": document_content(state, "SYSTEM_DESIGN"),
-                    "eligible_specialists": [
-                        profile.model_dump(mode="json", exclude={"unavailable_reasons"})
-                        for profile in eligible_specialists
-                    ],
-                    "prior_execution_plan": state.get("execution_plan") or None,
-                    "plan_revision": {
-                        "round": int(state.get("plan_revision_count", 0)),
-                        "human_feedback": revision_feedback,
-                    } if revision_feedback else None,
-                }),
-                ensure_ascii=False,
-            ),
+        planner_prompt = (
+            "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
+            "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
+            "role、objective、deliverable、depends_on、required_capabilities、selection_reason。"
+            "depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
+            f"role 仅允许本次冻结目录中的合格角色：{eligible_roles}。"
+            "required_capabilities 必须是对应角色 capabilities 的非空子集；selection_reason 必须说明"
+            "任务所需能力为何与该角色的冻结能力、工具和知识权限匹配，不得虚构能力。"
+            "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
+            "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
+            "本次只从输入指定的 planning_perspective 独立规划，不得假设或引用其他候选方案。"
         )
-        plan = parse_execution_plan(
-            planner_output,
-            state["user_input"],
-            capability_catalog,
+        shared_planning_context = {
+            "user_input": state["user_input"],
+            "requirements": without_analysis(state["requirements"]),
+            "architecture": state["architecture"],
+            "product_prd": document_content(state, "PRD"),
+            "system_design": document_content(state, "SYSTEM_DESIGN"),
+            "eligible_specialists": [
+                profile.model_dump(mode="json", exclude={"unavailable_reasons"})
+                for profile in eligible_specialists
+            ],
+            "prior_execution_plan": state.get("execution_plan") or None,
+            "plan_revision": {
+                "round": int(state.get("plan_revision_count", 0)),
+                "human_feedback": revision_feedback,
+            } if revision_feedback else None,
+        }
+        candidates = []
+        invalid_candidate_count = 0
+        fingerprints: dict[str, str] = {}
+        for perspective in PLANNING_PERSPECTIVES:
+            try:
+                planner_output = await invoke_agent(
+                    AgentRole.project_manager,
+                    planner_prompt,
+                    json.dumps(
+                        agent_context(state, {
+                            **shared_planning_context,
+                            "planning_perspective": perspective,
+                        }),
+                        ensure_ascii=False,
+                    ),
+                )
+                candidate_plan = parse_execution_plan_candidate(
+                    planner_output,
+                    state["user_input"],
+                    capability_catalog,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Planning candidate %s failed with %s",
+                    perspective["id"],
+                    type(exc).__name__,
+                )
+                candidate_plan = None
+            if candidate_plan is None:
+                invalid_candidate_count += 1
+                continue
+            assessment = assess_execution_plan_candidate(
+                perspective["id"],
+                perspective["label"],
+                candidate_plan,
+                state["user_input"],
+            )
+            duplicate_of = fingerprints.get(assessment.plan_fingerprint)
+            if duplicate_of:
+                assessment = assessment.model_copy(update={"duplicate_of": duplicate_of})
+            else:
+                fingerprints[assessment.plan_fingerprint] = assessment.candidate_id
+            candidates.append(assessment)
+
+        if candidates:
+            try:
+                arbiter_output = await invoke_agent(
+                    AgentRole.architect,
+                    (
+                        "你是独立执行计划仲裁 Agent。只输出 JSON，字段为 selected_candidate_id、"
+                        "selection_reason、dissenting_candidate_ids、dissent_summary。"
+                        "只能选择输入中已通过服务端硬校验的 candidate_id，不得改写计划。"
+                        "综合目标适配、五项确定性评分和候选取舍作出选择；如选择非最高分方案，"
+                        "selection_reason 必须说明评分未覆盖的关键原因。保留主要少数方案及其取舍。"
+                    ),
+                    json.dumps(
+                        {
+                            "user_input": state["user_input"],
+                            "plan_revision_feedback": revision_feedback,
+                            "candidates": [
+                                candidate.model_dump(mode="json")
+                                for candidate in candidates
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Plan arbitration failed with %s", type(exc).__name__)
+                arbiter_output = ""
+        else:
+            fallback_plan = build_fallback_plan(state["user_input"], capability_catalog)
+            candidates = [
+                assess_execution_plan_candidate(
+                    "deterministic_fallback",
+                    "确定性兜底",
+                    fallback_plan,
+                    state["user_input"],
+                )
+            ]
+            arbiter_output = ""
+
+        deliberation = arbitrate_execution_plan_candidates(
+            arbiter_output,
+            candidates,
+            invalid_candidate_count=invalid_candidate_count,
         )
+        plan = deliberation.selected_plan
+        deliberation_snapshot = deliberation.model_dump(mode="json")
         approval_required = bool(state.get("require_plan_approval", False))
         revisions = state.get("plan_revisions")
         revisions = revisions if isinstance(revisions, list) else []
@@ -586,10 +711,31 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             {
                 "version": plan_version,
                 "plan": plan_snapshot,
+                "deliberation": deliberation_snapshot,
                 "feedback": revision_feedback,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
         ]
+        record_workflow_event(
+            db,
+            workflow,
+            "PLAN_DELIBERATED",
+            "Multi-candidate execution plan deliberation completed",
+            node="planning",
+            payload={
+                "candidate_count": len(deliberation.candidates),
+                "distinct_candidate_count": deliberation.distinct_candidate_count,
+                "invalid_candidate_count": deliberation.invalid_candidate_count,
+                "selected_candidate_id": deliberation.selected_candidate_id,
+                "arbitration_mode": deliberation.arbitration_mode,
+                "score": next(
+                    candidate.score
+                    for candidate in deliberation.candidates
+                    if candidate.candidate_id == deliberation.selected_candidate_id
+                ),
+                "plan_version": plan_version,
+            },
+        )
         record_workflow_event(
             db,
             workflow,
@@ -613,6 +759,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "execution_plan": plan_snapshot,
             "plan_version": plan_version,
             "plan_revisions": plan_revisions,
+            "plan_deliberation": deliberation_snapshot,
             "messages": append_message(
                 state,
                 "planning_agent",
@@ -1356,9 +1503,11 @@ async def continue_workspace_graph(
     reviewed_plan_version: int | None = None
     if gate == "plan_review":
         selected_plan, selected_version = select_execution_plan_version(persisted, plan_version)
+        selected_deliberation = select_execution_plan_deliberation(persisted, selected_version)
         reviewed_plan_version = selected_version
         persisted["execution_plan"] = selected_plan
         persisted["plan_version"] = selected_version
+        persisted["plan_deliberation"] = selected_deliberation
         if decision == "APPROVE":
             persisted["execution_plan"] = validate_execution_plan_for_dispatch(
                 persisted,

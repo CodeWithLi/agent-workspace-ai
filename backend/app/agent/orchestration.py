@@ -346,6 +346,86 @@ class MultiAgentExecutionPlan(BaseModel):
         return self
 
 
+class ExecutionPlanCandidateCheck(BaseModel):
+    name: Literal[
+        "capability_coverage",
+        "specialist_fit",
+        "success_contract",
+        "parallel_efficiency",
+        "delivery_balance",
+    ]
+    label: str = Field(min_length=2, max_length=100)
+    score: int = Field(ge=0, le=100)
+    max_score: int = Field(ge=1, le=100)
+    detail: str = Field(min_length=2, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_score_bound(self) -> "ExecutionPlanCandidateCheck":
+        if self.score > self.max_score:
+            raise ValueError("candidate check score cannot exceed its maximum")
+        return self
+
+
+class ExecutionPlanCandidate(BaseModel):
+    candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
+    perspective: str = Field(min_length=2, max_length=100)
+    plan: MultiAgentExecutionPlan
+    score: int = Field(ge=0, le=100)
+    checks: list[ExecutionPlanCandidateCheck] = Field(min_length=5, max_length=5)
+    plan_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    duplicate_of: str | None = Field(default=None, pattern=r"^[a-z0-9_]{2,40}$")
+
+    @model_validator(mode="after")
+    def validate_score_contract(self) -> "ExecutionPlanCandidate":
+        names = [check.name for check in self.checks]
+        if len(names) != len(set(names)):
+            raise ValueError("candidate check names must be unique")
+        if sum(check.max_score for check in self.checks) != 100:
+            raise ValueError("candidate check maximum scores must total 100")
+        if self.score != sum(check.score for check in self.checks):
+            raise ValueError("candidate score must equal the sum of its checks")
+        if self.duplicate_of == self.candidate_id:
+            raise ValueError("candidate cannot duplicate itself")
+        return self
+
+
+class ExecutionPlanDeliberation(BaseModel):
+    selected_candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
+    selection_reason: str = Field(min_length=4, max_length=2000)
+    arbitration_mode: Literal["independent_arbiter", "deterministic_fallback"]
+    arbiter_role: Literal["architect"] = "architect"
+    candidates: list[ExecutionPlanCandidate] = Field(min_length=1, max_length=3)
+    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=2)
+    dissent_summary: str = Field(default="", max_length=2000)
+    invalid_candidate_count: int = Field(default=0, ge=0, le=3)
+    distinct_candidate_count: int = Field(ge=1, le=3)
+
+    @model_validator(mode="after")
+    def validate_candidate_references(self) -> "ExecutionPlanDeliberation":
+        candidate_ids = [candidate.candidate_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("execution plan candidate ids must be unique")
+        if self.selected_candidate_id not in candidate_ids:
+            raise ValueError("selected execution plan candidate was not assessed")
+        if len(self.dissenting_candidate_ids) != len(set(self.dissenting_candidate_ids)):
+            raise ValueError("dissenting execution plan candidate ids must be unique")
+        invalid_dissent = set(self.dissenting_candidate_ids) - set(candidate_ids)
+        if invalid_dissent or self.selected_candidate_id in self.dissenting_candidate_ids:
+            raise ValueError("dissenting candidates must be assessed and unselected")
+        distinct_count = len({candidate.plan_fingerprint for candidate in self.candidates})
+        if self.distinct_candidate_count != distinct_count:
+            raise ValueError("distinct candidate count must match plan fingerprints")
+        return self
+
+    @property
+    def selected_plan(self) -> MultiAgentExecutionPlan:
+        return next(
+            candidate.plan
+            for candidate in self.candidates
+            if candidate.candidate_id == self.selected_candidate_id
+        )
+
+
 def bind_execution_plan_capabilities(
     plan: MultiAgentExecutionPlan,
     catalog: list[SpecialistCapabilityProfile],
@@ -426,6 +506,145 @@ def build_execution_waves(plan: MultiAgentExecutionPlan) -> list[list[Specialist
         resolved.update(wave_roles)
         remaining = [assignment for assignment in remaining if assignment.role not in wave_roles]
     return waves
+
+
+def assess_execution_plan_candidate(
+    candidate_id: str,
+    perspective: str,
+    plan: MultiAgentExecutionPlan,
+    user_input: str,
+    *,
+    duplicate_of: str | None = None,
+) -> ExecutionPlanCandidate:
+    required = infer_required_specialist_capabilities(user_input)
+    covered = {
+        capability
+        for assignment in plan.assignments
+        for capability in assignment.required_capabilities
+    }
+    covered_required = required & covered
+    capability_score = (
+        round(30 * len(covered_required) / len(required))
+        if required
+        else 30
+    )
+
+    fit_points = []
+    for assignment in plan.assignments:
+        points = 0
+        if assignment.required_capabilities:
+            points += 8
+        if len(assignment.selection_reason.strip()) >= 12:
+            points += 6
+        if len(assignment.objective.strip()) >= 8 and len(assignment.deliverable.strip()) >= 4:
+            points += 6
+        fit_points.append(points)
+    specialist_score = round(sum(fit_points) / len(fit_points))
+
+    criteria = list(dict.fromkeys(item.strip() for item in plan.success_criteria if item.strip()))
+    specificity_markers = (
+        "验收",
+        "证据",
+        "负责人",
+        "阈值",
+        "指标",
+        "时限",
+        "回滚",
+        "恢复",
+        "审计",
+        "measurable",
+        "evidence",
+        "owner",
+        "threshold",
+        "rollback",
+        "deadline",
+    )
+    specific_count = sum(
+        1
+        for criterion in criteria
+        if len(criterion) >= 16
+        or any(marker in criterion.lower() for marker in specificity_markers)
+    )
+    criterion_count_score = min(12, len(criteria) * 4)
+    criterion_specificity_score = round(13 * specific_count / len(criteria)) if criteria else 0
+    success_score = criterion_count_score + criterion_specificity_score
+
+    waves = build_execution_waves(plan)
+    branch_count = len(plan.assignments)
+    parallel_ratio = (
+        (branch_count - len(waves)) / (branch_count - 1)
+        if branch_count > 1
+        else 0
+    )
+    parallel_score = 8 + round(7 * parallel_ratio)
+
+    roles = {assignment.role for assignment in plan.assignments}
+    balance_score = 4 * int("test_engineer" in roles) + 4 * int("operations_analyst" in roles)
+    if not required or required <= covered:
+        balance_score += 2
+
+    checks = [
+        ExecutionPlanCandidateCheck(
+            name="capability_coverage",
+            label="显式能力覆盖",
+            score=capability_score,
+            max_score=30,
+            detail=(
+                f"覆盖 {len(covered_required)}/{len(required)} 项目标显式要求能力"
+                if required
+                else "目标未声明额外领域能力，基础能力合同完整"
+            ),
+        ),
+        ExecutionPlanCandidateCheck(
+            name="specialist_fit",
+            label="专业角色匹配",
+            score=specialist_score,
+            max_score=20,
+            detail=f"{branch_count}/{branch_count} 个分支已绑定能力、交付物和组队依据",
+        ),
+        ExecutionPlanCandidateCheck(
+            name="success_contract",
+            label="成功标准质量",
+            score=success_score,
+            max_score=25,
+            detail=f"{specific_count}/{len(criteria)} 项标准包含可执行或可审计约束",
+        ),
+        ExecutionPlanCandidateCheck(
+            name="parallel_efficiency",
+            label="依赖并行效率",
+            score=parallel_score,
+            max_score=15,
+            detail=f"{branch_count} 个分支编排为 {len(waves)} 个执行波次",
+        ),
+        ExecutionPlanCandidateCheck(
+            name="delivery_balance",
+            label="交付防线完整性",
+            score=balance_score,
+            max_score=10,
+            detail=(
+                "质量、运营与目标显式领域能力均有责任分支"
+                if balance_score == 10
+                else "质量或运营基础防线仍可加强"
+            ),
+        ),
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            plan.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ExecutionPlanCandidate(
+        candidate_id=candidate_id,
+        perspective=perspective,
+        plan=plan,
+        score=sum(check.score for check in checks),
+        checks=checks,
+        plan_fingerprint=fingerprint,
+        duplicate_of=duplicate_of,
+    )
 
 
 def expand_revision_roles(
@@ -745,6 +964,89 @@ def _json_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
+class _ExecutionPlanArbiterDecision(BaseModel):
+    selected_candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
+    selection_reason: str = Field(min_length=4, max_length=2000)
+    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=2)
+    dissent_summary: str = Field(default="", max_length=2000)
+
+
+def arbitrate_execution_plan_candidates(
+    text: str,
+    candidates: list[ExecutionPlanCandidate],
+    *,
+    invalid_candidate_count: int = 0,
+) -> ExecutionPlanDeliberation:
+    if not candidates:
+        raise ValueError("execution plan arbitration requires at least one valid candidate")
+    candidate_ids = {candidate.candidate_id for candidate in candidates}
+    distinct_candidate_count = len({candidate.plan_fingerprint for candidate in candidates})
+    for raw_decision in _json_candidates(text):
+        try:
+            decision = _ExecutionPlanArbiterDecision.model_validate(json.loads(raw_decision))
+        except (json.JSONDecodeError, ValidationError):
+            continue
+        if decision.selected_candidate_id not in candidate_ids:
+            continue
+        dissenting_ids = list(dict.fromkeys(decision.dissenting_candidate_ids))
+        if (
+            set(dissenting_ids) - candidate_ids
+            or decision.selected_candidate_id in dissenting_ids
+        ):
+            continue
+        return ExecutionPlanDeliberation(
+            selected_candidate_id=decision.selected_candidate_id,
+            selection_reason=decision.selection_reason,
+            arbitration_mode="independent_arbiter",
+            candidates=candidates,
+            dissenting_candidate_ids=dissenting_ids,
+            dissent_summary=decision.dissent_summary,
+            invalid_candidate_count=invalid_candidate_count,
+            distinct_candidate_count=distinct_candidate_count,
+        )
+
+    selected = max(candidates, key=lambda candidate: (candidate.score, candidate.candidate_id))
+    alternatives = [
+        candidate.candidate_id
+        for candidate in candidates
+        if candidate.candidate_id != selected.candidate_id
+    ]
+    return ExecutionPlanDeliberation(
+        selected_candidate_id=selected.candidate_id,
+        selection_reason=(
+            f"独立仲裁输出不可用，已按确定性评分选择 {selected.perspective}方案"
+            f"（{selected.score}/100）。"
+        ),
+        arbitration_mode="deterministic_fallback",
+        candidates=candidates,
+        dissenting_candidate_ids=alternatives,
+        dissent_summary=(
+            "其余已验证候选作为少数方案保留，未覆盖选中方案的综合评分优势。"
+            if alternatives
+            else "本轮只有一个候选通过完整合同校验。"
+        ),
+        invalid_candidate_count=invalid_candidate_count,
+        distinct_candidate_count=distinct_candidate_count,
+    )
+
+
+def parse_execution_plan_candidate(
+    text: str,
+    user_input: str,
+    capability_catalog: list[SpecialistCapabilityProfile] | None = None,
+) -> MultiAgentExecutionPlan | None:
+    catalog = capability_catalog or default_specialist_capability_catalog()
+    required_capabilities = infer_required_specialist_capabilities(user_input)
+    ensure_specialist_capabilities_available(catalog, required_capabilities)
+    for candidate in _json_candidates(text):
+        try:
+            plan = MultiAgentExecutionPlan.model_validate(json.loads(candidate))
+            return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
+        except (json.JSONDecodeError, ValidationError, ValueError):
+            continue
+    return None
+
+
 def build_fallback_plan(
     user_input: str,
     capability_catalog: list[SpecialistCapabilityProfile] | None = None,
@@ -838,14 +1140,9 @@ def parse_execution_plan(
     capability_catalog: list[SpecialistCapabilityProfile] | None = None,
 ) -> MultiAgentExecutionPlan:
     catalog = capability_catalog or default_specialist_capability_catalog()
-    required_capabilities = infer_required_specialist_capabilities(user_input)
-    ensure_specialist_capabilities_available(catalog, required_capabilities)
-    for candidate in _json_candidates(text):
-        try:
-            plan = MultiAgentExecutionPlan.model_validate(json.loads(candidate))
-            return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
-        except (json.JSONDecodeError, ValidationError, ValueError):
-            continue
+    plan = parse_execution_plan_candidate(text, user_input, catalog)
+    if plan is not None:
+        return plan
     return build_fallback_plan(user_input, catalog)
 
 

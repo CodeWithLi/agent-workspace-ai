@@ -305,7 +305,8 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
         "PROJECT_PLAN",
         "TEST_PLAN",
     }
-    assert len(prompts) == 11
+    assert len(prompts) == 13
+    assert sum("动态编排器" in prompt for prompt in prompts) == 3
     assert db.scalar(
         select(func.count(WorkflowEvent.id)).where(
             WorkflowEvent.workflow_id == response.workflow_id,
@@ -337,7 +338,7 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
     await process_workflow(db, response.workflow_id)
     db.expire_all()
     assert db.get(WorkflowRun, response.workflow_id).status == WorkflowStatus.completed
-    assert len(prompts) == 12
+    assert len(prompts) == 14
 
 
 @pytest.mark.asyncio

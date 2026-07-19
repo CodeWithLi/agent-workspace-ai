@@ -24,6 +24,7 @@ from app.langgraph.workflow import (
     prepare_specialist_replan,
     prepare_specialist_retry,
     record_workflow_event,
+    select_execution_plan_deliberation,
     select_execution_plan_version,
     snapshot_agent_configs,
     validate_execution_plan_for_dispatch,
@@ -581,8 +582,13 @@ async def continue_workflow(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=str(exc),
                 ) from exc
+            selected_deliberation = select_execution_plan_deliberation(
+                state,
+                reviewed_plan_version,
+            )
             state["execution_plan"] = selected_plan
             state["plan_version"] = reviewed_plan_version
+            state["plan_deliberation"] = selected_deliberation
             state["plan_approved"] = False
             state["plan_revision_feedback"] = feedback
             state["plan_revision_count"] = int(state.get("plan_revision_count", 0)) + 1
@@ -648,8 +654,10 @@ async def continue_workflow(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=str(exc),
             ) from exc
+        selected_deliberation = select_execution_plan_deliberation(state, selected_version)
         state["execution_plan"] = selected_plan
         state["plan_version"] = selected_version
+        state["plan_deliberation"] = selected_deliberation
         reviewed_plan_version = selected_version
         if payload.decision == "REVISE":
             if not feedback:

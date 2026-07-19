@@ -151,6 +151,64 @@
           <span v-else-if="previousPlanRevision">结构化计划内容未发生变化</span>
           <p v-if="selectedPlanRevision.feedback">重规划意见：{{ selectedPlanRevision.feedback }}</p>
         </div>
+        <section v-if="selectedPlanDeliberation" class="plan-deliberation" aria-labelledby="plan-deliberation-title">
+          <header class="plan-deliberation-heading">
+            <div>
+              <h5 id="plan-deliberation-title">方案仲裁</h5>
+              <span>{{ selectedPlanDeliberation.candidates.length }} 个候选 · {{ selectedPlanDeliberation.distinct_candidate_count }} 个不同结构</span>
+            </div>
+            <div class="plan-deliberation-tags">
+              <el-tag type="primary">{{ planArbitrationModeLabel }}</el-tag>
+              <el-tag v-if="selectedPlanDeliberation.invalid_candidate_count" type="warning">
+                {{ selectedPlanDeliberation.invalid_candidate_count }} 个无效候选已隔离
+              </el-tag>
+            </div>
+          </header>
+          <p class="plan-selection-evidence">
+            <el-icon aria-hidden="true"><CircleCheck /></el-icon>
+            <span><strong>选择依据</strong>{{ selectedPlanDeliberation.selection_reason }}</span>
+          </p>
+          <p v-if="selectedPlanDeliberation.dissent_summary" class="plan-dissent-summary">
+            <strong>保留意见</strong>{{ selectedPlanDeliberation.dissent_summary }}
+          </p>
+          <details class="plan-candidate-details">
+            <summary>候选方案与评分证据</summary>
+            <ul class="plan-candidate-list">
+              <li
+                v-for="candidate in selectedPlanDeliberation.candidates"
+                :key="candidate.candidate_id"
+                class="plan-candidate-row"
+                :class="{ selected: candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id }"
+                :aria-label="`${candidate.perspective}候选方案`"
+              >
+                <header>
+                  <div>
+                    <strong>{{ candidate.perspective }}</strong>
+                    <span>{{ candidate.plan.objective }}</span>
+                  </div>
+                  <div class="plan-candidate-status">
+                    <el-tag :type="candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? 'success' : 'info'">
+                      {{ candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? '已选中' : '备选' }}
+                    </el-tag>
+                    <strong>{{ candidate.score }}/100</strong>
+                  </div>
+                </header>
+                <p>{{ candidate.plan.rationale }}</p>
+                <div class="plan-candidate-meta">
+                  <span>{{ candidate.plan.assignments.map((assignment) => specialistRoleLabel(assignment.role)).join('、') }}</span>
+                  <span>{{ candidateTopologyLabel(candidate.plan) }}</span>
+                  <span v-if="candidate.duplicate_of">与 {{ candidatePerspectiveLabel(candidate.duplicate_of) }} 结构相同</span>
+                </div>
+                <dl class="plan-candidate-checks">
+                  <div v-for="check in candidate.checks" :key="check.name">
+                    <dt><span>{{ check.label }}</span><strong>{{ check.score }}/{{ check.max_score }}</strong></dt>
+                    <dd>{{ check.detail }}</dd>
+                  </div>
+                </dl>
+              </li>
+            </ul>
+          </details>
+        </section>
         <div class="plan-success-criteria">
           <strong>本轮成功标准</strong>
           <ul><li v-for="criterion in executionPlan.success_criteria" :key="criterion">{{ criterion }}</li></ul>
@@ -554,9 +612,40 @@ interface WorkflowExecutionPlan {
   team_capabilities?: WorkflowCapabilityProfile[]
 }
 
+interface WorkflowPlanCandidateCheck {
+  name: string
+  label: string
+  score: number
+  max_score: number
+  detail: string
+}
+
+interface WorkflowPlanCandidate {
+  candidate_id: string
+  perspective: string
+  plan: WorkflowExecutionPlan
+  score: number
+  checks: WorkflowPlanCandidateCheck[]
+  plan_fingerprint: string
+  duplicate_of?: string | null
+}
+
+interface WorkflowPlanDeliberation {
+  selected_candidate_id: string
+  selection_reason: string
+  arbitration_mode: 'independent_arbiter' | 'deterministic_fallback'
+  arbiter_role: 'architect'
+  candidates: WorkflowPlanCandidate[]
+  dissenting_candidate_ids: string[]
+  dissent_summary: string
+  invalid_candidate_count: number
+  distinct_candidate_count: number
+}
+
 interface WorkflowPlanRevision {
   version: number
   plan: WorkflowExecutionPlan
+  deliberation?: WorkflowPlanDeliberation
   feedback: string
   created_at: string
 }
@@ -793,6 +882,21 @@ const displayedPlanVersion = computed(() => {
 const selectedPlanRevision = computed(() => (
   planRevisions.value.find((revision) => revision.version === displayedPlanVersion.value) || null
 ))
+const selectedPlanDeliberation = computed<WorkflowPlanDeliberation | null>(() => {
+  const revisionDeliberation = selectedPlanRevision.value?.deliberation
+  if (isWorkflowPlanDeliberation(revisionDeliberation)) return revisionDeliberation
+  const currentDeliberation = workflowState.value?.plan_deliberation
+  const currentVersion = Number(workflowState.value?.plan_version) || latestPlanVersion.value
+  if (displayedPlanVersion.value === currentVersion && isWorkflowPlanDeliberation(currentDeliberation)) {
+    return currentDeliberation
+  }
+  return null
+})
+const planArbitrationModeLabel = computed(() => (
+  selectedPlanDeliberation.value?.arbitration_mode === 'independent_arbiter'
+    ? '架构师独立仲裁'
+    : '确定性评分降级'
+))
 const previousPlanRevision = computed(() => {
   const selectedIndex = planRevisions.value.findIndex((revision) => revision.version === displayedPlanVersion.value)
   return selectedIndex > 0 ? planRevisions.value[selectedIndex - 1] : null
@@ -835,7 +939,15 @@ const executionPlan = computed<WorkflowExecutionPlan | null>(() => {
 })
 const executionPlanWaves = computed(() => {
   const plan = executionPlan.value
-  if (!plan) return []
+  return plan ? executionWavesForPlan(plan) : []
+})
+const executionPlanTopologyLabel = computed(() => {
+  const branchCount = executionPlan.value?.assignments.length || 0
+  const waveCount = executionPlanWaves.value.length
+  return waveCount > 1 ? `${branchCount} 个分支 · ${waveCount} 波` : `${branchCount} 个并行分支`
+})
+
+function executionWavesForPlan(plan: WorkflowExecutionPlan) {
   let remaining = [...plan.assignments]
   const resolved = new Set<string>()
   const waves: Array<{ number: number; assignments: WorkflowAssignment[] }> = []
@@ -850,12 +962,20 @@ const executionPlanWaves = computed(() => {
     remaining = remaining.filter((assignment) => !waveRoles.has(assignment.role))
   }
   return waves
-})
-const executionPlanTopologyLabel = computed(() => {
-  const branchCount = executionPlan.value?.assignments.length || 0
-  const waveCount = executionPlanWaves.value.length
-  return waveCount > 1 ? `${branchCount} 个分支 · ${waveCount} 波` : `${branchCount} 个并行分支`
-})
+}
+
+function candidateTopologyLabel(plan: WorkflowExecutionPlan) {
+  const waveCount = executionWavesForPlan(plan).length
+  return waveCount > 1
+    ? `${plan.assignments.length} 个分支 · ${waveCount} 波`
+    : `${plan.assignments.length} 个并行分支`
+}
+
+function candidatePerspectiveLabel(candidateId: string) {
+  return selectedPlanDeliberation.value?.candidates.find((candidate) => (
+    candidate.candidate_id === candidateId
+  ))?.perspective || candidateId
+}
 const executionPlanApprovalLabel = computed(() => {
   if (!workflowState.value?.require_plan_approval) return ''
   if (workflowState.value?.plan_approved) return '已批准'
@@ -1040,6 +1160,24 @@ function documentLabel(type: string) {
   }[type] || type
 }
 
+function isWorkflowPlanDeliberation(value: unknown): value is WorkflowPlanDeliberation {
+  if (!value || typeof value !== 'object') return false
+  const deliberation = value as Partial<WorkflowPlanDeliberation>
+  return (
+    typeof deliberation.selected_candidate_id === 'string'
+    && typeof deliberation.selection_reason === 'string'
+    && ['independent_arbiter', 'deterministic_fallback'].includes(deliberation.arbitration_mode || '')
+    && Array.isArray(deliberation.candidates)
+    && deliberation.candidates.length > 0
+    && deliberation.candidates.every((candidate) => (
+      typeof candidate?.candidate_id === 'string'
+      && candidate.plan
+      && Array.isArray(candidate.plan.assignments)
+      && Array.isArray(candidate.checks)
+    ))
+  )
+}
+
 function workflowStageLabel(node: string) {
   return {
     requirement: '需求分析',
@@ -1066,6 +1204,7 @@ function workflowEventLabel(eventType: string) {
     NODE_STARTED: '开始节点',
     NODE_COMPLETED: '完成节点',
     NODE_FAILED: '节点执行失败',
+    PLAN_DELIBERATED: '候选计划已仲裁',
     PLAN_CREATED: '计划已生成',
     PLAN_APPROVED: '计划已批准',
     PLAN_REVISION_REQUESTED: '要求重新规划',
@@ -1868,6 +2007,198 @@ onBeforeUnmount(disposeWorkflowEventStream)
   overflow-wrap: anywhere;
 }
 
+.plan-deliberation {
+  margin-bottom: 12px;
+  padding: 12px 0;
+  border-block: 1px solid var(--color-border);
+}
+
+.plan-deliberation-heading,
+.plan-candidate-row > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 16px;
+}
+
+.plan-deliberation-heading > div:first-child,
+.plan-candidate-row > header > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.plan-deliberation-heading h5 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.plan-deliberation-heading span,
+.plan-candidate-row > header span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.plan-deliberation-tags,
+.plan-candidate-status,
+.plan-candidate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.plan-deliberation-tags,
+.plan-candidate-status {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
+
+.plan-selection-evidence,
+.plan-dissent-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--color-success);
+  background: #f0fdf4;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.plan-selection-evidence .el-icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--color-success);
+  font-size: 14px;
+}
+
+.plan-selection-evidence strong,
+.plan-dissent-summary strong {
+  margin-right: 7px;
+  color: var(--color-foreground);
+}
+
+.plan-dissent-summary {
+  display: block;
+  border-left-color: var(--color-warning);
+  background: #fffbeb;
+}
+
+.plan-candidate-details {
+  margin-top: 10px;
+  border-block: 1px solid var(--color-border);
+}
+
+.plan-candidate-details > summary {
+  min-height: 40px;
+  padding: 10px 8px;
+  color: var(--color-primary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.plan-candidate-details > summary:focus-visible {
+  border-radius: var(--radius-sm);
+  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline-offset: 1px;
+}
+
+.plan-candidate-list {
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--color-border);
+  list-style: none;
+}
+
+.plan-candidate-row {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.plan-candidate-row + .plan-candidate-row {
+  border-top: 1px solid var(--color-border);
+}
+
+.plan-candidate-row.selected {
+  box-shadow: inset 3px 0 0 var(--color-success);
+}
+
+.plan-candidate-row > header strong {
+  font-size: 13px;
+}
+
+.plan-candidate-status > strong {
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-candidate-row > p {
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.plan-candidate-meta {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plan-candidate-meta span + span::before {
+  margin-right: 10px;
+  color: var(--color-border-strong);
+  content: "·";
+}
+
+.plan-candidate-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0 16px;
+  margin: 0;
+  border-top: 1px dashed var(--color-border);
+}
+
+.plan-candidate-checks > div {
+  min-width: 0;
+  padding: 8px 0;
+}
+
+.plan-candidate-checks dt {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plan-candidate-checks dt strong {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-candidate-checks dd {
+  margin: 2px 0 0;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .plan-success-criteria {
   display: grid;
   grid-template-columns: 112px minmax(0, 1fr);
@@ -2660,6 +2991,11 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .plan-version-selector :deep(.el-segmented) {
     min-height: 44px;
   }
+
+  .plan-candidate-details > summary {
+    min-height: 44px;
+    padding-block: 12px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -2694,6 +3030,20 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .orchestration-heading {
     flex-direction: column;
+  }
+
+  .plan-deliberation-heading,
+  .plan-candidate-row > header {
+    flex-direction: column;
+  }
+
+  .plan-deliberation-tags,
+  .plan-candidate-status {
+    justify-content: flex-start;
+  }
+
+  .plan-candidate-checks {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .decision-ledger-heading {
