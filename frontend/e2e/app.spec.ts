@@ -529,7 +529,7 @@ async function mockApi(page: Page) {
         success_criteria: ['核心路径可验收', '失败过程可回滚']
       },
       specialist_handoffs: [
-        { role: 'test_engineer', objective: '审查边界场景和验收证据', deliverable: '测试与验收清单', content: '已覆盖核心路径，但缺少证据负责人。', revision_round: 1 },
+        { role: 'test_engineer', objective: '审查边界场景和验收证据', deliverable: '测试与验收清单', content: '已覆盖核心路径，但缺少证据负责人。', revision_round: 1, contract_version: 2, structured: false },
         { role: 'operations_analyst', objective: '审查灰度发布和故障恢复', deliverable: '发布运行手册', content: '已定义灰度和回滚窗口。', revision_round: 1 }
       ],
       quality_gate: {
@@ -2652,8 +2652,46 @@ test('restores live specialist retry states and opens completed handoffs', async
           role: 'operations_analyst',
           objective: '定义发布和回滚边界',
           deliverable: '发布运行手册',
-          content: '已完成发布窗口、监控阈值、失败信号和回滚负责人定义。',
+          content: '## 摘要\n已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。',
           revision_round: 0,
+          contract_version: 2,
+          structured: true,
+          summary: '已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。',
+          decisions: [
+            {
+              title: '分阶段灰度',
+              outcome: '先发布 10% 流量，观察稳定后再逐步扩容。',
+              rationale: '缩小首轮风险面，并保留确定性的停止点。'
+            }
+          ],
+          evidence: [
+            {
+              claim: '核心发布路径具备可复现的验收证据。',
+              source: '灰度演练记录与监控快照',
+              verification: '重新执行灰度演练并核对成功标准。'
+            }
+          ],
+          risks: [
+            {
+              risk: '扩容后错误率可能超过当前预算。',
+              mitigation: '达到告警阈值时停止扩容并回滚。',
+              owner_role: 'operations_analyst'
+            }
+          ],
+          open_questions: [
+            {
+              question: '正式发布窗口是否已经确认？',
+              owner_role: 'operations_analyst',
+              blocking: false
+            }
+          ],
+          next_actions: [
+            {
+              action: '执行 10% 灰度并归档监控记录。',
+              owner_role: 'operations_analyst',
+              acceptance_criteria: '核心指标稳定且证据可由 Reviewer 复核。'
+            }
+          ],
           plan_version: 2,
           upstream_fingerprints: {},
           input_fingerprint: 'a'.repeat(64),
@@ -2677,7 +2715,7 @@ test('restores live specialist retry states and opens completed handoffs', async
     { id: 1, workflow_id: 150, node: 'specialists', event_type: 'WAVE_STARTED', message: 'wave started', payload: { wave: 1, roles: ['operations_analyst', 'test_engineer'] }, created_at: '2026-07-19T10:00:02Z' },
     { id: 2, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'operations started', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
     { id: 3, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'test started', payload: { role: 'test_engineer', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
-    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1, lineage_sealed: true, upstream_count: 0, plan_version: 2 }, created_at: '2026-07-19T10:00:07Z' },
+    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1, contract_version: 2, structured: true, decision_count: 1, evidence_count: 1, risk_count: 1, open_question_count: 1, next_action_count: 1, lineage_sealed: true, upstream_count: 0, plan_version: 2 }, created_at: '2026-07-19T10:00:07Z' },
     { id: 5, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_FAILED', message: 'test failed', payload: { role: 'test_engineer', branch_attempt: 1, retryable: true, will_retry: true }, created_at: '2026-07-19T10:00:07Z' },
     { id: 6, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_RETRY_SCHEDULED', message: 'test retry scheduled', payload: { role: 'test_engineer', branch_attempt: 1, next_branch_attempt: 2, retry_delay_seconds: 1 }, created_at: '2026-07-19T10:00:08Z' }
   ]
@@ -2702,12 +2740,27 @@ test('restores live specialist retry states and opens completed handoffs', async
   await expect(lineage.getByText('计划 v2 · 修订 R0', { exact: true })).toBeVisible()
   await expect(lineage.getByText('独立根分支', { exact: true })).toBeVisible()
   await expect(lineage.getByText('aaaaaaaaaa → bbbbbbbbbb', { exact: true })).toBeVisible()
-  await expect(page.getByText('已完成发布窗口、监控阈值、失败信号和回滚负责人定义。')).toBeVisible()
+  const contract = page.getByRole('region', { name: '运营分析师结构化 Handoff 合同' })
+  await expect(contract.getByText('结构化合同 v2', { exact: true })).toBeVisible()
+  await expect(contract.getByText('已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。', { exact: true })).toBeVisible()
+  await expect(contract.locator('.handoff-contract-counts > div').filter({ hasText: '决策' })).toHaveText('决策1')
+  await contract.locator('summary').filter({ hasText: '关键决策' }).click()
+  await expect(contract.getByText('先发布 10% 流量，观察稳定后再逐步扩容。', { exact: true })).toBeVisible()
+  await contract.locator('summary').filter({ hasText: '验收证据' }).click()
+  await expect(contract.getByText('灰度演练记录与监控快照', { exact: true })).toBeVisible()
+  await expect(contract.getByText('重新执行灰度演练并核对成功标准。', { exact: true })).toBeVisible()
+  await contract.locator('summary').filter({ hasText: '风险与缓解' }).click()
+  await expect(contract.getByText('达到告警阈值时停止扩容并回滚。', { exact: true })).toBeVisible()
+  await contract.locator('summary').filter({ hasText: '开放问题' }).click()
+  await expect(contract.getByText('正式发布窗口是否已经确认？', { exact: true })).toBeVisible()
+  await contract.locator('summary').filter({ hasText: '下一步行动' }).click()
+  await expect(contract.getByText('核心指标稳定且证据可由 Reviewer 复核。', { exact: true })).toBeVisible()
   if (testInfo.project.name === 'mobile-chromium') {
     await page.emulateMedia({ reducedMotion: 'reduce' })
     for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
       await page.setViewportSize(viewport)
       await expect(lineage).toBeVisible()
+      await expect(contract).toBeVisible()
       expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
     }
   }
@@ -2852,6 +2905,17 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await expect(ledger.getByText('全量回归通过后才能发布。', { exact: true })).toBeVisible()
   await expect(ledger.getByText('由谁确认灰度扩容阈值？', { exact: true })).toBeVisible()
   await expect(ledger.getByText('阻塞中', { exact: true }).first()).toBeVisible()
+
+  const testBranch = page.locator('.orchestration-branch-row').filter({ hasText: '测试工程师' })
+  await testBranch.getByRole('button', { name: '查看测试工程师交接' }).click()
+  const invalidHandoff = page.locator('#handoff-test_engineer')
+  await expect(invalidHandoff.getByRole('alert')).toContainText('结构化合同未通过')
+  await expect(invalidHandoff.getByText('已覆盖核心路径，但缺少证据负责人。', { exact: true })).toBeVisible()
+  const operationsBranch = page.locator('.orchestration-branch-row').filter({ hasText: '运营分析师' })
+  await operationsBranch.getByRole('button', { name: '查看运营分析师交接' }).click()
+  const legacyHandoff = page.locator('#handoff-operations_analyst')
+  await expect(legacyHandoff.getByText('已定义灰度和回滚窗口。', { exact: true })).toBeVisible()
+  await expect(legacyHandoff.locator('.handoff-contract')).toHaveCount(0)
 
   const revisionButton = page.getByRole('button', { name: '提交修订意见', exact: true })
   await expect(revisionButton).toBeDisabled()

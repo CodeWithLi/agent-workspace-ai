@@ -511,7 +511,111 @@
                 <code>{{ shortFingerprint(handoff.input_fingerprint) }} → {{ shortFingerprint(handoff.output_fingerprint) }}</code>
               </div>
             </section>
-            <pre>{{ handoff.content }}</pre>
+            <section
+              v-if="isStructuredHandoff(handoff)"
+              class="handoff-contract"
+              :aria-label="`${specialistRoleLabel(handoff.role)}结构化 Handoff 合同`"
+            >
+              <header class="handoff-contract-heading">
+                <div class="handoff-contract-status">
+                  <el-icon aria-hidden="true"><DocumentChecked /></el-icon>
+                  <strong>结构化合同 v{{ handoff.contract_version }}</strong>
+                </div>
+                <dl class="handoff-contract-counts" aria-label="Handoff 合同内容摘要">
+                  <div><dt>决策</dt><dd>{{ handoff.decisions?.length || 0 }}</dd></div>
+                  <div><dt>证据</dt><dd>{{ handoff.evidence?.length || 0 }}</dd></div>
+                  <div><dt>风险</dt><dd>{{ handoff.risks?.length || 0 }}</dd></div>
+                  <div><dt>问题</dt><dd>{{ handoff.open_questions?.length || 0 }}</dd></div>
+                  <div><dt>行动</dt><dd>{{ handoff.next_actions?.length || 0 }}</dd></div>
+                </dl>
+              </header>
+              <p class="handoff-contract-summary">{{ handoff.summary }}</p>
+              <div class="handoff-contract-groups">
+                <details v-if="handoff.decisions?.length" class="handoff-contract-group">
+                  <summary>
+                    <span><el-icon aria-hidden="true"><Memo /></el-icon>关键决策</span>
+                    <small>{{ handoff.decisions.length }} 项</small>
+                  </summary>
+                  <ol class="handoff-contract-list">
+                    <li v-for="decision in handoff.decisions" :key="`${decision.title}:${decision.outcome}`">
+                      <strong>{{ decision.title }}</strong>
+                      <p>{{ decision.outcome }}</p>
+                      <dl><div><dt>依据</dt><dd>{{ decision.rationale }}</dd></div></dl>
+                    </li>
+                  </ol>
+                </details>
+                <details v-if="handoff.evidence?.length" class="handoff-contract-group">
+                  <summary>
+                    <span><el-icon aria-hidden="true"><CircleCheck /></el-icon>验收证据</span>
+                    <small>{{ handoff.evidence.length }} 项</small>
+                  </summary>
+                  <ol class="handoff-contract-list">
+                    <li v-for="evidence in handoff.evidence" :key="`${evidence.claim}:${evidence.source}`">
+                      <strong>{{ evidence.claim }}</strong>
+                      <dl>
+                        <div><dt>来源</dt><dd>{{ evidence.source }}</dd></div>
+                        <div><dt>验证</dt><dd>{{ evidence.verification }}</dd></div>
+                      </dl>
+                    </li>
+                  </ol>
+                </details>
+                <details v-if="handoff.risks?.length" class="handoff-contract-group">
+                  <summary>
+                    <span><el-icon aria-hidden="true"><WarningFilled /></el-icon>风险与缓解</span>
+                    <small>{{ handoff.risks.length }} 项</small>
+                  </summary>
+                  <ol class="handoff-contract-list">
+                    <li v-for="risk in handoff.risks" :key="`${risk.risk}:${risk.owner_role}`">
+                      <strong>{{ risk.risk }}</strong>
+                      <p>{{ risk.mitigation }}</p>
+                      <dl><div><dt>负责人</dt><dd>{{ specialistRoleLabel(risk.owner_role) }}</dd></div></dl>
+                    </li>
+                  </ol>
+                </details>
+                <details v-if="handoff.open_questions?.length" class="handoff-contract-group">
+                  <summary>
+                    <span><el-icon aria-hidden="true"><QuestionFilled /></el-icon>开放问题</span>
+                    <small>{{ handoff.open_questions.length }} 项</small>
+                  </summary>
+                  <ol class="handoff-contract-list">
+                    <li v-for="question in handoff.open_questions" :key="`${question.question}:${question.owner_role}`">
+                      <strong>{{ question.question }}</strong>
+                      <dl>
+                        <div><dt>状态</dt><dd :class="{ 'handoff-blocking': question.blocking }">{{ question.blocking ? '阻塞' : '非阻塞' }}</dd></div>
+                        <div><dt>负责人</dt><dd>{{ specialistRoleLabel(question.owner_role) }}</dd></div>
+                      </dl>
+                    </li>
+                  </ol>
+                </details>
+                <details v-if="handoff.next_actions?.length" class="handoff-contract-group">
+                  <summary>
+                    <span><el-icon aria-hidden="true"><Promotion /></el-icon>下一步行动</span>
+                    <small>{{ handoff.next_actions.length }} 项</small>
+                  </summary>
+                  <ol class="handoff-contract-list">
+                    <li v-for="action in handoff.next_actions" :key="`${action.action}:${action.owner_role}`">
+                      <strong>{{ action.action }}</strong>
+                      <dl>
+                        <div><dt>负责人</dt><dd>{{ specialistRoleLabel(action.owner_role) }}</dd></div>
+                        <div><dt>完成标准</dt><dd>{{ action.acceptance_criteria }}</dd></div>
+                      </dl>
+                    </li>
+                  </ol>
+                </details>
+              </div>
+            </section>
+            <div
+              v-else-if="handoff.contract_version && handoff.contract_version >= 2"
+              class="handoff-contract-invalid"
+              role="alert"
+            >
+              <el-icon aria-hidden="true"><WarningFilled /></el-icon>
+              <div>
+                <strong>结构化合同未通过</strong>
+                <span>原始输出已保留，Quality Gate 将要求该分支修订。</span>
+              </div>
+            </div>
+            <pre v-if="!isStructuredHandoff(handoff)">{{ handoff.content }}</pre>
           </el-collapse-item>
         </el-collapse>
         <div v-if="qualityGate" class="quality-gate-summary" :class="{ failed: !qualityGate.passed }">
@@ -780,7 +884,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleCheck, CircleClose, Clock, Connection, Delete, Edit, Loading, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
+import { CircleCheck, CircleClose, Clock, Connection, Delete, DocumentChecked, Edit, Loading, MagicStick, Memo, Plus, Promotion, QuestionFilled, RefreshRight, VideoPause, View, WarningFilled } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, PerformanceEvidenceLevel, PlanPerformanceEvidence, Project, ProjectActivity, ProjectMember, Task, TeamRolePerformanceEvidence, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
@@ -927,10 +1031,48 @@ interface WorkflowPlanRevision {
 interface WorkflowHandoff extends WorkflowAssignment {
   content: string
   revision_round: number
+  contract_version?: number
+  structured?: boolean
+  summary?: string
+  decisions?: WorkflowHandoffDecision[]
+  evidence?: WorkflowHandoffEvidence[]
+  risks?: WorkflowHandoffRisk[]
+  open_questions?: WorkflowHandoffQuestion[]
+  next_actions?: WorkflowHandoffAction[]
   plan_version?: number
   upstream_fingerprints?: Record<string, string>
   input_fingerprint?: string
   output_fingerprint?: string
+}
+
+interface WorkflowHandoffDecision {
+  title: string
+  outcome: string
+  rationale: string
+}
+
+interface WorkflowHandoffEvidence {
+  claim: string
+  source: string
+  verification: string
+}
+
+interface WorkflowHandoffRisk {
+  risk: string
+  mitigation: string
+  owner_role: string
+}
+
+interface WorkflowHandoffQuestion {
+  question: string
+  owner_role: string
+  blocking: boolean
+}
+
+interface WorkflowHandoffAction {
+  action: string
+  owner_role: string
+  acceptance_criteria: string
 }
 
 interface WorkflowCollaborationDecision {
@@ -1754,6 +1896,10 @@ function reviewerStatusIcon(reviewer: WorkflowReviewerAssessment) {
 
 function handoffFor(role: string) {
   return specialistHandoffs.value.find((handoff) => handoff.role === role)
+}
+
+function isStructuredHandoff(handoff: WorkflowHandoff) {
+  return handoff.contract_version === 2 && handoff.structured === true
 }
 
 function shortFingerprint(fingerprint?: string) {
@@ -3273,6 +3419,207 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-size: 11px;
 }
 
+.handoff-contract {
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.handoff-contract-heading {
+  display: flex;
+  min-height: 44px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  background: var(--color-primary-soft);
+}
+
+.handoff-contract-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--color-primary);
+  font-size: 13px;
+}
+
+.handoff-contract-counts {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.handoff-contract-counts > div {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.handoff-contract-counts dt {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.handoff-contract-counts dd {
+  margin: 0;
+  color: var(--color-foreground);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.handoff-contract-summary {
+  margin: 0;
+  padding: 12px 14px;
+  color: var(--color-secondary-text);
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.handoff-contract-groups {
+  border-top: 1px solid var(--color-border);
+}
+
+.handoff-contract-group + .handoff-contract-group {
+  border-top: 1px solid var(--color-border);
+}
+
+.handoff-contract-group > summary {
+  display: list-item;
+  min-height: 44px;
+  list-style-position: inside;
+  padding: 8px 14px;
+  cursor: pointer;
+  color: var(--color-foreground);
+  font-size: 12px;
+  line-height: 28px;
+}
+
+.handoff-contract-group > summary:hover {
+  background: #f9fafb;
+}
+
+.handoff-contract-group > summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 700;
+}
+
+.handoff-contract-group > summary .el-icon {
+  color: var(--color-primary);
+}
+
+.handoff-contract-group > summary small {
+  float: right;
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.handoff-contract-group[open] > summary {
+  border-bottom: 1px solid var(--color-border);
+  background: #f9fafb;
+}
+
+.handoff-contract-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.handoff-contract-list li {
+  padding: 12px 14px;
+}
+
+.handoff-contract-list li + li {
+  border-top: 1px solid var(--color-border);
+}
+
+.handoff-contract-list strong,
+.handoff-contract-list p,
+.handoff-contract-list dl {
+  overflow-wrap: anywhere;
+}
+
+.handoff-contract-list strong {
+  display: block;
+  color: var(--color-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.handoff-contract-list p {
+  margin: 5px 0 0;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.handoff-contract-list dl {
+  display: grid;
+  gap: 5px;
+  margin: 8px 0 0;
+}
+
+.handoff-contract-list dl > div {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.handoff-contract-list dt,
+.handoff-contract-list dd {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.handoff-contract-list dt {
+  color: var(--color-muted-text);
+}
+
+.handoff-contract-list dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-secondary-text);
+}
+
+.handoff-contract-list .handoff-blocking {
+  color: var(--color-danger);
+  font-weight: 700;
+}
+
+.handoff-contract-invalid {
+  display: flex;
+  min-height: 44px;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px 12px;
+  border-top: 1px solid #fde68a;
+  background: #fffbeb;
+  color: var(--color-warning);
+}
+
+.handoff-contract-invalid > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.handoff-contract-invalid strong {
+  font-size: 12px;
+}
+
+.handoff-contract-invalid span {
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .handoff-details pre {
   max-height: 280px;
   margin: 0;
@@ -3875,6 +4222,21 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .branch-capability-summary > div,
   .branch-capability-details dl > div {
     grid-template-columns: 1fr;
+    gap: 1px;
+  }
+
+  .handoff-contract-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .handoff-contract-counts {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .handoff-contract-list dl > div {
+    grid-template-columns: minmax(0, 1fr);
     gap: 1px;
   }
 

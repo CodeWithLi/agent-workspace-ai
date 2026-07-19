@@ -33,7 +33,7 @@ An independently executable assignment in an Execution Plan whose result can be 
 _Avoid_: Agent, workflow node
 
 **Handoff**:
-A Specialist Branch result that identifies its owner, objective, promised deliverable, revision round and substantive output.
+A versioned Specialist Branch contract that identifies its owner, objective, promised deliverable and revision round. Handoff v2 separates summary, decisions, evidence, risks, open questions and next actions into bounded fields; legacy v1 retains substantive free-form output for compatibility.
 _Avoid_: Message, response
 
 **Quality Gate**:
