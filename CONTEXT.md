@@ -21,7 +21,7 @@ The validated objective, specialist assignments, expected deliverables and succe
 _Avoid_: Prompt, task list
 
 **Team Performance Profile**:
-A frozen, same-project history of observed Specialist Branch delivery behavior used as planning evidence.
+A frozen, same-project and configuration-comparable history of observed Specialist Branch delivery behavior used as planning evidence.
 _Avoid_: SLO, execution guarantee, cross-project benchmark
 
 **Specialist Branch**:

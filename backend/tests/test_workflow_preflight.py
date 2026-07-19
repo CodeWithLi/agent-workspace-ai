@@ -10,7 +10,8 @@ from starlette.requests import Request
 
 from app.agent.service import ensure_default_agents
 from app.api.routes.workflow import preflight_workflow, run_workflow
-from app.models import Agent, AgentRole, AgentTool, Project, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun
+from app.langgraph.workflow import snapshot_agent_configs
+from app.models import Agent, AgentRole, AgentTool, Project, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.schemas import WorkflowPreflightRequest, WorkflowRequest
 
 
@@ -69,7 +70,9 @@ def test_workflow_preflight_is_read_only_and_reports_eligible_team(db: Session) 
     }
     assert result.team_performance_profile.project_id == project.id
     assert result.team_performance_profile.workflow_count == 0
+    assert result.team_performance_profile.configuration_scope == "CURRENT_CONFIGURATION"
     assert result.team_performance_profile.branch_sample_count == 0
+    assert result.team_performance_profile.excluded_branch_sample_count == 0
     assert result.team_performance_profile.observed_role_count == 0
     assert {item.role for item in result.team_performance_profile.roles} == {
         "test_engineer",
@@ -84,6 +87,65 @@ def test_workflow_preflight_is_read_only_and_reports_eligible_team(db: Session) 
     assert db.scalar(select(func.count(WorkflowRun.id))) == 0
     assert db.scalar(select(func.count(TokenTransaction.id))) == 0
     assert db.get(User, user.id).ai_token_balance == 1000
+
+
+def test_workflow_preflight_uses_only_current_agent_configuration_history(
+    db: Session,
+) -> None:
+    ensure_default_agents(db)
+    user, project = create_workspace(db, "preflight-aligned@example.com")
+    current_snapshot = snapshot_agent_configs(db, user.role)
+    stale_snapshot = json.loads(json.dumps(current_snapshot))
+    stale_snapshot["test_engineer"]["model"] = "retired-model"
+
+    for snapshot in (current_snapshot, stale_snapshot):
+        workflow = WorkflowRun(
+            project_id=project.id,
+            user_id=user.id,
+            status=WorkflowStatus.completed,
+            current_node="completed",
+            state_json=json.dumps({"agent_snapshot": snapshot}),
+        )
+        db.add(workflow)
+        db.flush()
+        db.add_all(
+            [
+                WorkflowEvent(
+                    workflow_id=workflow.id,
+                    node="specialists",
+                    event_type="BRANCH_STARTED",
+                    message="started",
+                    payload_json=json.dumps(
+                        {"role": "test_engineer", "wave": 1, "branch_attempt": 1}
+                    ),
+                ),
+                WorkflowEvent(
+                    workflow_id=workflow.id,
+                    node="specialists",
+                    event_type="BRANCH_COMPLETED",
+                    message="completed",
+                    payload_json=json.dumps(
+                        {"role": "test_engineer", "wave": 1, "branch_attempt": 1}
+                    ),
+                ),
+            ]
+        )
+    db.commit()
+
+    result = preflight_workflow(
+        WorkflowPreflightRequest(project_id=project.id, user_input="规划可验证交付"),
+        user,
+        db,
+    )
+
+    profile = result.team_performance_profile
+    evidence = profile.for_role("test_engineer")
+    assert profile.workflow_count == 2
+    assert profile.branch_sample_count == 1
+    assert profile.excluded_branch_sample_count == 1
+    assert evidence is not None
+    assert evidence.sample_count == 1
+    assert evidence.excluded_sample_count == 1
 
 
 @pytest.mark.asyncio
@@ -184,6 +246,8 @@ async def test_workflow_run_freezes_team_performance_and_emits_count_only_snapsh
     assert profile["project_id"] == project.id
     assert profile["workflow_count"] == 0
     assert profile["branch_sample_count"] == 0
+    assert profile["configuration_scope"] == "CURRENT_CONFIGURATION"
+    assert profile["excluded_branch_sample_count"] == 0
     assert len(profile["roles"]) == 4
     event = db.scalar(
         select(WorkflowEvent).where(
@@ -195,6 +259,7 @@ async def test_workflow_run_freezes_team_performance_and_emits_count_only_snapsh
     assert json.loads(event.payload_json) == {
         "workflow_count": 0,
         "branch_sample_count": 0,
+        "excluded_branch_sample_count": 0,
         "observed_role_count": 0,
         "sufficient_role_count": 0,
     }

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.service import ensure_default_agents
 from app.agent.team_performance import build_team_performance_profile
+from app.langgraph.workflow import snapshot_agent_configs
 from app.models import (
     Agent,
     AgentRole,
@@ -33,13 +34,21 @@ def add_branch_event(
     db.add(
         WorkflowEvent(
             workflow_id=workflow_id,
-            node="specialists" if event_type != "REVISION_REQUESTED" else "quality_gate",
+            node=(
+                "quality_gate"
+                if event_type in {"REVISION_REQUESTED", "QUALITY_GATE_FAILED"}
+                else "specialists"
+            ),
             event_type=event_type,
             message=event_type,
             payload_json=json.dumps(
                 {
                     "role": role,
-                    "revision_roles": [role] if event_type == "REVISION_REQUESTED" else [],
+                    "revision_roles": (
+                        [role]
+                        if event_type in {"REVISION_REQUESTED", "QUALITY_GATE_FAILED"}
+                        else []
+                    ),
                     "wave": 1,
                     "revision_round": 0,
                     "workflow_attempt": 1,
@@ -57,13 +66,15 @@ def create_terminal_workflow(
     user: User,
     status: WorkflowStatus,
     finished_at: datetime,
+    *,
+    state: dict | None = None,
 ) -> WorkflowRun:
     workflow = WorkflowRun(
         project_id=project.id,
         user_id=user.id,
         status=status,
         current_node="completed",
-        state_json="{}",
+        state_json=json.dumps(state or {}),
         finished_at=finished_at,
     )
     db.add(workflow)
@@ -224,3 +235,86 @@ def test_team_performance_profile_aggregates_final_role_outcomes_and_telemetry(
     assert unobserved is not None
     assert unobserved.sample_count == 0
     assert unobserved.evidence_level == "INSUFFICIENT"
+
+
+def test_team_performance_profile_excludes_stale_agent_configs_and_counts_quality_failures(
+    db: Session,
+) -> None:
+    ensure_default_agents(db)
+    user = User(email="aligned-performance@example.com", name="Aligned", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Configuration Aligned", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    current_snapshot = snapshot_agent_configs(db)
+    started = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)
+
+    for index in range(3):
+        workflow = create_terminal_workflow(
+            db,
+            project,
+            user,
+            WorkflowStatus.completed,
+            started + timedelta(minutes=index),
+            state={"agent_snapshot": current_snapshot},
+        )
+        branch_started = started + timedelta(minutes=index)
+        add_branch_event(db, workflow.id, "BRANCH_STARTED", "test_engineer", branch_started)
+        add_branch_event(
+            db,
+            workflow.id,
+            "BRANCH_COMPLETED",
+            "test_engineer",
+            branch_started + timedelta(seconds=1),
+        )
+        if index == 2:
+            add_branch_event(
+                db,
+                workflow.id,
+                "QUALITY_GATE_FAILED",
+                "test_engineer",
+                branch_started + timedelta(seconds=2),
+            )
+
+    stale_snapshot = json.loads(json.dumps(current_snapshot))
+    stale_snapshot["test_engineer"]["prompt_version"] -= 1
+    stale = create_terminal_workflow(
+        db,
+        project,
+        user,
+        WorkflowStatus.completed,
+        started + timedelta(minutes=4),
+        state={"agent_snapshot": stale_snapshot},
+    )
+    add_branch_event(db, stale.id, "BRANCH_STARTED", "test_engineer", started + timedelta(minutes=4))
+    add_branch_event(
+        db,
+        stale.id,
+        "BRANCH_COMPLETED",
+        "test_engineer",
+        started + timedelta(minutes=4, seconds=1),
+    )
+    db.commit()
+
+    profile = build_team_performance_profile(
+        db,
+        project.id,
+        roles=["test_engineer"],
+        current_agent_snapshot=current_snapshot,
+        now=started + timedelta(hours=1),
+    )
+
+    assert profile.configuration_scope == "CURRENT_CONFIGURATION"
+    assert profile.workflow_count == 4
+    assert profile.branch_sample_count == 3
+    assert profile.excluded_branch_sample_count == 1
+    evidence = profile.for_role("test_engineer")
+    assert evidence is not None
+    assert evidence.sample_count == 3
+    assert evidence.excluded_sample_count == 1
+    assert evidence.success_count == 3
+    assert evidence.quality_failure_count == 1
+    assert evidence.quality_failure_rate == pytest.approx(1 / 3, abs=0.0001)
+    assert evidence.reliability_score == pytest.approx(0.7812)
+    assert evidence.evidence_level == "LOW"

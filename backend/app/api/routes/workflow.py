@@ -259,6 +259,7 @@ async def run_workflow(
         db,
         project.id,
         specialist_roles,
+        current_agent_snapshot=agent_snapshot,
     )
     preflight = build_workflow_preflight(
         agent_snapshot,
@@ -315,6 +316,7 @@ async def run_workflow(
         payload={
             "workflow_count": team_performance_profile.workflow_count,
             "branch_sample_count": team_performance_profile.branch_sample_count,
+            "excluded_branch_sample_count": team_performance_profile.excluded_branch_sample_count,
             "observed_role_count": team_performance_profile.observed_role_count,
             "sufficient_role_count": team_performance_profile.sufficient_role_count,
         },
@@ -352,7 +354,12 @@ def preflight_workflow(
     return build_workflow_preflight(
         agent_snapshot,
         payload.user_input,
-        build_team_performance_profile(db, project.id, specialist_roles),
+        build_team_performance_profile(
+            db,
+            project.id,
+            specialist_roles,
+            current_agent_snapshot=agent_snapshot,
+        ),
     )
 
 

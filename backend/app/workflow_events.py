@@ -20,6 +20,7 @@ PUBLIC_WORKFLOW_EVENT_PAYLOAD_FIELDS = frozenset(
         "dependency_count",
         "depends_on",
         "distinct_candidate_count",
+        "excluded_branch_sample_count",
         "conflict_count",
         "failed_count",
         "invalid_candidate_count",

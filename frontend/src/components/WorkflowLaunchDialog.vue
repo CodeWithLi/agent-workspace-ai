@@ -69,10 +69,13 @@
             <strong>同项目历史</strong>
             <span v-if="preflight.team_performance_profile.branch_sample_count">
               {{ preflight.team_performance_profile.workflow_count }} 次终态运行 ·
-              {{ preflight.team_performance_profile.branch_sample_count }} 份角色样本 ·
+              {{ preflight.team_performance_profile.branch_sample_count }} 份当前配置样本 ·
               {{ preflight.team_performance_profile.sufficient_role_count }}/{{ preflight.team_performance_profile.roles.length }} 个角色可参与可靠性调整
             </span>
             <span v-else>尚无可用分支样本，本次规划不会应用历史可靠性调整</span>
+            <small v-if="preflight.team_performance_profile.excluded_branch_sample_count">
+              已排除 {{ preflight.team_performance_profile.excluded_branch_sample_count }} 份旧版 Prompt、模型或运行配置样本
+            </small>
           </div>
           <ul class="preflight-specialists" aria-label="专业 Agent 资格">
             <li
@@ -104,6 +107,7 @@
                         <dt>历史样本</dt>
                         <dd>
                           {{ performanceForRole(profile.role)?.sample_count }} 份 ·
+                          已排除 {{ performanceForRole(profile.role)?.excluded_sample_count || 0 }} 份旧配置 ·
                           {{ evidenceLevelLabel(performanceForRole(profile.role)?.evidence_level) }}
                         </dd>
                       </div>
@@ -206,7 +210,7 @@ function evidenceLevelLabel(level?: PerformanceEvidenceLevel) {
 function reliabilityLabel(role: string) {
   const evidence = performanceForRole(role)
   if (!evidence || evidence.evidence_level === 'INSUFFICIENT') return '样本不足，不影响规划'
-  return `${Math.round(evidence.reliability_score * 100)}% · 重试 ${Math.round(evidence.retry_rate * 100)}% · 修订 ${Math.round(evidence.revision_rate * 100)}%`
+  return `${Math.round(evidence.reliability_score * 100)}% · 重试 ${Math.round(evidence.retry_rate * 100)}% · 修订 ${Math.round(evidence.revision_rate * 100)}% · 质检退回 ${Math.round((evidence.quality_failure_rate || 0) * 100)}%`
 }
 
 function formatDuration(value?: number | null) {
@@ -406,6 +410,12 @@ onBeforeUnmount(() => {
   color: var(--color-foreground);
 }
 
+.preflight-history-summary small {
+  grid-column: 2;
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
 .preflight-requirements strong {
   color: var(--color-primary);
 }
@@ -543,6 +553,10 @@ onBeforeUnmount(() => {
   .preflight-specialist-copy dl > div {
     grid-template-columns: 1fr;
     gap: 2px;
+  }
+
+  .preflight-history-summary small {
+    grid-column: 1;
   }
 
   .preflight-specialist-copy summary {

@@ -325,6 +325,12 @@
                   <p v-if="candidate.performance_evidence.sufficient_role_count === 0" class="plan-performance-notice">
                     所有角色样本均不足，历史记录不影响本次候选选择。
                   </p>
+                  <p v-if="candidate.performance_evidence.configuration_scope !== 'CURRENT_CONFIGURATION'" class="plan-performance-notice">
+                    该计划生成于配置隔离启用前，历史证据仅作兼容展示。
+                  </p>
+                  <p v-if="excludedPerformanceSampleCount(candidate.performance_evidence)" class="plan-performance-notice">
+                    已排除 {{ excludedPerformanceSampleCount(candidate.performance_evidence) }} 份与当前 Prompt、模型或运行配置不一致的旧样本。
+                  </p>
                   <dl class="plan-performance-metrics">
                     <div>
                       <dt>可靠性调整</dt>
@@ -349,12 +355,14 @@
                       <li v-for="evidence in candidate.performance_evidence.role_evidence" :key="evidence.role">
                         <strong>{{ specialistRoleLabel(evidence.role) }}</strong>
                         <span v-if="evidence.evidence_level === 'INSUFFICIENT'">
-                          {{ evidence.sample_count }} 份样本 · 样本不足，不参与可靠性调整
+                          {{ evidence.sample_count }} 份{{ performanceSampleScopeLabel(candidate.performance_evidence) }} · 已排除 {{ evidence.excluded_sample_count || 0 }} 份旧配置 · 样本不足，不参与可靠性调整
                         </span>
                         <span v-else>
-                          {{ evidence.sample_count }} 份样本 · 可靠性 {{ Math.round(evidence.reliability_score * 100) }}% ·
+                          {{ evidence.sample_count }} 份{{ performanceSampleScopeLabel(candidate.performance_evidence) }} · 可靠性 {{ Math.round(evidence.reliability_score * 100) }}% ·
+                          质检退回 {{ Math.round((evidence.quality_failure_rate || 0) * 100) }}% ·
                           中位耗时 {{ formatPerformanceDuration(evidence.median_latency_ms) }} ·
-                          平均成本 {{ formatPerformanceCost(evidence.average_cost_micros) }}
+                          平均成本 {{ formatPerformanceCost(evidence.average_cost_micros) }} ·
+                          已排除 {{ evidence.excluded_sample_count || 0 }} 份旧配置
                         </span>
                       </li>
                     </ul>
@@ -1325,6 +1333,20 @@ function performanceEvidenceType(level: PerformanceEvidenceLevel): 'success' | '
 
 function signedScore(value: number) {
   return value > 0 ? `+${value}` : `${value}`
+}
+
+function excludedPerformanceSampleCount(evidence: PlanPerformanceEvidence) {
+  if (evidence.excluded_sample_count !== undefined) return evidence.excluded_sample_count
+  return evidence.role_evidence.reduce(
+    (total, item) => total + (item.excluded_sample_count || 0),
+    0
+  )
+}
+
+function performanceSampleScopeLabel(evidence: PlanPerformanceEvidence) {
+  return evidence.configuration_scope === 'CURRENT_CONFIGURATION'
+    ? '当前配置样本'
+    : '历史样本'
 }
 
 function formatPerformanceDuration(value: number | null) {

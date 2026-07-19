@@ -463,10 +463,10 @@ function workflowPreflightFixture(goal: string, notificationAvailable = true) {
     ? ['当前团队缺少所需能力：通知投递。']
     : []
   const roleHistory = [
-    { role: 'test_engineer', sample_count: 12, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
-    { role: 'operations_analyst', sample_count: 8, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' },
-    { role: 'knowledge_admin', sample_count: 2, success_count: 2, failure_count: 0, retry_count: 0, revision_count: 0, success_rate: 1, retry_rate: 0, revision_rate: 0, reliability_score: 0.8214, median_latency_ms: 1300, average_cost_micros: 280, evidence_level: 'INSUFFICIENT' },
-    { role: 'notification_secretary', sample_count: 0, success_count: 0, failure_count: 0, retry_count: 0, revision_count: 0, success_rate: 0, retry_rate: 0, revision_rate: 0, reliability_score: 0.75, median_latency_ms: null, average_cost_micros: null, evidence_level: 'INSUFFICIENT' }
+    { role: 'test_engineer', sample_count: 12, excluded_sample_count: 3, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, quality_failure_count: 1, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, quality_failure_rate: 0.0833, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
+    { role: 'operations_analyst', sample_count: 8, excluded_sample_count: 2, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, quality_failure_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, quality_failure_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' },
+    { role: 'knowledge_admin', sample_count: 2, excluded_sample_count: 0, success_count: 2, failure_count: 0, retry_count: 0, revision_count: 0, quality_failure_count: 0, success_rate: 1, retry_rate: 0, revision_rate: 0, quality_failure_rate: 0, reliability_score: 0.8214, median_latency_ms: 1300, average_cost_micros: 280, evidence_level: 'INSUFFICIENT' },
+    { role: 'notification_secretary', sample_count: 0, excluded_sample_count: 0, success_count: 0, failure_count: 0, retry_count: 0, revision_count: 0, quality_failure_count: 0, success_rate: 0, retry_rate: 0, revision_rate: 0, quality_failure_rate: 0, reliability_score: 0.75, median_latency_ms: null, average_cost_micros: null, evidence_level: 'INSUFFICIENT' }
   ]
   return {
     ready: blockers.length === 0,
@@ -481,9 +481,11 @@ function workflowPreflightFixture(goal: string, notificationAvailable = true) {
       generated_at: '2026-07-19T09:00:00Z',
       workflow_count: 12,
       branch_sample_count: 22,
+      excluded_branch_sample_count: 5,
       observed_role_count: 3,
       sufficient_role_count: 2,
-      roles: roleHistory
+      roles: roleHistory,
+      configuration_scope: 'CURRENT_CONFIGURATION'
     }
   }
 }
@@ -2904,14 +2906,16 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     }
   ]
   const candidateRoleEvidence = [
-    { role: 'test_engineer', sample_count: 12, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
-    { role: 'operations_analyst', sample_count: 8, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' }
+    { role: 'test_engineer', sample_count: 12, excluded_sample_count: 3, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, quality_failure_count: 1, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, quality_failure_rate: 0.0833, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
+    { role: 'operations_analyst', sample_count: 8, excluded_sample_count: 2, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, quality_failure_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, quality_failure_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' }
   ]
   const candidatePerformance = (adjustment: number, selectionScore: number, criticalPath = 3600) => ({
     evidence_level: 'LOW',
+    configuration_scope: 'CURRENT_CONFIGURATION',
     assigned_role_count: 2,
     observed_role_count: 2,
     sufficient_role_count: 2,
+    excluded_sample_count: 5,
     reliability_adjustment: adjustment,
     selection_score: selectionScore,
     projected_cost_micros: 820,
@@ -3252,11 +3256,12 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(launchDialog.getByRole('heading', { name: '启动工作流', exact: true })).toBeVisible()
   await expect(launchDialog.getByRole('list', { name: '专业 Agent 资格' }).getByRole('listitem')).toHaveCount(4)
   await expect(launchDialog.getByText('可以启动', { exact: true })).toBeVisible()
-  await expect(launchDialog.getByText('12 次终态运行 · 22 份角色样本 · 2/4 个角色可参与可靠性调整', { exact: true })).toBeVisible()
+  await expect(launchDialog.getByText('12 次终态运行 · 22 份当前配置样本 · 2/4 个角色可参与可靠性调整', { exact: true })).toBeVisible()
+  await expect(launchDialog.getByText('已排除 5 份旧版 Prompt、模型或运行配置样本', { exact: true })).toBeVisible()
   const testerPreflight = launchDialog.getByRole('list', { name: '专业 Agent 资格' }).getByRole('listitem').filter({ hasText: 'AI测试工程师' })
   await testerPreflight.getByText('运行配置与历史证据', { exact: true }).click()
-  await expect(testerPreflight.getByText('12 份 · 中证据', { exact: true })).toBeVisible()
-  await expect(testerPreflight.getByText('87% · 重试 8% · 修订 17%', { exact: true })).toBeVisible()
+  await expect(testerPreflight.getByText('12 份 · 已排除 3 份旧配置 · 中证据', { exact: true })).toBeVisible()
+  await expect(testerPreflight.getByText('87% · 重试 8% · 修订 17% · 质检退回 8%', { exact: true })).toBeVisible()
 
   const goalInput = launchDialog.getByLabel('多 Agent 工作目标')
   const launchButton = launchDialog.getByRole('button', { name: '启动并进入计划审批', exact: true })
@@ -3313,8 +3318,9 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(riskPerformance.getByText('+2 分', { exact: true })).toBeVisible()
   await expect(riskPerformance.getByText('$0.0008', { exact: true })).toBeVisible()
   await expect(riskPerformance.getByText('3.6 秒', { exact: true })).toBeVisible()
+  await expect(riskPerformance.getByText('已排除 5 份与当前 Prompt、模型或运行配置不一致的旧样本。', { exact: true })).toBeVisible()
   await riskPerformance.getByText('查看角色历史明细', { exact: true }).click()
-  await expect(riskPerformance.getByText(/12 份样本 · 可靠性 87%/)).toBeVisible()
+  await expect(riskPerformance.getByText(/12 份当前配置样本 · 可靠性 87% · 质检退回 8%/)).toBeVisible()
   await expect(riskCandidate.getByText('显式能力覆盖', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('30/30', { exact: true })).toBeVisible()
   await expect(page.getByLabel('并行效率候选方案').getByText('测试与运营并行验证后统一收敛', { exact: true })).toBeVisible()

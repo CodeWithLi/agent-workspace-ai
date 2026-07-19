@@ -184,11 +184,25 @@ def test_execution_plan_candidate_keeps_legacy_snapshots_compatible() -> None:
     )
     legacy_snapshot = candidate.model_dump(mode="json")
     legacy_snapshot.pop("origin")
+    legacy_snapshot["performance_evidence"].pop("configuration_scope")
+    legacy_snapshot["performance_evidence"].pop("excluded_sample_count")
+    for evidence in legacy_snapshot["performance_evidence"]["role_evidence"]:
+        evidence.pop("excluded_sample_count")
+        evidence.pop("quality_failure_count")
+        evidence.pop("quality_failure_rate")
 
     restored = ExecutionPlanCandidate.model_validate(legacy_snapshot)
 
     assert restored.origin == "independent"
     assert restored.source_candidate_id is None
+    assert restored.performance_evidence.configuration_scope == "ALL_HISTORY"
+    assert restored.performance_evidence.excluded_sample_count == 0
+    assert all(
+        evidence.excluded_sample_count == 0
+        and evidence.quality_failure_count == 0
+        and evidence.quality_failure_rate == 0
+        for evidence in restored.performance_evidence.role_evidence
+    )
 
 
 def test_candidate_performance_evidence_is_bounded_and_requires_sufficient_samples() -> None:

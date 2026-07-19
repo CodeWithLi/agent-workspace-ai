@@ -634,13 +634,16 @@ export type PerformanceEvidenceLevel = 'INSUFFICIENT' | 'LOW' | 'MEDIUM' | 'HIGH
 export interface TeamRolePerformanceEvidence {
   role: string
   sample_count: number
+  excluded_sample_count?: number
   success_count: number
   failure_count: number
   retry_count: number
   revision_count: number
+  quality_failure_count?: number
   success_rate: number
   retry_rate: number
   revision_rate: number
+  quality_failure_rate?: number
   reliability_score: number
   median_latency_ms: number | null
   average_cost_micros: number | null
@@ -652,16 +655,20 @@ export interface TeamPerformanceProfile {
   generated_at: string
   workflow_count: number
   branch_sample_count: number
+  excluded_branch_sample_count?: number
   observed_role_count: number
   sufficient_role_count: number
   roles: TeamRolePerformanceEvidence[]
+  configuration_scope?: 'ALL_HISTORY' | 'CURRENT_CONFIGURATION'
 }
 
 export interface PlanPerformanceEvidence {
   evidence_level: PerformanceEvidenceLevel
+  configuration_scope?: 'ALL_HISTORY' | 'CURRENT_CONFIGURATION'
   assigned_role_count: number
   observed_role_count: number
   sufficient_role_count: number
+  excluded_sample_count?: number
   reliability_adjustment: number
   selection_score: number
   projected_cost_micros: number | null

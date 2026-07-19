@@ -119,7 +119,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
 
-`POST /workflow/preflight` 与运行入口使用同一套确定性团队就绪规则：至少两个合格专业 Agent，并覆盖工作目标明确要求的领域能力。响应中的 `team_performance_profile` 来自最近 50 个同项目终态运行，按角色返回最终成功/失败、重试、修订、可靠性、分支中位耗时、平均模型成本和 `INSUFFICIENT|LOW|MEDIUM|HIGH` 证据等级。`POST /workflow/run` 不信任此前的客户端结果，而是在项目互斥检查后重新冻结配置与绩效证据并复核；只有通过后才预扣额度和创建队列运行，同一次运行继续复用这份快照，避免检查、规划与审批使用不同数据。
+`POST /workflow/preflight` 与运行入口使用同一套确定性团队就绪规则：至少两个合格专业 Agent，并覆盖工作目标明确要求的领域能力。响应中的 `team_performance_profile` 来自最近 50 个同项目终态运行，且 `configuration_scope=CURRENT_CONFIGURATION`；只有与当前 Agent ID、Prompt、模型、工具、知识/记忆权限和并发额度一致的角色样本进入 `branch_sample_count`，旧配置或缺失快照样本进入 `excluded_branch_sample_count`。每个角色返回最终成功/失败、重试、修订、质量失败、可靠性、分支中位耗时、平均模型成本、排除数和 `INSUFFICIENT|LOW|MEDIUM|HIGH` 证据等级。`POST /workflow/run` 不信任此前的客户端结果，而是在项目互斥检查后重新冻结配置与绩效证据并复核；只有通过后才预扣额度和创建队列运行，同一次运行继续复用这份快照，避免检查、规划与审批使用不同数据。
 
 Requirement 节点将产品经理输出解析为 `requirements.contract`：包含目标用户、范围内/外、约束、假设，以及带稳定 `AC-xx`、优先级和证据要求的验收标准。架构师与测试工程师独立返回 `ACCEPT|CHALLENGE|ABSTAIN`，归约结果存入 `requirements.consensus`。合法质疑触发一次产品经理修订；服务端拒绝无效或 SHA-256 指纹未变化的修订，并仅对有效新合同重新评审。最终 `CHALLENGED` 会强制 `require_plan_approval=true`，`INCOMPLETE` 保留证据但不把模型故障伪装成质疑。`REQUIREMENTS_CONSENSUS_REACHED` 事件只公开验收标准数、状态、来源、评审票数和修订有效性，不返回合同、问题或建议正文；缺少新字段的历史运行仍按原状态读取。
 
