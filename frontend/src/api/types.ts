@@ -629,6 +629,46 @@ export interface WorkflowSpecialistPreflight {
   unavailable_reasons: string[]
 }
 
+export type PerformanceEvidenceLevel = 'INSUFFICIENT' | 'LOW' | 'MEDIUM' | 'HIGH'
+
+export interface TeamRolePerformanceEvidence {
+  role: string
+  sample_count: number
+  success_count: number
+  failure_count: number
+  retry_count: number
+  revision_count: number
+  success_rate: number
+  retry_rate: number
+  revision_rate: number
+  reliability_score: number
+  median_latency_ms: number | null
+  average_cost_micros: number | null
+  evidence_level: PerformanceEvidenceLevel
+}
+
+export interface TeamPerformanceProfile {
+  project_id: number
+  generated_at: string
+  workflow_count: number
+  branch_sample_count: number
+  observed_role_count: number
+  sufficient_role_count: number
+  roles: TeamRolePerformanceEvidence[]
+}
+
+export interface PlanPerformanceEvidence {
+  evidence_level: PerformanceEvidenceLevel
+  assigned_role_count: number
+  observed_role_count: number
+  sufficient_role_count: number
+  reliability_adjustment: number
+  selection_score: number
+  projected_cost_micros: number | null
+  projected_critical_path_latency_ms: number | null
+  role_evidence: TeamRolePerformanceEvidence[]
+}
+
 export interface WorkflowPreflight {
   ready: boolean
   required_capabilities: string[]
@@ -637,6 +677,7 @@ export interface WorkflowPreflight {
   minimum_required: number
   specialists: WorkflowSpecialistPreflight[]
   blockers: string[]
+  team_performance_profile: TeamPerformanceProfile
 }
 
 export interface WorkflowEvent {

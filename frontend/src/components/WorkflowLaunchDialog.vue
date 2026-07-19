@@ -65,6 +65,15 @@
             </span>
             <span v-else>通用交付能力</span>
           </div>
+          <div class="preflight-history-summary">
+            <strong>同项目历史</strong>
+            <span v-if="preflight.team_performance_profile.branch_sample_count">
+              {{ preflight.team_performance_profile.workflow_count }} 次终态运行 ·
+              {{ preflight.team_performance_profile.branch_sample_count }} 份角色样本 ·
+              {{ preflight.team_performance_profile.sufficient_role_count }}/{{ preflight.team_performance_profile.roles.length }} 个角色可参与可靠性调整
+            </span>
+            <span v-else>尚无可用分支样本，本次规划不会应用历史可靠性调整</span>
+          </div>
           <ul class="preflight-specialists" aria-label="专业 Agent 资格">
             <li
               v-for="profile in preflight.specialists"
@@ -85,11 +94,32 @@
                 <p v-if="profile.eligible">{{ profile.capabilities.map(specialistCapabilityLabel).join('、') }}</p>
                 <p v-else role="status">{{ profile.unavailable_reasons.join('、') }}</p>
                 <details v-if="profile.eligible">
-                  <summary>运行配置</summary>
+                  <summary>运行配置与历史证据</summary>
                   <dl>
                     <div><dt>启用工具</dt><dd>{{ profile.enabled_tools.map(specialistToolLabel).join('、') || '无' }}</dd></div>
                     <div><dt>并发额度</dt><dd>{{ profile.concurrency_limit }}</dd></div>
                     <div><dt>知识访问</dt><dd>{{ profile.knowledge_access ? '已启用' : '未启用' }}</dd></div>
+                    <template v-if="performanceForRole(profile.role)">
+                      <div>
+                        <dt>历史样本</dt>
+                        <dd>
+                          {{ performanceForRole(profile.role)?.sample_count }} 份 ·
+                          {{ evidenceLevelLabel(performanceForRole(profile.role)?.evidence_level) }}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>可靠性</dt>
+                        <dd>{{ reliabilityLabel(profile.role) }}</dd>
+                      </div>
+                      <div>
+                        <dt>分支耗时</dt>
+                        <dd>{{ formatDuration(performanceForRole(profile.role)?.median_latency_ms) }}</dd>
+                      </div>
+                      <div>
+                        <dt>平均成本</dt>
+                        <dd>{{ formatCost(performanceForRole(profile.role)?.average_cost_micros) }}</dd>
+                      </div>
+                    </template>
                   </dl>
                 </details>
               </div>
@@ -119,7 +149,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { CircleCheck, CircleClose, VideoPlay } from '@element-plus/icons-vue'
 import { api, getApiErrorMessage } from '../api/client'
-import type { WorkflowPreflight } from '../api/types'
+import type { PerformanceEvidenceLevel, WorkflowPreflight } from '../api/types'
 import {
   specialistCapabilityLabel,
   specialistRoleLabel,
@@ -159,6 +189,38 @@ const preflightStatus = computed(() => {
   if (!preflight.value) return '等待目标'
   return preflight.value.ready ? '可以启动' : '存在阻塞'
 })
+
+function performanceForRole(role: string) {
+  return preflight.value?.team_performance_profile.roles.find((item) => item.role === role)
+}
+
+function evidenceLevelLabel(level?: PerformanceEvidenceLevel) {
+  return {
+    INSUFFICIENT: '样本不足',
+    LOW: '低证据',
+    MEDIUM: '中证据',
+    HIGH: '高证据'
+  }[level || 'INSUFFICIENT']
+}
+
+function reliabilityLabel(role: string) {
+  const evidence = performanceForRole(role)
+  if (!evidence || evidence.evidence_level === 'INSUFFICIENT') return '样本不足，不影响规划'
+  return `${Math.round(evidence.reliability_score * 100)}% · 重试 ${Math.round(evidence.retry_rate * 100)}% · 修订 ${Math.round(evidence.revision_rate * 100)}%`
+}
+
+function formatDuration(value?: number | null) {
+  if (value === null || value === undefined) return '暂无完整观测'
+  if (value < 1000) return `${value} ms`
+  if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} 秒`
+  return `${(value / 60_000).toFixed(1)} 分钟`
+}
+
+function formatCost(value?: number | null) {
+  if (value === null || value === undefined) return '暂无完整观测'
+  const amount = value / 1_000_000
+  return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`
+}
 
 function cancelScheduledPreflight() {
   if (preflightTimer) clearTimeout(preflightTimer)
@@ -328,6 +390,22 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 
+.preflight-history-summary {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-background);
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.preflight-history-summary strong {
+  color: var(--color-foreground);
+}
+
 .preflight-requirements strong {
   color: var(--color-primary);
 }
@@ -461,6 +539,7 @@ onBeforeUnmount(() => {
   }
 
   .preflight-requirements,
+  .preflight-history-summary,
   .preflight-specialist-copy dl > div {
     grid-template-columns: 1fr;
     gap: 2px;

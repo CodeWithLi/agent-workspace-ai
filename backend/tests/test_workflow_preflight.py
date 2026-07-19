@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
@@ -8,7 +10,7 @@ from starlette.requests import Request
 
 from app.agent.service import ensure_default_agents
 from app.api.routes.workflow import preflight_workflow, run_workflow
-from app.models import Agent, AgentRole, AgentTool, Project, TokenTransaction, User, UserRole, WorkflowRun
+from app.models import Agent, AgentRole, AgentTool, Project, TokenTransaction, User, UserRole, WorkflowEvent, WorkflowRun
 from app.schemas import WorkflowPreflightRequest, WorkflowRequest
 
 
@@ -65,6 +67,20 @@ def test_workflow_preflight_is_read_only_and_reports_eligible_team(db: Session) 
         "knowledge_admin",
         "notification_secretary",
     }
+    assert result.team_performance_profile.project_id == project.id
+    assert result.team_performance_profile.workflow_count == 0
+    assert result.team_performance_profile.branch_sample_count == 0
+    assert result.team_performance_profile.observed_role_count == 0
+    assert {item.role for item in result.team_performance_profile.roles} == {
+        "test_engineer",
+        "operations_analyst",
+        "knowledge_admin",
+        "notification_secretary",
+    }
+    assert all(
+        item.evidence_level == "INSUFFICIENT"
+        for item in result.team_performance_profile.roles
+    )
     assert db.scalar(select(func.count(WorkflowRun.id))) == 0
     assert db.scalar(select(func.count(TokenTransaction.id))) == 0
     assert db.get(User, user.id).ai_token_balance == 1000
@@ -140,3 +156,45 @@ def test_workflow_preflight_requires_two_eligible_specialists(db: Session) -> No
     assert [profile.role for profile in result.specialists if profile.eligible] == [
         "test_engineer"
     ]
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_freezes_team_performance_and_emits_count_only_snapshot(
+    db: Session,
+) -> None:
+    ensure_default_agents(db)
+    user, project = create_workspace(db, "preflight-freeze@example.com")
+
+    response = await run_workflow(
+        WorkflowRequest(
+            project_id=project.id,
+            user_input="规划可灰度发布并可验证的企业协作流程",
+            request_id="performance-profile-freeze",
+            require_plan_approval=True,
+        ),
+        http_request("/api/v1/workflow/run"),
+        user,
+        db,
+    )
+
+    workflow = db.get(WorkflowRun, response.workflow_id)
+    assert workflow is not None
+    state = json.loads(workflow.state_json)
+    profile = state["team_performance_profile"]
+    assert profile["project_id"] == project.id
+    assert profile["workflow_count"] == 0
+    assert profile["branch_sample_count"] == 0
+    assert len(profile["roles"]) == 4
+    event = db.scalar(
+        select(WorkflowEvent).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "TEAM_PERFORMANCE_SNAPSHOTTED",
+        )
+    )
+    assert event is not None
+    assert json.loads(event.payload_json) == {
+        "workflow_count": 0,
+        "branch_sample_count": 0,
+        "observed_role_count": 0,
+        "sufficient_role_count": 0,
+    }

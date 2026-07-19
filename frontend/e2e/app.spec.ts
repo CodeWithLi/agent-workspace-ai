@@ -462,6 +462,12 @@ function workflowPreflightFixture(goal: string, notificationAvailable = true) {
   const blockers = requiresNotification && !notificationAvailable
     ? ['当前团队缺少所需能力：通知投递。']
     : []
+  const roleHistory = [
+    { role: 'test_engineer', sample_count: 12, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
+    { role: 'operations_analyst', sample_count: 8, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' },
+    { role: 'knowledge_admin', sample_count: 2, success_count: 2, failure_count: 0, retry_count: 0, revision_count: 0, success_rate: 1, retry_rate: 0, revision_rate: 0, reliability_score: 0.8214, median_latency_ms: 1300, average_cost_micros: 280, evidence_level: 'INSUFFICIENT' },
+    { role: 'notification_secretary', sample_count: 0, success_count: 0, failure_count: 0, retry_count: 0, revision_count: 0, success_rate: 0, retry_rate: 0, revision_rate: 0, reliability_score: 0.75, median_latency_ms: null, average_cost_micros: null, evidence_level: 'INSUFFICIENT' }
+  ]
   return {
     ready: blockers.length === 0,
     required_capabilities: requiredCapabilities,
@@ -469,7 +475,16 @@ function workflowPreflightFixture(goal: string, notificationAvailable = true) {
     eligible_count: specialists.filter((profile) => profile.eligible).length,
     minimum_required: 2,
     specialists,
-    blockers
+    blockers,
+    team_performance_profile: {
+      project_id: 2,
+      generated_at: '2026-07-19T09:00:00Z',
+      workflow_count: 12,
+      branch_sample_count: 22,
+      observed_role_count: 3,
+      sufficient_role_count: 2,
+      roles: roleHistory
+    }
   }
 }
 
@@ -2888,6 +2903,21 @@ test('reviews, replans and approves an execution plan before specialist dispatch
       unavailable_reasons: []
     }
   ]
+  const candidateRoleEvidence = [
+    { role: 'test_engineer', sample_count: 12, success_count: 11, failure_count: 1, retry_count: 1, revision_count: 2, success_rate: 0.9167, retry_rate: 0.0833, revision_rate: 0.1667, reliability_score: 0.87, median_latency_ms: 1600, average_cost_micros: 360, evidence_level: 'MEDIUM' },
+    { role: 'operations_analyst', sample_count: 8, success_count: 7, failure_count: 1, retry_count: 1, revision_count: 1, success_rate: 0.875, retry_rate: 0.125, revision_rate: 0.125, reliability_score: 0.81, median_latency_ms: 2000, average_cost_micros: 460, evidence_level: 'LOW' }
+  ]
+  const candidatePerformance = (adjustment: number, selectionScore: number, criticalPath = 3600) => ({
+    evidence_level: 'LOW',
+    assigned_role_count: 2,
+    observed_role_count: 2,
+    sufficient_role_count: 2,
+    reliability_adjustment: adjustment,
+    selection_score: selectionScore,
+    projected_cost_micros: 820,
+    projected_critical_path_latency_ms: criticalPath,
+    role_evidence: candidateRoleEvidence
+  })
   const initialPlan = {
     objective: '先验证可恢复交付，再启动专业 Agent',
     rationale: '测试先确认验收证据，运营再基于测试结论设计灰度和恢复。',
@@ -2977,6 +3007,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         plan: deliveryCandidatePlan,
         score: 90,
         checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 8 } : check),
+        performance_evidence: candidatePerformance(1, 91),
         plan_fingerprint: 'a'.repeat(64),
         duplicate_of: null,
         commitments: acceptedCommitments,
@@ -2991,6 +3022,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         plan: initialPlan,
         score: 92,
         checks: candidateChecks.map((check) => check.name === 'success_contract' ? { ...check, score: 24 } : check),
+        performance_evidence: candidatePerformance(2, 94),
         plan_fingerprint: 'b'.repeat(64),
         duplicate_of: null,
         commitments: acceptedCommitments,
@@ -3005,6 +3037,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
         plan: parallelCandidatePlan,
         score: 97,
         checks: candidateChecks.map((check) => check.name === 'parallel_efficiency' ? { ...check, score: 15 } : check),
+        performance_evidence: candidatePerformance(1, 98, 2000),
         plan_fingerprint: 'c'.repeat(64),
         duplicate_of: null,
         commitments: challengedCommitments,
@@ -3161,6 +3194,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
             plan: negotiatedPlan,
             score: 94,
             checks: candidateChecks,
+            performance_evidence: candidatePerformance(2, 96),
             plan_fingerprint: 'e'.repeat(64),
             duplicate_of: null,
             commitments: acceptedCommitments,
@@ -3218,6 +3252,11 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(launchDialog.getByRole('heading', { name: '启动工作流', exact: true })).toBeVisible()
   await expect(launchDialog.getByRole('list', { name: '专业 Agent 资格' }).getByRole('listitem')).toHaveCount(4)
   await expect(launchDialog.getByText('可以启动', { exact: true })).toBeVisible()
+  await expect(launchDialog.getByText('12 次终态运行 · 22 份角色样本 · 2/4 个角色可参与可靠性调整', { exact: true })).toBeVisible()
+  const testerPreflight = launchDialog.getByRole('list', { name: '专业 Agent 资格' }).getByRole('listitem').filter({ hasText: 'AI测试工程师' })
+  await testerPreflight.getByText('运行配置与历史证据', { exact: true }).click()
+  await expect(testerPreflight.getByText('12 份 · 中证据', { exact: true })).toBeVisible()
+  await expect(testerPreflight.getByText('87% · 重试 8% · 修订 17%', { exact: true })).toBeVisible()
 
   const goalInput = launchDialog.getByLabel('多 Agent 工作目标')
   const launchButton = launchDialog.getByRole('button', { name: '启动并进入计划审批', exact: true })
@@ -3268,17 +3307,26 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(riskCandidate.getByText('已选中', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('2/2 执行者接受', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('92/100', { exact: true })).toBeVisible()
+  await expect(riskCandidate.getByText('决策分 94 · 可靠性 +2', { exact: true })).toBeVisible()
+  const riskPerformance = riskCandidate.getByRole('region', { name: '风险控制团队绩效证据' })
+  await expect(riskPerformance.getByText('低证据', { exact: true })).toBeVisible()
+  await expect(riskPerformance.getByText('+2 分', { exact: true })).toBeVisible()
+  await expect(riskPerformance.getByText('$0.0008', { exact: true })).toBeVisible()
+  await expect(riskPerformance.getByText('3.6 秒', { exact: true })).toBeVisible()
+  await riskPerformance.getByText('查看角色历史明细', { exact: true }).click()
+  await expect(riskPerformance.getByText(/12 份样本 · 可靠性 87%/)).toBeVisible()
   await expect(riskCandidate.getByText('显式能力覆盖', { exact: true })).toBeVisible()
   await expect(riskCandidate.getByText('30/30', { exact: true })).toBeVisible()
   await expect(page.getByLabel('并行效率候选方案').getByText('测试与运营并行验证后统一收敛', { exact: true })).toBeVisible()
   const challengedCandidate = page.getByLabel('并行效率候选方案')
+  const challengedCommitmentEvidence = challengedCandidate.getByRole('region', { name: '并行效率执行前承诺' })
   await expect(challengedCandidate.getByText('1 项执行质疑', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('运营分析师', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('质疑', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('承诺置信 89%', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('缺少生产错误预算基线，当前恢复目标不可验证。', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('生产错误预算基线', { exact: true })).toBeVisible()
-  await expect(challengedCandidate.getByText('补充错误预算和发布窗口后重新确认', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('运营分析师', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('质疑', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('承诺置信 89%', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('缺少生产错误预算基线，当前恢复目标不可验证。', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('生产错误预算基线', { exact: true })).toBeVisible()
+  await expect(challengedCommitmentEvidence.getByText('补充错误预算和发布窗口后重新确认', { exact: true })).toBeVisible()
   await expect(page.locator('.plan-dissent-summary')).toContainText('并行方案总分更高，但对跨角色风险责任的先后约束不足；交付方案的失败恢复边界较弱。')
   await expect(page.locator('.orchestration-copy').getByText('测试先确认验收证据，运营再基于测试结论设计灰度和恢复。', { exact: true })).toBeVisible()
   await expect(page.locator('.orchestration-tags').getByText('2 个分支 · 2 波', { exact: true })).toBeVisible()

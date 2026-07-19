@@ -6,6 +6,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from app.agent.team_performance import (
+    ExecutionPlanPerformanceEvidence,
+    TeamPerformanceProfile,
+    build_plan_performance_evidence,
+)
+
 
 SpecialistRole = Literal[
     "test_engineer",
@@ -412,6 +418,7 @@ class ExecutionPlanCandidate(BaseModel):
     plan: MultiAgentExecutionPlan
     score: int = Field(ge=0, le=100)
     checks: list[ExecutionPlanCandidateCheck] = Field(min_length=5, max_length=5)
+    performance_evidence: ExecutionPlanPerformanceEvidence | None = None
     plan_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     duplicate_of: str | None = Field(default=None, pattern=r"^[a-z0-9_]{2,40}$")
     commitments: list[SpecialistPlanCommitment] = Field(default_factory=list, max_length=4)
@@ -434,6 +441,17 @@ class ExecutionPlanCandidate(BaseModel):
             raise ValueError("candidate check maximum scores must total 100")
         if self.score != sum(check.score for check in self.checks):
             raise ValueError("candidate score must equal the sum of its checks")
+        if self.performance_evidence is not None:
+            assigned_roles = [assignment.role for assignment in self.plan.assignments]
+            evidence_roles = [item.role for item in self.performance_evidence.role_evidence]
+            if evidence_roles != assigned_roles:
+                raise ValueError("candidate performance evidence must follow assigned roles")
+            expected_selection_score = max(
+                0,
+                min(105, self.score + self.performance_evidence.reliability_adjustment),
+            )
+            if self.performance_evidence.selection_score != expected_selection_score:
+                raise ValueError("candidate selection score must include reliability adjustment")
         if self.duplicate_of == self.candidate_id:
             raise ValueError("candidate cannot duplicate itself")
         if self.source_candidate_id == self.candidate_id:
@@ -628,6 +646,7 @@ def assess_execution_plan_candidate(
         "deterministic_fallback",
     ] = "independent",
     source_candidate_id: str | None = None,
+    team_performance_profile: TeamPerformanceProfile | dict[str, Any] | None = None,
 ) -> ExecutionPlanCandidate:
     required = infer_required_specialist_capabilities(user_input)
     covered = {
@@ -749,14 +768,22 @@ def assess_execution_plan_candidate(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    score = sum(check.score for check in checks)
+    performance_evidence = build_plan_performance_evidence(
+        score,
+        [assignment.role for assignment in plan.assignments],
+        [[assignment.role for assignment in wave] for wave in waves],
+        team_performance_profile,
+    )
     return ExecutionPlanCandidate(
         candidate_id=candidate_id,
         perspective=perspective,
         origin=origin,
         source_candidate_id=source_candidate_id,
         plan=plan,
-        score=sum(check.score for check in checks),
+        score=score,
         checks=checks,
+        performance_evidence=performance_evidence,
         plan_fingerprint=fingerprint,
         duplicate_of=duplicate_of,
     )
@@ -1202,6 +1229,11 @@ def arbitrate_execution_plan_candidates(
         candidates,
         key=lambda candidate: (
             commitment_rank[candidate.commitment_status],
+            (
+                candidate.performance_evidence.selection_score
+                if candidate.performance_evidence
+                else candidate.score
+            ),
             candidate.score,
             candidate.candidate_id,
         ),
@@ -1215,10 +1247,12 @@ def arbitrate_execution_plan_candidates(
         selected_candidate_id=selected.candidate_id,
         selection_reason=(
             f"独立仲裁未遵守执行者承诺门禁，已优先选择全员接受的"
-            f"{selected.perspective}方案（{selected.score}/100）。"
+            f"{selected.perspective}方案（结构 {selected.score}/100，可靠性调整 "
+            f"{(selected.performance_evidence.reliability_adjustment if selected.performance_evidence else 0):+d}）。"
             if ready_candidate_ids
-            else f"独立仲裁输出不可用，已按确定性评分选择 {selected.perspective}方案"
-            f"（{selected.score}/100）。"
+            else f"独立仲裁输出不可用，已按确定性评分与历史可靠性选择 {selected.perspective}方案"
+            f"（结构 {selected.score}/100，可靠性调整 "
+            f"{(selected.performance_evidence.reliability_adjustment if selected.performance_evidence else 0):+d}）。"
             + (
                 "该方案仍有执行者质疑，必须经过人工审批。"
                 if selected.commitment_status == "CHALLENGED"

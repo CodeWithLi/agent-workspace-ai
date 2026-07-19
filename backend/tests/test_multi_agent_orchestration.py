@@ -26,6 +26,19 @@ from app.agent.orchestration import (
     seal_handoff,
     validate_execution_plan_capabilities,
 )
+from app.agent.team_performance import RolePerformanceEvidence, TeamPerformanceProfile
+
+
+def performance_profile(*roles: RolePerformanceEvidence) -> TeamPerformanceProfile:
+    return TeamPerformanceProfile(
+        project_id=1,
+        generated_at="2026-07-19T09:00:00Z",
+        workflow_count=max((role.sample_count for role in roles), default=0),
+        branch_sample_count=sum(role.sample_count for role in roles),
+        observed_role_count=sum(role.sample_count > 0 for role in roles),
+        sufficient_role_count=sum(role.sample_count >= 3 for role in roles),
+        roles=list(roles),
+    )
 
 
 def test_fallback_plan_selects_context_specific_specialists() -> None:
@@ -176,6 +189,132 @@ def test_execution_plan_candidate_keeps_legacy_snapshots_compatible() -> None:
 
     assert restored.origin == "independent"
     assert restored.source_candidate_id is None
+
+
+def test_candidate_performance_evidence_is_bounded_and_requires_sufficient_samples() -> None:
+    plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    profile = performance_profile(
+        RolePerformanceEvidence(
+            role="test_engineer",
+            sample_count=10,
+            success_count=10,
+            failure_count=0,
+            retry_count=0,
+            revision_count=0,
+            success_rate=1,
+            retry_rate=0,
+            revision_rate=0,
+            reliability_score=0.9167,
+            median_latency_ms=1200,
+            average_cost_micros=200,
+            evidence_level="MEDIUM",
+        ),
+        RolePerformanceEvidence(
+            role="operations_analyst",
+            sample_count=10,
+            success_count=9,
+            failure_count=1,
+            retry_count=1,
+            revision_count=0,
+            success_rate=0.9,
+            retry_rate=0.1,
+            revision_rate=0,
+            reliability_score=0.8417,
+            median_latency_ms=1800,
+            average_cost_micros=300,
+            evidence_level="MEDIUM",
+        ),
+    )
+
+    candidate = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        plan,
+        "构建可灰度发布并可回滚的会员平台",
+        team_performance_profile=profile,
+    )
+
+    assert candidate.performance_evidence.reliability_adjustment == 3
+    assert candidate.performance_evidence.selection_score == candidate.score + 3
+    assert candidate.performance_evidence.projected_cost_micros == 500
+    assert candidate.performance_evidence.projected_critical_path_latency_ms == 1800
+    assert candidate.performance_evidence.evidence_level == "MEDIUM"
+
+    insufficient = performance_profile(
+        RolePerformanceEvidence(
+            role="test_engineer",
+            sample_count=2,
+            success_count=2,
+            failure_count=0,
+            retry_count=0,
+            revision_count=0,
+            success_rate=1,
+            retry_rate=0,
+            revision_rate=0,
+            reliability_score=0.8214,
+            median_latency_ms=1000,
+            average_cost_micros=100,
+            evidence_level="INSUFFICIENT",
+        )
+    )
+    insufficient_candidate = assess_execution_plan_candidate(
+        "risk_control",
+        "风险控制",
+        plan,
+        "构建可灰度发布并可回滚的会员平台",
+        team_performance_profile=insufficient,
+    )
+
+    assert insufficient_candidate.performance_evidence.reliability_adjustment == 0
+    assert insufficient_candidate.performance_evidence.selection_score == insufficient_candidate.score
+    assert insufficient_candidate.performance_evidence.sufficient_role_count == 0
+    assert insufficient_candidate.performance_evidence.projected_cost_micros is None
+
+
+def test_deterministic_arbitration_uses_bounded_performance_selection_score() -> None:
+    plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    first = assess_execution_plan_candidate(
+        "delivery_confidence", "交付完整性", plan, "构建会员平台"
+    )
+    second = assess_execution_plan_candidate(
+        "risk_control",
+        "风险控制",
+        plan.model_copy(update={"objective": "优先收敛风险边界并保留完整验收证据"}),
+        "构建会员平台",
+    )
+    first = first.model_copy(
+        update={
+            "performance_evidence": first.performance_evidence.model_copy(
+                update={
+                    "reliability_adjustment": 5,
+                    "selection_score": first.score + 5,
+                }
+            )
+        }
+    )
+    second = second.model_copy(
+        update={
+            "performance_evidence": second.performance_evidence.model_copy(
+                update={
+                    "reliability_adjustment": -5,
+                    "selection_score": second.score - 5,
+                }
+            )
+        }
+    )
+
+    deliberation = arbitrate_execution_plan_candidates("invalid", [first, second])
+    expected = max(
+        (first, second),
+        key=lambda candidate: (
+            candidate.performance_evidence.selection_score,
+            candidate.score,
+            candidate.candidate_id,
+        ),
+    )
+
+    assert deliberation.selected_candidate_id == expected.candidate_id
+    assert "历史可靠性" in deliberation.selection_reason
 
 
 def test_plan_arbitration_preserves_selection_evidence_and_falls_back_deterministically() -> None:

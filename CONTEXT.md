@@ -20,6 +20,10 @@ _Avoid_: Team Discussion, chat
 The validated objective, specialist assignments, expected deliverables and success criteria for one Delivery Workflow.
 _Avoid_: Prompt, task list
 
+**Team Performance Profile**:
+A frozen, same-project history of observed Specialist Branch delivery behavior used as planning evidence.
+_Avoid_: SLO, execution guarantee, cross-project benchmark
+
 **Specialist Branch**:
 An independently executable assignment in an Execution Plan whose result can be produced concurrently with other branches.
 _Avoid_: Agent, workflow node

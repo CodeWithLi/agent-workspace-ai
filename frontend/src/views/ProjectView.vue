@@ -293,7 +293,13 @@
                     <el-tag :type="candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? 'success' : 'info'">
                       {{ candidate.candidate_id === selectedPlanDeliberation.selected_candidate_id ? '已选中' : '备选' }}
                     </el-tag>
-                    <strong>{{ candidate.score }}/100</strong>
+                    <span class="plan-candidate-score">
+                      <strong>{{ candidate.score }}/100</strong>
+                      <small v-if="candidate.performance_evidence">
+                        决策分 {{ candidate.performance_evidence.selection_score }} ·
+                        可靠性 {{ signedScore(candidate.performance_evidence.reliability_adjustment) }}
+                      </small>
+                    </span>
                   </div>
                 </header>
                 <p>{{ candidate.plan.rationale }}</p>
@@ -305,6 +311,55 @@
                   </span>
                   <span v-if="candidate.duplicate_of">与 {{ candidatePerspectiveLabel(candidate.duplicate_of) }} 结构相同</span>
                 </div>
+                <section
+                  v-if="candidate.performance_evidence"
+                  class="plan-performance-evidence"
+                  :aria-label="`${candidate.perspective}团队绩效证据`"
+                >
+                  <header>
+                    <strong>同项目团队绩效</strong>
+                    <el-tag size="small" :type="performanceEvidenceType(candidate.performance_evidence.evidence_level)" effect="plain">
+                      {{ performanceEvidenceLevelLabel(candidate.performance_evidence.evidence_level) }}
+                    </el-tag>
+                  </header>
+                  <p v-if="candidate.performance_evidence.sufficient_role_count === 0" class="plan-performance-notice">
+                    所有角色样本均不足，历史记录不影响本次候选选择。
+                  </p>
+                  <dl class="plan-performance-metrics">
+                    <div>
+                      <dt>可靠性调整</dt>
+                      <dd>{{ signedScore(candidate.performance_evidence.reliability_adjustment) }} 分</dd>
+                    </div>
+                    <div>
+                      <dt>证据覆盖</dt>
+                      <dd>{{ candidate.performance_evidence.sufficient_role_count }}/{{ candidate.performance_evidence.assigned_role_count }} 角色</dd>
+                    </div>
+                    <div>
+                      <dt>预计模型成本</dt>
+                      <dd>{{ formatPerformanceCost(candidate.performance_evidence.projected_cost_micros) }}</dd>
+                    </div>
+                    <div>
+                      <dt>预计关键路径</dt>
+                      <dd>{{ formatPerformanceDuration(candidate.performance_evidence.projected_critical_path_latency_ms) }}</dd>
+                    </div>
+                  </dl>
+                  <details class="plan-performance-roles">
+                    <summary>查看角色历史明细</summary>
+                    <ul>
+                      <li v-for="evidence in candidate.performance_evidence.role_evidence" :key="evidence.role">
+                        <strong>{{ specialistRoleLabel(evidence.role) }}</strong>
+                        <span v-if="evidence.evidence_level === 'INSUFFICIENT'">
+                          {{ evidence.sample_count }} 份样本 · 样本不足，不参与可靠性调整
+                        </span>
+                        <span v-else>
+                          {{ evidence.sample_count }} 份样本 · 可靠性 {{ Math.round(evidence.reliability_score * 100) }}% ·
+                          中位耗时 {{ formatPerformanceDuration(evidence.median_latency_ms) }} ·
+                          平均成本 {{ formatPerformanceCost(evidence.average_cost_micros) }}
+                        </span>
+                      </li>
+                    </ul>
+                  </details>
+                </section>
                 <section
                   v-if="candidate.commitments?.length"
                   class="plan-commitment-evidence"
@@ -716,7 +771,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'v
 import { useRoute, useRouter } from 'vue-router'
 import { CircleCheck, CircleClose, Clock, Connection, Delete, Edit, Loading, MagicStick, Plus, RefreshRight, VideoPause, View } from '@element-plus/icons-vue'
 import { api, apiBaseURL } from '../api/client'
-import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
+import type { Agent, PerformanceEvidenceLevel, PlanPerformanceEvidence, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
 import WorkflowLaunchDialog from '../components/WorkflowLaunchDialog.vue'
 import { useAuthStore } from '../stores/auth'
@@ -828,6 +883,7 @@ interface WorkflowPlanCandidate {
   plan: WorkflowExecutionPlan
   score: number
   checks: WorkflowPlanCandidateCheck[]
+  performance_evidence?: PlanPerformanceEvidence | null
   plan_fingerprint: string
   duplicate_of?: string | null
   commitments?: WorkflowPlanCommitment[]
@@ -1252,6 +1308,38 @@ function candidateNegotiationStatus(candidate: WorkflowPlanCandidate) {
   return '承诺待确认'
 }
 
+function performanceEvidenceLevelLabel(level: PerformanceEvidenceLevel) {
+  return {
+    INSUFFICIENT: '样本不足',
+    LOW: '低证据',
+    MEDIUM: '中证据',
+    HIGH: '高证据'
+  }[level]
+}
+
+function performanceEvidenceType(level: PerformanceEvidenceLevel): 'success' | 'warning' | 'info' {
+  if (level === 'HIGH' || level === 'MEDIUM') return 'success'
+  if (level === 'LOW') return 'warning'
+  return 'info'
+}
+
+function signedScore(value: number) {
+  return value > 0 ? `+${value}` : `${value}`
+}
+
+function formatPerformanceDuration(value: number | null) {
+  if (value === null) return '样本不完整'
+  if (value < 1000) return `${value} ms`
+  if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} 秒`
+  return `${(value / 60_000).toFixed(1)} 分钟`
+}
+
+function formatPerformanceCost(value: number | null) {
+  if (value === null) return '样本不完整'
+  const amount = value / 1_000_000
+  return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`
+}
+
 function requirementPriorityLabel(priority: WorkflowRequirementCriterion['priority']) {
   return { MUST: '必须', SHOULD: '应该', COULD: '可选' }[priority]
 }
@@ -1548,6 +1636,7 @@ function workflowEventLabel(eventType: string) {
     NODE_COMPLETED: '完成节点',
     NODE_FAILED: '节点执行失败',
     PLAN_COMMITMENTS_COLLECTED: '执行承诺已收集',
+    TEAM_PERFORMANCE_SNAPSHOTTED: '团队绩效证据已冻结',
     PLAN_DELIBERATED: '候选计划已仲裁',
     PLAN_CREATED: '计划已生成',
     PLAN_APPROVED: '计划已批准',
@@ -2561,10 +2650,23 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-size: 13px;
 }
 
-.plan-candidate-status > strong {
+.plan-candidate-score > strong {
   color: var(--color-secondary-text);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+.plan-candidate-score {
+  display: grid;
+  gap: 1px;
+  text-align: right;
+}
+
+.plan-candidate-score small {
+  color: var(--color-muted-text);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
 }
 
 .plan-candidate-row > p {
@@ -2585,6 +2687,105 @@ onBeforeUnmount(disposeWorkflowEventStream)
   margin-right: 10px;
   color: var(--color-border-strong);
   content: "·";
+}
+
+.plan-performance-evidence {
+  display: grid;
+  gap: 7px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.plan-performance-evidence > header {
+  display: flex;
+  min-height: 28px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+}
+
+.plan-performance-evidence > header strong {
+  font-size: 11px;
+}
+
+.plan-performance-notice {
+  margin: 0;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plan-performance-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  background: var(--color-background);
+}
+
+.plan-performance-metrics > div {
+  min-width: 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--color-border-strong);
+}
+
+.plan-performance-metrics dt,
+.plan-performance-metrics dd {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.plan-performance-metrics dt {
+  color: var(--color-muted-text);
+}
+
+.plan-performance-metrics dd {
+  margin-top: 2px;
+  color: var(--color-foreground);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.plan-performance-roles {
+  border-top: 1px solid var(--color-border);
+}
+
+.plan-performance-roles > summary {
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 11px 0;
+  color: var(--color-primary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.plan-performance-roles > summary:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.plan-performance-roles ul {
+  margin: 0;
+  padding: 0 0 4px;
+  list-style: none;
+}
+
+.plan-performance-roles li {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  padding: 7px 0;
+  border-top: 1px solid var(--color-border);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plan-performance-roles li span {
+  color: var(--color-secondary-text);
+  overflow-wrap: anywhere;
 }
 
 .plan-commitment-evidence {
@@ -3573,6 +3774,24 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .plan-candidate-checks {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plan-candidate-score {
+    text-align: left;
+  }
+
+  .plan-performance-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .plan-performance-roles > summary {
+    min-height: 44px;
+    padding-block: 13px;
+  }
+
+  .plan-performance-roles li {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
   }
 
   .plan-commitment-evidence dl > div {

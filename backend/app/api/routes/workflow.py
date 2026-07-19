@@ -14,6 +14,7 @@ from app.agent.orchestration import (
     build_specialist_capability_catalog,
     infer_required_specialist_capabilities,
 )
+from app.agent.team_performance import TeamPerformanceProfile, build_team_performance_profile
 from app.api.deps import get_current_user
 from app.api.routes.projects import get_project_for_user
 from app.core.audit import record_audit
@@ -123,6 +124,7 @@ def workflow_state(workflow: WorkflowRun) -> dict:
 def build_workflow_preflight(
     agent_snapshot: dict,
     user_input: str,
+    team_performance_profile: TeamPerformanceProfile,
 ) -> WorkflowPreflightResponse:
     minimum_required = 2
     catalog = build_specialist_capability_catalog(agent_snapshot)
@@ -153,6 +155,7 @@ def build_workflow_preflight(
             for profile in catalog
         ],
         blockers=blockers,
+        team_performance_profile=team_performance_profile,
     )
 
 
@@ -249,7 +252,19 @@ async def run_workflow(
             detail=f"Project already has an active workflow: {active.id}",
         )
     agent_snapshot = snapshot_agent_configs(db, current_user.role)
-    preflight = build_workflow_preflight(agent_snapshot, payload.user_input)
+    specialist_roles = [
+        profile.role for profile in build_specialist_capability_catalog(agent_snapshot)
+    ]
+    team_performance_profile = build_team_performance_profile(
+        db,
+        project.id,
+        specialist_roles,
+    )
+    preflight = build_workflow_preflight(
+        agent_snapshot,
+        payload.user_input,
+        team_performance_profile,
+    )
     if not preflight.ready:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -281,6 +296,7 @@ async def run_workflow(
                 payload.user_input,
                 agent_snapshot,
                 require_plan_approval=payload.require_plan_approval,
+                team_performance_profile=team_performance_profile.model_dump(mode="json"),
             ),
             ensure_ascii=False,
         ),
@@ -291,6 +307,18 @@ async def run_workflow(
     )
     db.add(workflow)
     db.flush()
+    record_workflow_event(
+        db,
+        workflow,
+        "TEAM_PERFORMANCE_SNAPSHOTTED",
+        "Same-project specialist performance evidence frozen",
+        payload={
+            "workflow_count": team_performance_profile.workflow_count,
+            "branch_sample_count": team_performance_profile.branch_sample_count,
+            "observed_role_count": team_performance_profile.observed_role_count,
+            "sufficient_role_count": team_performance_profile.sufficient_role_count,
+        },
+    )
     record_workflow_event(db, workflow, "QUEUED", "Workflow queued")
     record_audit(
         db,
@@ -316,10 +344,15 @@ def preflight_workflow(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> WorkflowPreflightResponse:
-    get_project_for_user(payload.project_id, current_user, db, write=True)
+    project = get_project_for_user(payload.project_id, current_user, db, write=True)
+    agent_snapshot = snapshot_agent_configs(db, current_user.role)
+    specialist_roles = [
+        profile.role for profile in build_specialist_capability_catalog(agent_snapshot)
+    ]
     return build_workflow_preflight(
-        snapshot_agent_configs(db, current_user.role),
+        agent_snapshot,
         payload.user_input,
+        build_team_performance_profile(db, project.id, specialist_roles),
     )
 
 

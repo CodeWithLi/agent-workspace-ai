@@ -84,7 +84,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 ## 工作流与知识库
 
-- `POST /workflow/preflight`：只读检查给定项目和工作目标所需的专业能力，返回四类专业 Agent 的资格、当前能力视图和阻断原因；不扣费、不创建运行。
+- `POST /workflow/preflight`：只读检查给定项目和工作目标所需的专业能力，返回四类专业 Agent 的资格、当前能力视图、阻断原因及同项目 Team Performance Profile；不扣费、不创建运行。
 - `POST /workflow/run`
 - `GET /workflow?project_id=...`
 - `GET /workflow/{workflow_id}`
@@ -119,13 +119,13 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
 
-`POST /workflow/preflight` 与运行入口使用同一套确定性团队就绪规则：至少两个合格专业 Agent，并覆盖工作目标明确要求的领域能力。`POST /workflow/run` 不信任此前的客户端结果，而是在项目互斥检查后重新冻结配置并复核；只有通过后才预扣额度和创建队列运行，同一次运行继续复用这份快照，避免检查与执行使用不同配置。
+`POST /workflow/preflight` 与运行入口使用同一套确定性团队就绪规则：至少两个合格专业 Agent，并覆盖工作目标明确要求的领域能力。响应中的 `team_performance_profile` 来自最近 50 个同项目终态运行，按角色返回最终成功/失败、重试、修订、可靠性、分支中位耗时、平均模型成本和 `INSUFFICIENT|LOW|MEDIUM|HIGH` 证据等级。`POST /workflow/run` 不信任此前的客户端结果，而是在项目互斥检查后重新冻结配置与绩效证据并复核；只有通过后才预扣额度和创建队列运行，同一次运行继续复用这份快照，避免检查、规划与审批使用不同数据。
 
 Requirement 节点将产品经理输出解析为 `requirements.contract`：包含目标用户、范围内/外、约束、假设，以及带稳定 `AC-xx`、优先级和证据要求的验收标准。架构师与测试工程师独立返回 `ACCEPT|CHALLENGE|ABSTAIN`，归约结果存入 `requirements.consensus`。合法质疑触发一次产品经理修订；服务端拒绝无效或 SHA-256 指纹未变化的修订，并仅对有效新合同重新评审。最终 `CHALLENGED` 会强制 `require_plan_approval=true`，`INCOMPLETE` 保留证据但不把模型故障伪装成质疑。`REQUIREMENTS_CONSENSUS_REACHED` 事件只公开验收标准数、状态、来源、评审票数和修订有效性，不返回合同、问题或建议正文；缺少新字段的历史运行仍按原状态读取。
 
 `POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；创建时按发起者角色冻结 Agent 的 Prompt、模型、版本、启用工具、知识权限和并发限制。Planner 只接收本次冻结快照中合格的专业角色及能力目录；少于两个合格角色，或用户明确要求的知识检索/通知投递能力不可用时不调用模型。设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。计划中的每个 assignment 声明 `required_capabilities`、`selection_reason`，并可使用 `depends_on` 引用同一计划内的前置角色；服务端拒绝不可用角色、能力越权、明确领域能力遗漏、重复、自依赖、未知依赖和环，批准及调度时都会复核。缺少能力元数据或依赖字段的旧计划由服务端补齐基线能力并按无依赖处理。同一拓扑波次内并行执行，后续波次接收直接上游 Handoff。新 Handoff 在服务端写入 `plan_version`、`upstream_fingerprints`、`input_fingerprint` 和 `output_fingerprint`；Quality Gate 会根据当前计划和拓扑重新计算这些值，阻断被修改或引用旧上游的交接，缺少这些字段的历史快照保持兼容。Quality Gate 并行调用测试、运营和架构 Reviewer；至少两份合法 JSON 合同构成 quorum，有效评分取中位数且有效票必须多数通过，确定性检查和任一开放阻塞项仍可否决。单 Reviewer 异常按弃权处理，低于 quorum 时 worker 从质量节点重试。每个尝试批次都会原子提交已成功 Handoff 和消息；瞬时分支错误只重试失败角色，确定性错误或局部重试耗尽进入 `specialist_review`。事件公开脱敏的退避、恢复、证据链和 Reviewer 计数，不公开完整指纹或评审正文。创建运行时冻结局部重试参数；每次重规划追加不可变快照并重新审批。同一项目存在活动工作流时拒绝第二条；幂等请求不重复扣费。后台 worker 按节点和专业波次持久化快照，取消或真正终态失败才进入补偿与幂等退款。
 
-每个计划版本包含三个彼此隔离的 Planner 候选视角。服务端只接受通过能力和 DAG 合同的候选，并记录五项总计 100 分的确定性检查；架构师仲裁只能选择已有 `candidate_id`，不能通过响应改写计划。仲裁失败时自动选择确定性最高分候选，全部候选无效时使用能力感知的服务端计划。响应状态中的 `plan_deliberation` 和 `plan_revisions[].deliberation` 保存候选、结构指纹、评分、选择依据和少数意见；缺少这些字段的历史运行保持兼容。选择历史 `plan_version` 批准或重规划时，服务端同步切换计划与仲裁证据。`PLAN_DELIBERATED` 事件只公开候选数量、不同结构数、无效候选数、选中 ID、仲裁模式和分数，不返回候选正文。
+每个计划版本包含三个彼此隔离的 Planner 候选视角。服务端只接受通过能力和 DAG 合同的候选，并记录五项总计 100 分的确定性检查；架构师仲裁只能选择已有 `candidate_id`，不能通过响应改写计划。每个候选另含 `performance_evidence`：结构分保持 `/100`，样本充足角色的收缩可靠性只产生 `-5..+5` 调整，成本与关键路径投影要求全部分配角色有观测；能力合同和必需角色不受历史表现影响。仲裁失败时按承诺状态、调整后决策分、结构分和稳定 ID 选择，全部候选无效时使用能力感知的服务端计划。响应状态中的 `plan_deliberation` 和 `plan_revisions[].deliberation` 保存候选、绩效证据、结构指纹、评分、选择依据和少数意见；缺少绩效字段的历史运行仍按结构分兼容。选择历史 `plan_version` 批准或重规划时，服务端同步切换计划与仲裁证据。`PLAN_DELIBERATED` 事件只公开候选数量、不同结构数、无效候选数、选中 ID、仲裁模式、结构分、决策分、可靠性调整、证据等级和角色计数，不返回候选正文。
 
 每个合法候选在仲裁前由其 assignment 对应的冻结专业 Agent 并发生成执行承诺。`commitments` 包含角色、`ACCEPT|CHALLENGE|ABSTAIN`、结构化状态、置信度、摘要、缺失输入、依赖风险和修改建议，并汇总为 `READY|CHALLENGED|INCOMPLETE`。三个独立候选都未就绪且存在合法 `CHALLENGE` 时，服务端按接受数、质疑数、确定性评分和稳定 ID 选择来源候选，调用 Planner 一次生成 `origin=negotiated_repair` 的第四候选；重复指纹或无效合同被拒绝，合法修复只重新收集自己的执行承诺。存在 `READY` 候选时服务端拒绝架构师选择其他状态；修复后仍无 `READY` 候选时自动把 `require_plan_approval` 设为 true。人工计划 `REVISE` 会把所选版本的结构化质疑连同人工意见注入下一轮 Planner。`PLAN_COMMITMENTS_COLLECTED` 与 `PLAN_NEGOTIATION_REPAIRED` 事件只公开候选、来源、修复有效性、就绪、接受、质疑和弃权计数，不公开承诺正文、置信度或具体问题。
 

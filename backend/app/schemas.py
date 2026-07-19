@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.agent.team_performance import TeamPerformanceProfile
 from app.models import AgentRole, ProjectMemberRole, SagaStepStatus, TaskStatus, TraceAlertStatus, UserRole, WorkflowStatus
 
 
@@ -430,6 +431,7 @@ class WorkflowPreflightResponse(BaseModel):
     minimum_required: int
     specialists: list[WorkflowSpecialistPreflightOut]
     blockers: list[str]
+    team_performance_profile: TeamPerformanceProfile
 
 
 class WorkflowContinueRequest(BaseModel):

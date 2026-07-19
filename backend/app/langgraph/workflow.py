@@ -103,6 +103,7 @@ class ProjectState(TypedDict, total=False):
     plan_version: int
     plan_revisions: list[dict[str, Any]]
     plan_deliberation: dict[str, Any]
+    team_performance_profile: dict[str, Any]
     require_plan_approval: bool
     plan_approved: bool
     plan_revision_count: int
@@ -193,6 +194,7 @@ def initial_state(
     user_input: str,
     agent_snapshot: dict[str, dict[str, Any]] | None = None,
     require_plan_approval: bool = False,
+    team_performance_profile: dict[str, Any] | None = None,
 ) -> ProjectState:
     return {
         "user_input": user_input,
@@ -209,6 +211,7 @@ def initial_state(
         "plan_version": 0,
         "plan_revisions": [],
         "plan_deliberation": {},
+        "team_performance_profile": team_performance_profile or {},
         "require_plan_approval": require_plan_approval,
         "plan_approved": not require_plan_approval,
         "plan_revision_count": 0,
@@ -858,6 +861,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 perspective["label"],
                 candidate_plan,
                 state["user_input"],
+                team_performance_profile=state.get("team_performance_profile"),
             )
             duplicate_of = fingerprints.get(assessment.plan_fingerprint)
             if duplicate_of:
@@ -876,6 +880,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     fallback_plan,
                     state["user_input"],
                     origin="deterministic_fallback",
+                    team_performance_profile=state.get("team_performance_profile"),
                 )
             ]
 
@@ -988,6 +993,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 key=lambda candidate: (
                     -candidate.commitment_accept_count,
                     candidate.commitment_challenge_count,
+                    -(
+                        candidate.performance_evidence.selection_score
+                        if candidate.performance_evidence
+                        else candidate.score
+                    ),
                     -candidate.score,
                     candidate.candidate_id,
                 ),
@@ -1040,6 +1050,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         state["user_input"],
                         origin="negotiated_repair",
                         source_candidate_id=repair_source.candidate_id,
+                        team_performance_profile=state.get("team_performance_profile"),
                     )
                     if repaired_plan is not None
                     else None
@@ -1198,6 +1209,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     for candidate in deliberation.candidates
                     if candidate.candidate_id == deliberation.selected_candidate_id
                 ),
+                "selection_score": deliberation.selected_candidate.performance_evidence.selection_score,
+                "reliability_adjustment": deliberation.selected_candidate.performance_evidence.reliability_adjustment,
+                "performance_evidence_level": deliberation.selected_candidate.performance_evidence.evidence_level,
+                "performance_observed_role_count": deliberation.selected_candidate.performance_evidence.observed_role_count,
+                "performance_sufficient_role_count": deliberation.selected_candidate.performance_evidence.sufficient_role_count,
                 "plan_version": plan_version,
             },
         )

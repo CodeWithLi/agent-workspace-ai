@@ -331,6 +331,12 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
         for role in ("test_engineer", "operations_analyst")
     }
     assert first_state["plan_revisions"][0]["deliberation"] == first_state["plan_deliberation"]
+    assert all(
+        candidate["performance_evidence"]["reliability_adjustment"] == 0
+        and candidate["performance_evidence"]["evidence_level"] == "INSUFFICIENT"
+        and candidate["performance_evidence"]["selection_score"] == candidate["score"]
+        for candidate in first_state["plan_deliberation"]["candidates"]
+    )
     first_assignments = first_state["execution_plan"]["assignments"]
     assert all(assignment["required_capabilities"] for assignment in first_assignments)
     assert all(assignment["selection_reason"] for assignment in first_assignments)
