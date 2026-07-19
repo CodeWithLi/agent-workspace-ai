@@ -15,6 +15,7 @@ from app.core.llm_usage import bind_llm_usage
 from app.agent.concurrency import AgentBusyError, acquire_agent_slot
 from app.agent.orchestration import (
     AgentHandoff,
+    ExecutionPlanCandidate,
     MultiAgentExecutionPlan,
     SpecialistCapabilityProfile,
     arbitrate_execution_plan_candidates,
@@ -338,6 +339,47 @@ def select_execution_plan_deliberation(
     return current if selected_version == current_version and isinstance(current, dict) else {}
 
 
+def selected_plan_commitment_challenges(
+    deliberation: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(deliberation, dict):
+        return []
+    selected_candidate_id = deliberation.get("selected_candidate_id")
+    candidates = deliberation.get("candidates")
+    if not isinstance(selected_candidate_id, str) or not isinstance(candidates, list):
+        return []
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and candidate.get("candidate_id") == selected_candidate_id
+        ),
+        None,
+    )
+    commitments = selected.get("commitments") if isinstance(selected, dict) else None
+    if not isinstance(commitments, list):
+        return []
+    challenges = []
+    for commitment in commitments:
+        if (
+            not isinstance(commitment, dict)
+            or commitment.get("decision") != "CHALLENGE"
+            or commitment.get("structured") is not True
+        ):
+            continue
+        challenges.append(
+            {
+                "role": commitment.get("role"),
+                "summary": commitment.get("summary"),
+                "missing_inputs": commitment.get("missing_inputs", []),
+                "dependency_concerns": commitment.get("dependency_concerns", []),
+                "proposed_changes": commitment.get("proposed_changes", []),
+            }
+        )
+    return challenges
+
+
 def without_analysis(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "analysis"}
 
@@ -578,6 +620,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             infer_required_specialist_capabilities(state["user_input"]),
         )
         eligible_roles = ", ".join(profile.role for profile in eligible_specialists)
+        prior_commitment_challenges = (
+            selected_plan_commitment_challenges(state.get("plan_deliberation"))
+            if revision_feedback
+            else []
+        )
         planner_prompt = (
             "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
             "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
@@ -604,6 +651,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "plan_revision": {
                 "round": int(state.get("plan_revision_count", 0)),
                 "human_feedback": revision_feedback,
+                "specialist_challenges": prior_commitment_challenges,
             } if revision_feedback else None,
         }
         candidates = []
@@ -659,6 +707,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "确定性兜底",
                     fallback_plan,
                     state["user_input"],
+                    origin="deterministic_fallback",
                 )
             ]
 
@@ -698,51 +747,163 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 isolated_usage=True,
             )
 
-        commitment_specs = [
-            (candidate.candidate_id, assignment.role, candidate, assignment)
+        async def collect_commitments(
+            review_candidates: list[ExecutionPlanCandidate],
+        ) -> list[ExecutionPlanCandidate]:
+            commitment_specs = [
+                (candidate.candidate_id, assignment.role, candidate, assignment)
+                for candidate in review_candidates
+                for assignment in candidate.plan.assignments
+            ]
+            commitment_results = await asyncio.gather(
+                *(
+                    run_commitment(candidate, assignment)
+                    for _candidate_id, _role, candidate, assignment in commitment_specs
+                ),
+                return_exceptions=True,
+            )
+            cancellation = next(
+                (
+                    result
+                    for result in commitment_results
+                    if isinstance(result, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if cancellation:
+                raise cancellation
+            commitments_by_candidate = {
+                candidate.candidate_id: {}
+                for candidate in review_candidates
+            }
+            for (candidate_id, role, _candidate, _assignment), result in zip(
+                commitment_specs,
+                commitment_results,
+                strict=True,
+            ):
+                commitments_by_candidate[candidate_id][role] = parse_specialist_plan_commitment(
+                    result if isinstance(result, str) else "",
+                    role,
+                )
+            return [
+                attach_execution_plan_commitments(
+                    candidate,
+                    [
+                        commitments_by_candidate[candidate.candidate_id][assignment.role]
+                        for assignment in candidate.plan.assignments
+                    ],
+                )
+                for candidate in review_candidates
+            ]
+
+        candidates = await collect_commitments(candidates)
+        repair_attempted = False
+        repair_valid = False
+        repair_candidate_id = "negotiated_repair"
+        repair_source_candidate_id = ""
+        challenged_candidates = [
+            candidate
             for candidate in candidates
-            for assignment in candidate.plan.assignments
+            if any(
+                commitment.structured and commitment.decision == "CHALLENGE"
+                for commitment in candidate.commitments
+            )
         ]
-        commitment_results = await asyncio.gather(
-            *(
-                run_commitment(candidate, assignment)
-                for _candidate_id, _role, candidate, assignment in commitment_specs
-            ),
-            return_exceptions=True,
-        )
-        cancellation = next(
-            (
-                result
-                for result in commitment_results
-                if isinstance(result, asyncio.CancelledError)
-            ),
-            None,
-        )
-        if cancellation:
-            raise cancellation
-        commitments_by_candidate = {
-            candidate.candidate_id: {}
-            for candidate in candidates
-        }
-        for (candidate_id, role, _candidate, _assignment), result in zip(
-            commitment_specs,
-            commitment_results,
-            strict=True,
+        if (
+            generated_candidates
+            and not any(candidate.commitment_status == "READY" for candidate in candidates)
+            and challenged_candidates
         ):
-            commitments_by_candidate[candidate_id][role] = parse_specialist_plan_commitment(
-                result if isinstance(result, str) else "",
-                role,
+            repair_attempted = True
+            repair_source = sorted(
+                challenged_candidates,
+                key=lambda candidate: (
+                    -candidate.commitment_accept_count,
+                    candidate.commitment_challenge_count,
+                    -candidate.score,
+                    candidate.candidate_id,
+                ),
+            )[0]
+            repair_source_candidate_id = repair_source.candidate_id
+            source_challenges = [
+                commitment.model_dump(mode="json")
+                for commitment in repair_source.commitments
+                if commitment.structured and commitment.decision == "CHALLENGE"
+            ]
+            try:
+                repair_output = await invoke_agent(
+                    AgentRole.project_manager,
+                    (
+                        "你是自动协商修复 Agent。只允许进行一次修复，只输出完整执行计划 JSON，字段为 "
+                        "objective、rationale、assignments、success_criteria；每个 assignment 包含 role、"
+                        "objective、deliverable、depends_on、required_capabilities、selection_reason。"
+                        "必须逐项闭环输入中的专业执行者质疑，并生成与 source_plan 结构实质不同的计划；"
+                        "只能使用 eligible_specialists 中冻结的角色、能力、工具和知识权限，不得虚构输入、"
+                        "权限或上游产物。依赖必须无环，成功标准必须可验证。"
+                    ),
+                    json.dumps(
+                        agent_context(state, {
+                            "workflow_objective": state["user_input"],
+                            "requirements": without_analysis(state["requirements"]),
+                            "architecture": state["architecture"],
+                            "product_prd": document_content(state, "PRD"),
+                            "system_design": document_content(state, "SYSTEM_DESIGN"),
+                            "source_candidate_id": repair_source.candidate_id,
+                            "source_plan": repair_source.plan.model_dump(mode="json"),
+                            "specialist_challenges": source_challenges,
+                            "eligible_specialists": [
+                                profile.model_dump(mode="json", exclude={"unavailable_reasons"})
+                                for profile in eligible_specialists
+                            ],
+                        }),
+                        ensure_ascii=False,
+                    ),
+                )
+                repaired_plan = parse_execution_plan_candidate(
+                    repair_output,
+                    state["user_input"],
+                    capability_catalog,
+                )
+                repaired_candidate = (
+                    assess_execution_plan_candidate(
+                        repair_candidate_id,
+                        "自动协商修复",
+                        repaired_plan,
+                        state["user_input"],
+                        origin="negotiated_repair",
+                        source_candidate_id=repair_source.candidate_id,
+                    )
+                    if repaired_plan is not None
+                    else None
+                )
+                if (
+                    repaired_candidate is not None
+                    and repaired_candidate.plan_fingerprint
+                    not in {candidate.plan_fingerprint for candidate in candidates}
+                ):
+                    repair_valid = True
+                    candidates.extend(await collect_commitments([repaired_candidate]))
+            except Exception as exc:
+                logger.warning("Negotiated plan repair failed with %s", type(exc).__name__)
+
+            record_workflow_event(
+                db,
+                workflow,
+                "PLAN_NEGOTIATION_REPAIRED",
+                "Bounded specialist challenge negotiation completed",
+                node="planning",
+                payload={
+                    "source_candidate_id": repair_source_candidate_id,
+                    "repair_candidate_id": repair_candidate_id,
+                    "repair_attempted": repair_attempted,
+                    "repair_valid": repair_valid,
+                    "ready_candidate_count": sum(
+                        candidate.commitment_status == "READY"
+                        for candidate in candidates
+                    ),
+                },
             )
-        candidates = [
-            attach_execution_plan_commitments(
-                candidate,
-                [
-                    commitments_by_candidate[candidate.candidate_id][assignment.role]
-                    for assignment in candidate.plan.assignments
-                ],
-            )
-            for candidate in candidates
-        ]
+
         commitments = [
             commitment
             for candidate in candidates
@@ -817,6 +978,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         approval_required = bool(
             state.get("require_plan_approval", False)
             or deliberation.selected_candidate.commitment_status == "CHALLENGED"
+            or (
+                repair_attempted
+                and not any(
+                    candidate.commitment_status == "READY"
+                    for candidate in deliberation.candidates
+                )
+            )
         )
         revisions = state.get("plan_revisions")
         revisions = revisions if isinstance(revisions, list) else []

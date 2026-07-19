@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from app.agent.orchestration import (
     AgentHandoff,
+    ExecutionPlanCandidate,
     MultiAgentExecutionPlan,
     ReviewerPanelQuorumError,
     SpecialistTeamUnavailableError,
@@ -158,6 +159,23 @@ def test_execution_plan_candidates_are_strictly_parsed_scored_and_fingerprinted(
     assert efficient_candidate.score > sequential_candidate.score
     assert len(efficient_candidate.plan_fingerprint) == 64
     assert efficient_candidate.plan.assignments[0].selection_reason
+
+
+def test_execution_plan_candidate_keeps_legacy_snapshots_compatible() -> None:
+    plan = build_fallback_plan("构建可灰度发布并可回滚的会员平台")
+    candidate = assess_execution_plan_candidate(
+        "delivery_confidence",
+        "交付完整性",
+        plan,
+        "构建可灰度发布并可回滚的会员平台",
+    )
+    legacy_snapshot = candidate.model_dump(mode="json")
+    legacy_snapshot.pop("origin")
+
+    restored = ExecutionPlanCandidate.model_validate(legacy_snapshot)
+
+    assert restored.origin == "independent"
+    assert restored.source_candidate_id is None
 
 
 def test_plan_arbitration_preserves_selection_evidence_and_falls_back_deterministically() -> None:

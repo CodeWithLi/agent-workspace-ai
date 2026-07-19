@@ -3014,11 +3014,18 @@ test('reviews, replans and approves an execution plan before specialist dispatch
           : assignment),
         success_criteria: [...initialPlan.success_criteria, '数据安全边界具有明确负责人']
       }
+      const negotiatedPlan = {
+        ...revisedPlan,
+        objective: '自动协商闭环后的可恢复交付计划',
+        rationale: '已把执行者提出的错误预算和发布窗口质疑写入任务与成功标准。',
+        success_criteria: [...revisedPlan.success_criteria, '错误预算与发布窗口均有可审计证据']
+      }
       const revisedDeliberation = {
         ...initialDeliberation,
-        selection_reason: '修订后的风险控制方案完整回应人工安全边界和负责人要求。',
-        candidates: initialDeliberation.candidates.map((candidate) => (
-          {
+        selected_candidate_id: 'negotiated_repair',
+        selection_reason: '修复方案完整回应执行者质疑并通过全部角色重新承诺。',
+        candidates: [
+          ...initialDeliberation.candidates.map((candidate) => ({
             ...candidate,
             ...(candidate.candidate_id === 'risk_control'
               ? { plan: revisedPlan, plan_fingerprint: 'd'.repeat(64) }
@@ -3028,21 +3035,39 @@ test('reviews, replans and approves an execution plan before specialist dispatch
             commitment_valid_count: 2,
             commitment_accept_count: 1,
             commitment_challenge_count: 1
+          })),
+          {
+            candidate_id: 'negotiated_repair',
+            perspective: '自动协商修复',
+            origin: 'negotiated_repair',
+            source_candidate_id: 'delivery_confidence',
+            plan: negotiatedPlan,
+            score: 94,
+            checks: candidateChecks,
+            plan_fingerprint: 'e'.repeat(64),
+            duplicate_of: null,
+            commitments: acceptedCommitments,
+            commitment_status: 'READY',
+            commitment_valid_count: 2,
+            commitment_accept_count: 2,
+            commitment_challenge_count: 0
           }
-        ))
+        ],
+        dissenting_candidate_ids: ['delivery_confidence', 'risk_control', 'parallel_efficiency'],
+        distinct_candidate_count: 4
       }
       planWorkflow = {
         ...planWorkflow,
         state: {
           ...planWorkflow.state,
-          execution_plan: revisedPlan,
+          execution_plan: negotiatedPlan,
           plan_version: 2,
           plan_deliberation: revisedDeliberation,
           plan_revisions: [
             ...planWorkflow.state.plan_revisions,
             {
               version: 2,
-              plan: revisedPlan,
+              plan: negotiatedPlan,
               deliberation: revisedDeliberation,
               feedback: String(payload.human_feedback),
               created_at: '2026-07-19T08:02:00Z'
@@ -3151,13 +3176,18 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await expect(reviseButton).toBeDisabled()
   await page.getByLabel('工作流人工反馈').fill('补充数据安全边界，并为回滚验收指定负责人')
   await reviseButton.click()
-  await expect(page.getByText('执行计划 v2 存在执行者质疑', { exact: true })).toBeVisible()
-  await expect(page.locator('.orchestration-copy').getByText('补齐安全边界后的可恢复交付计划', { exact: true })).toBeVisible()
+  await expect(page.getByText('执行计划 v2 等待批准', { exact: true })).toBeVisible()
+  await expect(page.locator('.orchestration-copy').getByText('自动协商闭环后的可恢复交付计划', { exact: true })).toBeVisible()
+  await expect(page.getByText('自动协商修复 · 质疑已闭环', { exact: true })).toBeVisible()
+  await expect(page.getByText('4 个候选 · 4 个不同结构', { exact: true })).toBeVisible()
+  const repairedCandidate = page.getByLabel('自动协商修复候选方案')
+  await expect(repairedCandidate.locator('.plan-candidate-status').getByText('自动协商修复', { exact: true })).toBeVisible()
+  await expect(repairedCandidate.getByText('来源：交付完整性 · 质疑已闭环', { exact: true })).toBeVisible()
   await expect(page.getByText('相较 v1 的变化', { exact: true })).toBeVisible()
   await expect(page.getByText('调整总体目标', { exact: true })).toBeVisible()
   await expect(page.getByText('更新编排理由', { exact: true })).toBeVisible()
   await expect(page.getByText('更新分支：测试工程师', { exact: true })).toBeVisible()
-  await expect(page.getByText('新增 1 项成功标准', { exact: true })).toBeVisible()
+  await expect(page.getByText('新增 2 项成功标准', { exact: true })).toBeVisible()
   await expect(page.getByText('重规划意见：补充数据安全边界，并为回滚验收指定负责人', { exact: true })).toBeVisible()
   expect(decisions[0]).toMatchObject({ decision: 'REVISE', human_feedback: '补充数据安全边界，并为回滚验收指定负责人', plan_version: 1 })
 

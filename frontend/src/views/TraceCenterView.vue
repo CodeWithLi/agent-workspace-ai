@@ -477,7 +477,7 @@ const eventLabels: Record<string, string> = {
   BRANCH_FAILED: '分支失败', BRANCH_RETRY_SCHEDULED: '分支准备重试', RETRY_SCHEDULED: '计划自动重试',
   RETRY_CREATED: '已创建重试运行', RETRY_QUEUED: '检查点重试入队',
   PAUSE_REQUESTED: '请求安全暂停', PAUSE_SKIPPED: '暂停未生效', INTERVENTION_APPLIED: '应用恢复指令',
-  PLAN_COMMITMENTS_COLLECTED: '执行承诺已收集', PLAN_DELIBERATED: '候选计划已仲裁', PLAN_CREATED: '计划已生成', PLAN_APPROVED: '计划已批准', PLAN_REVISION_REQUESTED: '要求重新规划',
+  PLAN_COMMITMENTS_COLLECTED: '执行承诺已收集', PLAN_NEGOTIATION_REPAIRED: '执行质疑已协商', PLAN_DELIBERATED: '候选计划已仲裁', PLAN_CREATED: '计划已生成', PLAN_APPROVED: '计划已批准', PLAN_REVISION_REQUESTED: '要求重新规划',
   QUALITY_GATE_PASSED: '质量门禁通过',
   QUALITY_GATE_FAILED: '质量门禁未通过', REVISION_REQUESTED: '请求修订', PAUSED: '等待人工确认',
   CANCEL_REQUESTED: '请求取消', CANCELLED: '已取消', COMPLETED: '运行完成', FAILED: '运行失败'

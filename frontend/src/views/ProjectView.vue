@@ -162,6 +162,12 @@
               <el-tag v-if="selectedPlanCandidate" :type="candidateCommitmentType(selectedPlanCandidate)">
                 选中方案 · {{ candidateCommitmentLabel(selectedPlanCandidate) }}
               </el-tag>
+              <el-tag
+                v-if="selectedPlanCandidate?.origin === 'negotiated_repair'"
+                type="success"
+              >
+                自动协商修复 · {{ candidateNegotiationStatus(selectedPlanCandidate) }}
+              </el-tag>
               <el-tag v-if="selectedPlanDeliberation.invalid_candidate_count" type="warning">
                 {{ selectedPlanDeliberation.invalid_candidate_count }} 个无效候选已隔离
               </el-tag>
@@ -190,6 +196,9 @@
                     <span>{{ candidate.plan.objective }}</span>
                   </div>
                   <div class="plan-candidate-status">
+                    <el-tag v-if="candidate.origin === 'negotiated_repair'" type="primary">
+                      自动协商修复
+                    </el-tag>
                     <el-tag :type="candidateCommitmentType(candidate)">
                       {{ candidateCommitmentLabel(candidate) }}
                     </el-tag>
@@ -203,6 +212,9 @@
                 <div class="plan-candidate-meta">
                   <span>{{ candidate.plan.assignments.map((assignment) => specialistRoleLabel(assignment.role)).join('、') }}</span>
                   <span>{{ candidateTopologyLabel(candidate.plan) }}</span>
+                  <span v-if="candidate.origin === 'negotiated_repair' && candidate.source_candidate_id">
+                    来源：{{ candidatePerspectiveLabel(candidate.source_candidate_id) }} · {{ candidateNegotiationStatus(candidate) }}
+                  </span>
                   <span v-if="candidate.duplicate_of">与 {{ candidatePerspectiveLabel(candidate.duplicate_of) }} 结构相同</span>
                 </div>
                 <section
@@ -682,6 +694,8 @@ interface WorkflowPlanCommitment {
 interface WorkflowPlanCandidate {
   candidate_id: string
   perspective: string
+  origin?: 'independent' | 'negotiated_repair' | 'deterministic_fallback'
+  source_candidate_id?: string | null
   plan: WorkflowExecutionPlan
   score: number
   checks: WorkflowPlanCandidateCheck[]
@@ -1071,6 +1085,12 @@ function candidateCommitmentType(candidate: WorkflowPlanCandidate): 'success' | 
   if (candidate.commitment_status === 'READY') return 'success'
   if (candidate.commitment_status === 'CHALLENGED') return 'warning'
   return 'info'
+}
+
+function candidateNegotiationStatus(candidate: WorkflowPlanCandidate) {
+  if (candidate.commitment_status === 'READY') return '质疑已闭环'
+  if (candidate.commitment_status === 'CHALLENGED') return '仍有质疑'
+  return '承诺待确认'
 }
 
 function commitmentDecisionLabel(decision: WorkflowPlanCommitment['decision']) {

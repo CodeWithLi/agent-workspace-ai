@@ -403,6 +403,12 @@ class SpecialistPlanCommitment(BaseModel):
 class ExecutionPlanCandidate(BaseModel):
     candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
     perspective: str = Field(min_length=2, max_length=100)
+    origin: Literal[
+        "independent",
+        "negotiated_repair",
+        "deterministic_fallback",
+    ] = "independent"
+    source_candidate_id: str | None = Field(default=None, pattern=r"^[a-z0-9_]{2,40}$")
     plan: MultiAgentExecutionPlan
     score: int = Field(ge=0, le=100)
     checks: list[ExecutionPlanCandidateCheck] = Field(min_length=5, max_length=5)
@@ -430,6 +436,12 @@ class ExecutionPlanCandidate(BaseModel):
             raise ValueError("candidate score must equal the sum of its checks")
         if self.duplicate_of == self.candidate_id:
             raise ValueError("candidate cannot duplicate itself")
+        if self.source_candidate_id == self.candidate_id:
+            raise ValueError("candidate cannot be repaired from itself")
+        if self.origin == "negotiated_repair" and self.source_candidate_id is None:
+            raise ValueError("negotiated repair candidates require a source candidate")
+        if self.origin != "negotiated_repair" and self.source_candidate_id is not None:
+            raise ValueError("only negotiated repair candidates may reference a source candidate")
         if not self.commitments:
             if (
                 self.commitment_status != "NOT_REVIEWED"
@@ -474,11 +486,11 @@ class ExecutionPlanDeliberation(BaseModel):
     selection_reason: str = Field(min_length=4, max_length=2000)
     arbitration_mode: Literal["independent_arbiter", "deterministic_fallback"]
     arbiter_role: Literal["architect"] = "architect"
-    candidates: list[ExecutionPlanCandidate] = Field(min_length=1, max_length=3)
-    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=2)
+    candidates: list[ExecutionPlanCandidate] = Field(min_length=1, max_length=4)
+    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=3)
     dissent_summary: str = Field(default="", max_length=2000)
     invalid_candidate_count: int = Field(default=0, ge=0, le=3)
-    distinct_candidate_count: int = Field(ge=1, le=3)
+    distinct_candidate_count: int = Field(ge=1, le=4)
 
     @model_validator(mode="after")
     def validate_candidate_references(self) -> "ExecutionPlanDeliberation":
@@ -492,6 +504,13 @@ class ExecutionPlanDeliberation(BaseModel):
         invalid_dissent = set(self.dissenting_candidate_ids) - set(candidate_ids)
         if invalid_dissent or self.selected_candidate_id in self.dissenting_candidate_ids:
             raise ValueError("dissenting candidates must be assessed and unselected")
+        invalid_sources = {
+            candidate.source_candidate_id
+            for candidate in self.candidates
+            if candidate.source_candidate_id is not None
+        } - set(candidate_ids)
+        if invalid_sources:
+            raise ValueError("negotiated repair sources must reference assessed candidates")
         distinct_count = len({candidate.plan_fingerprint for candidate in self.candidates})
         if self.distinct_candidate_count != distinct_count:
             raise ValueError("distinct candidate count must match plan fingerprints")
@@ -603,6 +622,12 @@ def assess_execution_plan_candidate(
     user_input: str,
     *,
     duplicate_of: str | None = None,
+    origin: Literal[
+        "independent",
+        "negotiated_repair",
+        "deterministic_fallback",
+    ] = "independent",
+    source_candidate_id: str | None = None,
 ) -> ExecutionPlanCandidate:
     required = infer_required_specialist_capabilities(user_input)
     covered = {
@@ -727,6 +752,8 @@ def assess_execution_plan_candidate(
     return ExecutionPlanCandidate(
         candidate_id=candidate_id,
         perspective=perspective,
+        origin=origin,
+        source_candidate_id=source_candidate_id,
         plan=plan,
         score=sum(check.score for check in checks),
         checks=checks,
@@ -1120,7 +1147,7 @@ def parse_specialist_plan_commitment(
 class _ExecutionPlanArbiterDecision(BaseModel):
     selected_candidate_id: str = Field(pattern=r"^[a-z0-9_]{2,40}$")
     selection_reason: str = Field(min_length=4, max_length=2000)
-    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=2)
+    dissenting_candidate_ids: list[str] = Field(default_factory=list, max_length=3)
     dissent_summary: str = Field(default="", max_length=2000)
 
 

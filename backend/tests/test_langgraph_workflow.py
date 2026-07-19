@@ -445,9 +445,16 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
     project = Project(name="Commitment Gate", description="Challenge before dispatch", owner_id=user.id)
     db.add(project)
     db.commit()
+    planner_contexts: list[dict] = []
+    repair_contexts: list[dict] = []
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "自动协商修复 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            repair_contexts.append(context)
+            return json.dumps(context["source_plan"], ensure_ascii=False)
         if "动态编排器" in system_prompt:
+            planner_contexts.append(json.loads(user_prompt))
             return json.dumps(
                 {
                     "objective": "形成执行者确认边界的可恢复交付计划",
@@ -545,6 +552,11 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
     assert selected["commitment_challenge_count"] == 1
     assert paused_state["specialist_handoffs"] == []
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
+    assert len(repair_contexts) == 1
+    assert repair_contexts[0]["source_candidate_id"] == "delivery_confidence"
+    assert repair_contexts[0]["specialist_challenges"][0]["missing_inputs"] == [
+        "生产错误预算基线"
+    ]
     event_types = list(
         db.scalars(
             select(WorkflowEvent.event_type)
@@ -553,10 +565,217 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
         )
     )
     assert event_types.count("PLAN_COMMITMENTS_COLLECTED") == 1
+    assert event_types.count("PLAN_NEGOTIATION_REPAIRED") == 1
+    repair_event = db.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "PLAN_NEGOTIATION_REPAIRED",
+        )
+        .order_by(WorkflowEvent.id.desc())
+    )
+    assert json.loads(repair_event.payload_json) == {
+        "source_candidate_id": "delivery_confidence",
+        "repair_candidate_id": "negotiated_repair",
+        "repair_attempted": True,
+        "repair_valid": False,
+        "ready_candidate_count": 0,
+    }
+
+    workflow = await continue_workspace_graph(
+        db,
+        workflow,
+        "补充生产错误预算，并明确恢复演练的发布窗口",
+        decision="REVISE",
+    )
+    assert workflow.status == WorkflowStatus.paused
+    assert workflow.current_node == "plan_review"
+    assert len(planner_contexts) == 6
+    assert all(
+        context["plan_revision"]["specialist_challenges"][0]["missing_inputs"]
+        == ["生产错误预算基线"]
+        for context in planner_contexts[3:]
+    )
 
     workflow = await continue_workspace_graph(db, workflow, decision="APPROVE")
     assert workflow.status == WorkflowStatus.completed
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) >= 4
+
+
+@pytest.mark.asyncio
+async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="negotiated-repair@example.com", name="Negotiated Repair", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Negotiated Repair", description="Close specialist challenges", owner_id=user.id)
+    db.add(project)
+    db.commit()
+    repair_contexts: list[dict] = []
+    commitment_contexts: list[dict] = []
+
+    def candidate_plan(perspective_id: str) -> dict:
+        return {
+            "objective": f"从 {perspective_id} 视角形成可恢复交付计划",
+            "rationale": "测试与运营分别验证验收证据和恢复边界。",
+            "assignments": [
+                {
+                    "role": "test_engineer",
+                    "objective": "验证核心路径、边界状态和验收证据",
+                    "deliverable": "可复现测试与验收清单",
+                },
+                {
+                    "role": "operations_analyst",
+                    "objective": "验证监控、灰度发布和故障恢复边界",
+                    "deliverable": "发布与回滚运行手册",
+                },
+            ],
+            "success_criteria": [
+                "核心路径都有可复现验收证据和明确负责人",
+                "失败场景都有告警阈值、回滚条件和恢复时限",
+            ],
+        }
+
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "自动协商修复 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            repair_contexts.append(context)
+            return json.dumps(
+                {
+                    "objective": "闭环执行者质疑后形成可恢复交付计划",
+                    "rationale": "先固定生产错误预算与发布窗口，再让测试证据约束恢复演练。",
+                    "assignments": [
+                        {
+                            "role": "test_engineer",
+                            "objective": "验证核心路径、错误预算边界和验收证据",
+                            "deliverable": "含错误预算基线的可复现验收清单",
+                        },
+                        {
+                            "role": "operations_analyst",
+                            "objective": "基于测试证据验证发布窗口、监控和故障恢复",
+                            "deliverable": "含发布窗口和回滚阈值的运行手册",
+                            "depends_on": ["test_engineer"],
+                        },
+                    ],
+                    "success_criteria": [
+                        "核心路径都有可复现验收证据和明确负责人",
+                        "生产错误预算、发布窗口和回滚阈值均有审计证据",
+                        "恢复演练在约定窗口完成并记录实际恢复时限",
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "动态编排器" in system_prompt:
+            perspective_id = json.loads(user_prompt)["planning_perspective"]["id"]
+            return json.dumps(candidate_plan(perspective_id), ensure_ascii=False)
+        if "执行前承诺 Agent" in system_prompt:
+            context = json.loads(user_prompt)
+            commitment_contexts.append(context)
+            repaired = context["candidate_id"] == "negotiated_repair"
+            challenged = not repaired and context["assignment"]["role"] == "operations_analyst"
+            return json.dumps(
+                {
+                    "decision": "CHALLENGE" if challenged else "ACCEPT",
+                    "confidence": 0.94,
+                    "summary": (
+                        "缺少生产错误预算基线和确认后的发布窗口，当前不能承诺恢复目标。"
+                        if challenged
+                        else "输入、依赖、能力和交付边界完整，可以执行。"
+                    ),
+                    "missing_inputs": ["生产错误预算基线"] if challenged else [],
+                    "dependency_concerns": ["恢复演练缺少确认后的发布窗口"] if challenged else [],
+                    "proposed_changes": ["补充基线和发布窗口后重新确认"] if challenged else [],
+                },
+                ensure_ascii=False,
+            )
+        if "独立执行计划仲裁 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "selected_candidate_id": "risk_control",
+                    "selection_reason": "风险候选得分更高。",
+                    "dissenting_candidate_ids": ["delivery_confidence", "parallel_efficiency"],
+                    "dissent_summary": "保留其他两个独立候选。",
+                },
+                ensure_ascii=False,
+            )
+        if "专业交接 Agent" in system_prompt:
+            return (
+                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
+                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
+                "所有结论均与用户目标和成功标准建立可追溯关系，并记录实际结果和审计责任人。"
+            )
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 96,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "专业交接达到发布门禁。",
+                },
+                ensure_ascii=False,
+            )
+        if "报告生成器" in system_prompt:
+            return "# 最终报告\n\n自动协商后的执行计划已完成。"
+        return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
+
+    monkeypatch.setattr(get_llm(), "chat", fake_chat)
+
+    workflow = await run_workspace_graph(
+        db,
+        project,
+        user.id,
+        "构建可灰度发布并可回滚的会员平台",
+        pause_before_report=False,
+        require_plan_approval=False,
+    )
+    state = json.loads(workflow.state_json)
+    deliberation = state["plan_deliberation"]
+    selected = next(
+        candidate
+        for candidate in deliberation["candidates"]
+        if candidate["candidate_id"] == deliberation["selected_candidate_id"]
+    )
+
+    assert workflow.status == WorkflowStatus.completed
+    assert deliberation["selected_candidate_id"] == "negotiated_repair"
+    assert deliberation["arbitration_mode"] == "deterministic_fallback"
+    assert len(deliberation["candidates"]) == 4
+    assert selected["origin"] == "negotiated_repair"
+    assert selected["source_candidate_id"] == "delivery_confidence"
+    assert selected["commitment_status"] == "READY"
+    assert selected["commitment_accept_count"] == 2
+    assert state["require_plan_approval"] is False
+    assert state["plan_approved"] is True
+    assert len(repair_contexts) == 1
+    assert repair_contexts[0]["source_candidate_id"] == "delivery_confidence"
+    assert repair_contexts[0]["specialist_challenges"][0]["missing_inputs"] == [
+        "生产错误预算基线"
+    ]
+    assert sum(
+        context["candidate_id"] == "negotiated_repair"
+        for context in commitment_contexts
+    ) == 2
+    repair_events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(
+                WorkflowEvent.workflow_id == workflow.id,
+                WorkflowEvent.event_type == "PLAN_NEGOTIATION_REPAIRED",
+            )
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert len(repair_events) == 1
+    assert json.loads(repair_events[0].payload_json) == {
+        "source_candidate_id": "delivery_confidence",
+        "repair_candidate_id": "negotiated_repair",
+        "repair_attempted": True,
+        "repair_valid": True,
+        "ready_candidate_count": 1,
+    }
 
 
 @pytest.mark.asyncio
