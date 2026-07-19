@@ -37,6 +37,16 @@ from app.agent.orchestration import (
     seal_handoff,
     validate_execution_plan_capabilities,
 )
+from app.agent.requirements import (
+    REQUIREMENT_REVIEW_ROLES,
+    RequirementContract,
+    RequirementReview,
+    build_fallback_requirement_contract,
+    build_requirement_consensus,
+    parse_requirement_contract,
+    parse_requirement_review,
+    requirement_contract_fingerprint,
+)
 from app.models import Agent, AgentRole, Project, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.services.workflow_saga import (
     WorkflowLeaseLost,
@@ -557,14 +567,170 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
 
     async def requirement_node(state: WorkspaceGraphState) -> dict[str, Any]:
         begin_node(db, workflow, "requirement", expected_lease_token)
-        requirements = requirement_create(state["user_input"])
-        requirements["analysis"] = await invoke_agent(
+        baseline = requirement_create(state["user_input"])
+        draft_output = await invoke_agent(
             AgentRole.product_manager,
-            "你是需求分析 Agent。识别目标、约束、缺失信息和验收标准。",
+            (
+                "你是结构化需求合同 Agent。只输出 JSON，字段必须为 objective、target_users、"
+                "in_scope、out_of_scope、constraints、assumptions、acceptance_criteria。"
+                "acceptance_criteria 必须包含 2 到 10 项，每项字段为 description、evidence、priority，"
+                "priority 只能是 MUST、SHOULD 或 COULD。不得把解决方案愿望当作现有事实，不得虚构"
+                "外部服务、权限、数据或生产环境；每项 MUST 都要给出可复现或可审计证据。"
+            ),
             json.dumps(
-                agent_context(state, {"user_input": state["user_input"]}),
+                agent_context(state, {
+                    "user_input": state["user_input"],
+                    "project": state["project"],
+                }),
                 ensure_ascii=False,
             ),
+        )
+        contract = parse_requirement_contract(draft_output, state["user_input"])
+        origin: Literal[
+            "model_draft",
+            "negotiated_revision",
+            "deterministic_baseline",
+        ] = "model_draft" if contract is not None else "deterministic_baseline"
+        contract = contract or build_fallback_requirement_contract(state["user_input"])
+
+        async def run_requirement_review(
+            review_agent_role: AgentRole,
+            review_role: Literal["architect", "test_engineer"],
+            review_contract: RequirementContract,
+        ) -> str:
+            perspective = (
+                "检查范围边界、系统可行性、依赖、权限、数据、容量与恢复假设"
+                if review_role == "architect"
+                else "检查每项验收标准是否可观察、可复现、可量化并覆盖异常边界"
+            )
+            return await invoke_agent(
+                review_agent_role,
+                (
+                    f"你是需求合同{'可行性' if review_role == 'architect' else '可验收性'}评审 Agent。"
+                    "你只能独立审查输入合同，不能看到另一名 Reviewer 的意见。只输出 JSON，字段为 "
+                    "decision、confidence、summary、concerns、proposed_changes；decision 只能是 ACCEPT "
+                    "或 CHALLENGE。ACCEPT 时两个数组必须为空；CHALLENGE 时必须给出具体问题或修改建议。"
+                    f"本次关注域：{perspective}。不得改写合同或虚构项目条件。"
+                ),
+                json.dumps(
+                    agent_context(state, {
+                        "workflow_objective": state["user_input"],
+                        "reviewer_role": review_role,
+                        "contract": review_contract.model_dump(mode="json"),
+                    }),
+                    ensure_ascii=False,
+                ),
+                isolated_usage=True,
+            )
+
+        async def collect_requirement_reviews(
+            review_contract: RequirementContract,
+        ) -> list[RequirementReview]:
+            results = await asyncio.gather(
+                *(
+                    run_requirement_review(agent_role, review_role, review_contract)
+                    for agent_role, review_role in REQUIREMENT_REVIEW_ROLES
+                ),
+                return_exceptions=True,
+            )
+            cancellation = next(
+                (result for result in results if isinstance(result, asyncio.CancelledError)),
+                None,
+            )
+            if cancellation:
+                raise cancellation
+            return [
+                parse_requirement_review(result if isinstance(result, str) else "", review_role)
+                for (_agent_role, review_role), result in zip(
+                    REQUIREMENT_REVIEW_ROLES,
+                    results,
+                    strict=True,
+                )
+            ]
+
+        reviews = await collect_requirement_reviews(contract)
+        initial_challenges = [
+            review
+            for review in reviews
+            if review.structured and review.decision == "CHALLENGE"
+        ]
+        revision_attempted = bool(initial_challenges)
+        revision_valid = False
+        source_contract_fingerprint: str | None = None
+        if revision_attempted:
+            original_contract = contract
+            original_fingerprint = requirement_contract_fingerprint(original_contract)
+            try:
+                revision_output = await invoke_agent(
+                    AgentRole.product_manager,
+                    (
+                        "你是需求共识修订 Agent。只允许进行一次修订，只输出完整需求合同 JSON。"
+                        "必须逐项回应 review_challenges，并保持未被质疑的用户目标和边界；字段与原合同一致，"
+                        "验收标准可以保留稳定 criterion_id，也可以省略后由服务端重新编号。不得虚构输入、"
+                        "权限、数据、外部服务或生产条件。"
+                    ),
+                    json.dumps(
+                        agent_context(state, {
+                            "user_input": state["user_input"],
+                            "source_contract": original_contract.model_dump(mode="json"),
+                            "review_challenges": [
+                                review.model_dump(mode="json")
+                                for review in initial_challenges
+                            ],
+                        }),
+                        ensure_ascii=False,
+                    ),
+                )
+                revised_contract = parse_requirement_contract(
+                    revision_output,
+                    state["user_input"],
+                )
+                if (
+                    revised_contract is not None
+                    and requirement_contract_fingerprint(revised_contract) != original_fingerprint
+                ):
+                    revision_valid = True
+                    source_contract_fingerprint = original_fingerprint
+                    contract = revised_contract
+                    origin = "negotiated_revision"
+                    reviews = await collect_requirement_reviews(contract)
+            except Exception as exc:
+                logger.warning("Requirement consensus revision failed with %s", type(exc).__name__)
+
+        consensus = build_requirement_consensus(
+            contract,
+            reviews,
+            origin=origin,
+            source_contract_fingerprint=source_contract_fingerprint,
+            revision_challenges=initial_challenges if revision_attempted else [],
+            revision_attempted=revision_attempted,
+            revision_valid=revision_valid,
+        )
+        requirements = {
+            **baseline,
+            "contract": contract.model_dump(mode="json"),
+            "consensus": consensus.model_dump(mode="json"),
+        }
+        record_workflow_event(
+            db,
+            workflow,
+            "REQUIREMENTS_CONSENSUS_REACHED",
+            "Structured requirement contract reviewed by independent agents",
+            node="requirement",
+            payload={
+                "acceptance_criteria_count": len(contract.acceptance_criteria),
+                "requirement_consensus_status": consensus.status,
+                "requirement_contract_origin": consensus.origin,
+                "requirement_review_count": len(consensus.reviews),
+                "requirement_review_valid_count": consensus.reviewer_valid_count,
+                "requirement_review_accept_count": consensus.reviewer_accept_count,
+                "requirement_review_challenge_count": consensus.reviewer_challenge_count,
+                "requirement_review_abstain_count": (
+                    len(consensus.reviews) - consensus.reviewer_valid_count
+                ),
+                "requirement_revision_attempted": consensus.revision_attempted,
+                "requirement_revision_valid": consensus.revision_valid,
+            },
         )
         return complete_node(db, workflow, "requirement", state, {
             "requirements": requirements,
@@ -634,6 +800,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "required_capabilities 必须是对应角色 capabilities 的非空子集；selection_reason 必须说明"
             "任务所需能力为何与该角色的冻结能力、工具和知识权限匹配，不得虚构能力。"
             "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
+            "requirements.contract 中每个 AC 编号都必须被任务目标或 success_criteria 明确覆盖；"
+            "requirements.consensus 中未闭环的 Reviewer 质疑不得被静默忽略。"
             "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
             "本次只从输入指定的 planning_perspective 独立规划，不得假设或引用其他候选方案。"
         )
@@ -977,6 +1145,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         deliberation_snapshot = deliberation.model_dump(mode="json")
         approval_required = bool(
             state.get("require_plan_approval", False)
+            or (
+                isinstance(state.get("requirements"), dict)
+                and isinstance(state["requirements"].get("consensus"), dict)
+                and state["requirements"]["consensus"].get("status") == "CHALLENGED"
+            )
             or deliberation.selected_candidate.commitment_status == "CHALLENGED"
             or (
                 repair_attempted

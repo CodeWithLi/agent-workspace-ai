@@ -1597,7 +1597,12 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
 
     await execute_workspace_graph(db, workflow, pause_before_report=True)
 
-    architect_call = next(call for call in calls if call[0].startswith(frozen_architect_prompt))
+    architect_call = next(
+        call
+        for call in calls
+        if call[0].startswith(frozen_architect_prompt)
+        and "你是AI架构师，生成系统设计" in call[0]
+    )
     assert "PRODUCT-ARTIFACT" in architect_call[1]
     assert all(not system_prompt.startswith("MUTATED AFTER WORKFLOW CREATION") for system_prompt, _prompt in calls)
     assert calls

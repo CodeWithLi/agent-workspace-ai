@@ -125,6 +125,94 @@
           <el-step v-for="stage in workflowStages" :key="stage" :title="stage" />
         </el-steps>
       </div>
+      <section
+        v-if="requirementConsensus"
+        class="plan-deliberation requirement-consensus"
+        aria-labelledby="requirement-consensus-title"
+      >
+        <header class="plan-deliberation-heading">
+          <div>
+            <h4 id="requirement-consensus-title">需求共识</h4>
+            <p>{{ requirementConsensus.contract.objective }}</p>
+          </div>
+          <div class="plan-deliberation-tags">
+            <el-tag :type="requirementConsensusType">{{ requirementConsensusLabel }}</el-tag>
+            <el-tag type="info">{{ requirementOriginLabel }}</el-tag>
+            <el-tag type="primary">{{ requirementConsensus.contract.acceptance_criteria.length }} 项验收标准</el-tag>
+          </div>
+        </header>
+        <p class="plan-candidate-meta requirement-consensus-summary">
+          架构与测试评审 {{ requirementConsensus.reviewer_accept_count }}/2 接受
+          <span v-if="requirementConsensus.revision_attempted">
+            · {{ requirementConsensus.revision_valid ? '已完成一次自动修订' : '自动修订未通过指纹门禁' }}
+          </span>
+        </p>
+        <details class="plan-candidate-details requirement-consensus-details">
+          <summary>范围、验收标准与评审证据</summary>
+          <div class="requirement-scope-grid">
+            <section class="requirement-evidence-section">
+              <h5>目标用户</h5>
+              <ul><li v-for="item in requirementConsensus.contract.target_users" :key="item">{{ item }}</li></ul>
+            </section>
+            <section class="requirement-evidence-section">
+              <h5>范围内</h5>
+              <ul><li v-for="item in requirementConsensus.contract.in_scope" :key="item">{{ item }}</li></ul>
+            </section>
+            <section v-if="requirementConsensus.contract.constraints.length" class="requirement-evidence-section">
+              <h5>约束</h5>
+              <ul><li v-for="item in requirementConsensus.contract.constraints" :key="item">{{ item }}</li></ul>
+            </section>
+            <section v-if="requirementConsensus.contract.out_of_scope.length" class="requirement-evidence-section">
+              <h5>范围外</h5>
+              <ul><li v-for="item in requirementConsensus.contract.out_of_scope" :key="item">{{ item }}</li></ul>
+            </section>
+          </div>
+          <section class="requirement-evidence-section requirement-criteria" aria-label="需求验收标准">
+            <h5>验收标准</h5>
+            <ol class="plan-candidate-list">
+              <li v-for="criterion in requirementConsensus.contract.acceptance_criteria" :key="criterion.criterion_id" class="plan-candidate-row">
+                <header>
+                  <strong>{{ criterion.criterion_id }}</strong>
+                  <el-tag :type="requirementPriorityType(criterion.priority)" size="small">
+                    {{ requirementPriorityLabel(criterion.priority) }}
+                  </el-tag>
+                </header>
+                <p>{{ criterion.description }}</p>
+                <span>证据：{{ criterion.evidence }}</span>
+              </li>
+            </ol>
+          </section>
+          <section
+            v-if="requirementConsensus.revision_challenges.length"
+            class="requirement-evidence-section requirement-review-challenges"
+            aria-label="需求自动修订依据"
+          >
+            <h5>自动修订依据</h5>
+            <ul class="plan-candidate-list">
+              <li v-for="review in requirementConsensus.revision_challenges" :key="`revision-${review.role}`" class="plan-candidate-row">
+                <header><strong>{{ requirementReviewerLabel(review.role) }}</strong><el-tag type="warning" size="small">质疑</el-tag></header>
+                <p>{{ review.summary }}</p>
+                <span v-for="concern in review.concerns" :key="concern">{{ concern }}</span>
+              </li>
+            </ul>
+          </section>
+          <section class="requirement-evidence-section" aria-label="需求最终评审">
+            <h5>最终签署</h5>
+            <ul class="plan-candidate-list">
+              <li v-for="review in requirementConsensus.reviews" :key="review.role" class="plan-candidate-row" :class="`is-${review.decision.toLowerCase()}`">
+                <header>
+                  <strong>{{ requirementReviewerLabel(review.role) }}</strong>
+                  <el-tag :type="requirementReviewType(review.decision)" size="small">
+                    {{ requirementReviewLabel(review.decision) }}
+                  </el-tag>
+                </header>
+                <p>{{ review.summary }}</p>
+                <span v-for="concern in review.concerns" :key="concern">{{ concern }}</span>
+              </li>
+            </ul>
+          </section>
+        </details>
+      </section>
       <section v-if="executionPlan" class="workflow-orchestration" aria-label="多 Agent 执行计划">
         <div v-if="workflowPlanReview && planRevisions.length > 1" class="plan-version-toolbar">
           <div><strong>计划版本</strong><span>当前生成 v{{ latestPlanVersion }}</span></div>
@@ -645,6 +733,47 @@ import {
   specialistToolLabel
 } from '../utils/specialists'
 
+interface WorkflowRequirementCriterion {
+  criterion_id: string
+  description: string
+  evidence: string
+  priority: 'MUST' | 'SHOULD' | 'COULD'
+}
+
+interface WorkflowRequirementContract {
+  objective: string
+  target_users: string[]
+  in_scope: string[]
+  out_of_scope: string[]
+  constraints: string[]
+  assumptions: string[]
+  acceptance_criteria: WorkflowRequirementCriterion[]
+}
+
+interface WorkflowRequirementReview {
+  role: 'architect' | 'test_engineer'
+  decision: 'ACCEPT' | 'CHALLENGE' | 'ABSTAIN'
+  structured: boolean
+  confidence: number | null
+  summary: string
+  concerns: string[]
+  proposed_changes: string[]
+}
+
+interface WorkflowRequirementConsensus {
+  contract: WorkflowRequirementContract
+  contract_fingerprint: string
+  origin: 'model_draft' | 'negotiated_revision' | 'deterministic_baseline'
+  reviews: WorkflowRequirementReview[]
+  revision_challenges: WorkflowRequirementReview[]
+  status: 'READY' | 'CHALLENGED' | 'INCOMPLETE'
+  reviewer_valid_count: number
+  reviewer_accept_count: number
+  reviewer_challenge_count: number
+  revision_attempted: boolean
+  revision_valid: boolean
+}
+
 interface WorkflowAssignment {
   role: string
   objective: string
@@ -872,6 +1001,28 @@ const workflowPlanReview = computed(() => (
   && workflowCurrentNode.value === 'plan_review'
   && !workflowOperatorPaused.value
 ))
+const requirementConsensus = computed<WorkflowRequirementConsensus | null>(() => {
+  const consensus = workflowState.value?.requirements?.consensus
+  return isWorkflowRequirementConsensus(consensus) ? consensus : null
+})
+const workflowRequirementsChallenged = computed(() => (
+  requirementConsensus.value?.status === 'CHALLENGED'
+))
+const requirementConsensusLabel = computed(() => ({
+  READY: '已达成共识',
+  CHALLENGED: '仍有质疑',
+  INCOMPLETE: '评审不完整'
+}[requirementConsensus.value?.status || 'INCOMPLETE']))
+const requirementConsensusType = computed<'success' | 'warning' | 'info'>(() => {
+  if (requirementConsensus.value?.status === 'READY') return 'success'
+  if (requirementConsensus.value?.status === 'CHALLENGED') return 'warning'
+  return 'info'
+})
+const requirementOriginLabel = computed(() => ({
+  model_draft: 'AI 结构化草案',
+  negotiated_revision: '自动协商修订',
+  deterministic_baseline: '确定性需求基线'
+}[requirementConsensus.value?.origin || 'deterministic_baseline']))
 const workflowSpecialistReview = computed(() => (
   workflowStatus.value === 'PAUSED'
   && workflowCurrentNode.value === 'specialist_review'
@@ -885,6 +1036,7 @@ const workflowFeedbackRequired = computed(() => (
 const workflowApprovalTitle = computed(() => {
   if (workflowOperatorPaused.value) return `运行已在“${workflowStageLabel(workflowCurrentNode.value)}”安全暂停`
   if (workflowPlanReview.value) {
+    if (workflowRequirementsChallenged.value) return '需求合同存在跨角色质疑'
     return selectedPlanCandidate.value?.commitment_status === 'CHALLENGED'
       ? `执行计划 v${displayedPlanVersion.value} 存在执行者质疑`
       : `执行计划 v${displayedPlanVersion.value} 等待批准`
@@ -895,6 +1047,9 @@ const workflowApprovalTitle = computed(() => {
 const workflowApprovalDescription = computed(() => {
   if (workflowOperatorPaused.value) return '恢复指令会写入运行上下文，并传递给后续全部 Agent。'
   if (workflowPlanReview.value) {
+    if (workflowRequirementsChallenged.value) {
+      return '核对架构与测试 Reviewer 提出的范围、依赖或验收缺口。批准会接受当前假设；需要闭环时请填写具体意见并重新规划。'
+    }
     return selectedPlanCandidate.value?.commitment_status === 'CHALLENGED'
       ? '核对执行者提出的缺失输入、依赖风险和修改建议。批准会按当前计划继续；需要消除质疑时请填写具体意见并重新规划。'
       : '核对角色、依赖、交付物、成功标准和执行者承诺。批准后将按依赖波次启动专业 Agent；需要调整时请填写具体意见。'
@@ -906,7 +1061,11 @@ const workflowApprovalDescription = computed(() => {
 })
 const workflowFeedbackPlaceholder = computed(() => {
   if (workflowOperatorPaused.value) return '输入恢复指令，后续 Agent 将基于该约束继续执行'
-  if (workflowPlanReview.value) return '需要重新规划时，说明缺失角色、目标、交付物或成功标准'
+  if (workflowPlanReview.value) {
+    return workflowRequirementsChallenged.value
+      ? '说明如何补齐需求范围、约束、依赖或验收证据'
+      : '需要重新规划时，说明缺失角色、目标、交付物或成功标准'
+  }
   if (workflowSpecialistReview.value) return '说明环境、权限、依赖或验收条件如何修复；该指令会注入恢复后的 Agent'
   return workflowCurrentNode.value === 'quality_review' ? '输入具体修订意见' : '补充最终报告需要强调的内容（可选）'
 })
@@ -1091,6 +1250,34 @@ function candidateNegotiationStatus(candidate: WorkflowPlanCandidate) {
   if (candidate.commitment_status === 'READY') return '质疑已闭环'
   if (candidate.commitment_status === 'CHALLENGED') return '仍有质疑'
   return '承诺待确认'
+}
+
+function requirementPriorityLabel(priority: WorkflowRequirementCriterion['priority']) {
+  return { MUST: '必须', SHOULD: '应该', COULD: '可选' }[priority]
+}
+
+function requirementPriorityType(
+  priority: WorkflowRequirementCriterion['priority']
+): 'danger' | 'warning' | 'info' {
+  if (priority === 'MUST') return 'danger'
+  if (priority === 'SHOULD') return 'warning'
+  return 'info'
+}
+
+function requirementReviewerLabel(role: WorkflowRequirementReview['role']) {
+  return role === 'architect' ? '架构师 Reviewer' : '测试工程师 Reviewer'
+}
+
+function requirementReviewLabel(decision: WorkflowRequirementReview['decision']) {
+  return { ACCEPT: '接受', CHALLENGE: '质疑', ABSTAIN: '弃权' }[decision]
+}
+
+function requirementReviewType(
+  decision: WorkflowRequirementReview['decision']
+): 'success' | 'warning' | 'info' {
+  if (decision === 'ACCEPT') return 'success'
+  if (decision === 'CHALLENGE') return 'warning'
+  return 'info'
 }
 
 function commitmentDecisionLabel(decision: WorkflowPlanCommitment['decision']) {
@@ -1311,6 +1498,26 @@ function isWorkflowPlanDeliberation(value: unknown): value is WorkflowPlanDelibe
       && Array.isArray(candidate.plan.assignments)
       && Array.isArray(candidate.checks)
     ))
+  )
+}
+
+function isWorkflowRequirementConsensus(value: unknown): value is WorkflowRequirementConsensus {
+  if (!value || typeof value !== 'object') return false
+  const consensus = value as Partial<WorkflowRequirementConsensus>
+  const contract = consensus.contract as Partial<WorkflowRequirementContract> | undefined
+  return (
+    ['READY', 'CHALLENGED', 'INCOMPLETE'].includes(consensus.status || '')
+    && ['model_draft', 'negotiated_revision', 'deterministic_baseline'].includes(consensus.origin || '')
+    && Boolean(contract)
+    && typeof contract?.objective === 'string'
+    && Array.isArray(contract.target_users)
+    && Array.isArray(contract.in_scope)
+    && Array.isArray(contract.out_of_scope)
+    && Array.isArray(contract.constraints)
+    && Array.isArray(contract.assumptions)
+    && Array.isArray(contract.acceptance_criteria)
+    && Array.isArray(consensus.reviews)
+    && Array.isArray(consensus.revision_challenges)
   )
 }
 
@@ -2142,6 +2349,87 @@ onBeforeUnmount(disposeWorkflowEventStream)
   margin: 0;
   color: var(--color-secondary-text);
   overflow-wrap: anywhere;
+}
+
+.requirement-consensus {
+  margin-top: 12px;
+}
+
+.requirement-consensus .plan-deliberation-heading h4,
+.requirement-consensus .plan-deliberation-heading p,
+.requirement-consensus-summary,
+.requirement-evidence-section h5,
+.requirement-evidence-section ul,
+.requirement-evidence-section ol,
+.requirement-evidence-section p {
+  margin: 0;
+}
+
+.requirement-consensus .plan-deliberation-heading h4 {
+  font-size: 14px;
+}
+
+.requirement-consensus .plan-deliberation-heading p {
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.requirement-consensus-summary {
+  margin-top: 8px;
+  min-height: 18px;
+}
+
+.requirement-scope-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 20px;
+  border-top: 1px solid var(--color-border);
+}
+
+.requirement-evidence-section {
+  min-width: 0;
+  padding: 11px 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.requirement-evidence-section h5 {
+  margin-bottom: 6px;
+  color: var(--color-foreground);
+  font-size: 11px;
+}
+
+.requirement-evidence-section > ul:not(.plan-candidate-list) {
+  padding-left: 17px;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.requirement-evidence-section li,
+.requirement-evidence-section p,
+.requirement-evidence-section span {
+  overflow-wrap: anywhere;
+}
+
+.requirement-evidence-section .plan-candidate-row > span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.requirement-review-challenges {
+  border-left: 3px solid var(--color-warning);
+  background: #fffbeb;
+}
+
+.requirement-evidence-section .plan-candidate-row.is-challenge {
+  box-shadow: inset 3px 0 0 var(--color-warning);
+}
+
+.requirement-evidence-section .plan-candidate-row.is-abstain {
+  box-shadow: inset 3px 0 0 var(--color-border-strong);
 }
 
 .plan-deliberation {
@@ -3277,6 +3565,10 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .plan-deliberation-tags,
   .plan-candidate-status {
     justify-content: flex-start;
+  }
+
+  .requirement-scope-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .plan-candidate-checks {

@@ -118,6 +118,38 @@ def test_plan_deliberation_event_exposes_summary_without_candidate_content() -> 
     }
 
 
+def test_requirement_consensus_event_exposes_counts_without_review_content() -> None:
+    payload = public_workflow_event_payload(
+        {
+            "acceptance_criteria_count": 3,
+            "requirement_consensus_status": "CHALLENGED",
+            "requirement_contract_origin": "model_draft",
+            "requirement_review_count": 2,
+            "requirement_review_valid_count": 2,
+            "requirement_review_accept_count": 1,
+            "requirement_review_challenge_count": 1,
+            "requirement_review_abstain_count": 0,
+            "requirement_revision_attempted": True,
+            "requirement_revision_valid": False,
+            "reviews": [{"concerns": ["secret production boundary"]}],
+            "contract": {"objective": "secret product objective"},
+        }
+    )
+
+    assert payload == {
+        "acceptance_criteria_count": 3,
+        "requirement_consensus_status": "CHALLENGED",
+        "requirement_contract_origin": "model_draft",
+        "requirement_review_count": 2,
+        "requirement_review_valid_count": 2,
+        "requirement_review_accept_count": 1,
+        "requirement_review_challenge_count": 1,
+        "requirement_review_abstain_count": 0,
+        "requirement_revision_attempted": True,
+        "requirement_revision_valid": False,
+    }
+
+
 def test_event_history_returns_latest_window_in_chronological_order_and_is_tenant_scoped(
     db: Session,
 ) -> None:

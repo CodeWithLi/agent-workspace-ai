@@ -9,16 +9,20 @@ from app.models import Notification, Project, Report, Task, TaskStatus
 
 
 def requirement_create(user_input: str) -> dict[str, Any]:
+    objective = user_input.strip()[:800] or "形成可实施、可验证的项目目标"
     return {
-        "product_background": f"围绕「{user_input}」建立业务背景、问题和价值假设。",
-        "target_users": ["业务负责人", "项目成员", "AI数字员工", "知识库管理员"],
+        "product_background": f"围绕「{objective}」建立业务背景、问题和价值假设。",
+        "target_users": ["业务负责人", "目标用户", "项目交付团队"],
         "user_stories": [
-            "作为业务负责人，我希望创建项目并让AI员工协作产出方案。",
-            "作为项目成员，我希望查看任务、文档、报告和知识库引用。",
+            f"作为业务负责人，我希望可验证地完成「{objective}」。",
+            "作为项目成员，我希望查看范围、假设、验收证据和责任边界。",
         ],
-        "features": ["项目空间", "AI员工协作", "任务看板", "知识库RAG", "会议纪要", "项目报告"],
-        "pages": ["工作台", "项目空间", "AI聊天", "任务看板", "知识库", "会议中心", "项目报告", "系统设置"],
-        "acceptance": ["可登录", "可创建项目", "可调用AI员工", "可上传和检索知识", "可执行工作流"],
+        "features": [f"核心目标：{objective}", "多 Agent 协作交付", "可追溯验收证据"],
+        "pages": [],
+        "acceptance": [
+            f"可验证完成用户目标：{objective}",
+            "关键失败路径具有恢复方案、负责人和审计证据",
+        ],
     }
 
 

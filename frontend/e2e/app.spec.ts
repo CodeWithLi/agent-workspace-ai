@@ -2933,6 +2933,36 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     invalid_candidate_count: 0,
     distinct_candidate_count: 3
   }
+  const requirementConsensus = {
+    contract: {
+      objective: '交付可灰度发布并可回滚的会员平台',
+      target_users: ['会员运营', '平台管理员'],
+      in_scope: ['会员注册与登录', '灰度发布与故障回滚'],
+      out_of_scope: ['线下会员卡发行'],
+      constraints: ['生产数据保留三十天', '发布失败由值班负责人在十分钟内回滚'],
+      assumptions: ['已有可用的生产监控'],
+      acceptance_criteria: [
+        { criterion_id: 'AC-01', description: '会员可以完成注册、登录和会话恢复', evidence: '端到端自动化用例与成功运行记录', priority: 'MUST' },
+        { criterion_id: 'AC-02', description: '发布失败后由值班负责人在十分钟内完成回滚', evidence: '灰度演练记录、告警时间线与恢复指标', priority: 'MUST' }
+      ]
+    },
+    contract_fingerprint: 'f'.repeat(64),
+    origin: 'negotiated_revision',
+    source_contract_fingerprint: '0'.repeat(64),
+    reviews: [
+      { role: 'architect', decision: 'ACCEPT', structured: true, confidence: 0.94, summary: '数据保留、恢复责任和系统边界完整可行。', concerns: [], proposed_changes: [] },
+      { role: 'test_engineer', decision: 'ACCEPT', structured: true, confidence: 0.92, summary: '每项标准都包含行为、证据和可量化恢复阈值。', concerns: [], proposed_changes: [] }
+    ],
+    revision_challenges: [
+      { role: 'architect', decision: 'CHALLENGE', structured: true, confidence: 0.91, summary: '初稿缺少生产数据保留和回滚责任边界。', concerns: ['未定义生产数据保留周期'], proposed_changes: ['补充数据保留周期与回滚责任人'] }
+    ],
+    status: 'READY',
+    reviewer_valid_count: 2,
+    reviewer_accept_count: 2,
+    reviewer_challenge_count: 0,
+    revision_attempted: true,
+    revision_valid: true
+  }
   let planWorkflow = {
     workflow_id: 140,
     project_id: 2,
@@ -2946,6 +2976,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
     status: 'PAUSED',
     current_node: 'plan_review',
     state: {
+      requirements: { contract: requirementConsensus.contract, consensus: requirementConsensus },
       execution_plan: initialPlan,
       plan_version: 1,
       plan_revisions: [{ version: 1, plan: initialPlan, deliberation: initialDeliberation, feedback: '', created_at: '2026-07-19T08:00:30Z' }],
@@ -3132,6 +3163,15 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await workflowReloaded
 
   await expect(page.getByText('执行计划 v1 等待批准', { exact: true })).toBeVisible()
+  const requirementSection = page.getByRole('region', { name: '需求共识' })
+  await expect(requirementSection.getByText('已达成共识', { exact: true })).toBeVisible()
+  await expect(requirementSection.getByText('自动协商修订', { exact: true })).toBeVisible()
+  await expect(requirementSection.getByText('2 项验收标准', { exact: true })).toBeVisible()
+  await requirementSection.getByText('范围、验收标准与评审证据', { exact: true }).click()
+  await expect(requirementSection.getByText('AC-01', { exact: true })).toBeVisible()
+  await expect(requirementSection.getByText('未定义生产数据保留周期', { exact: true })).toBeVisible()
+  await expect(requirementSection.getByText('架构师 Reviewer', { exact: true })).toHaveCount(2)
+  await expect(requirementSection.getByText('测试工程师 Reviewer', { exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: '方案仲裁', exact: true })).toBeVisible()
   await expect(page.getByText('架构师独立仲裁', { exact: true })).toBeVisible()
   await expect(page.getByText('3 个候选 · 3 个不同结构', { exact: true })).toBeVisible()

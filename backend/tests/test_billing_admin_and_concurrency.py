@@ -305,7 +305,9 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
         "PROJECT_PLAN",
         "TEST_PLAN",
     }
-    assert len(prompts) == 15
+    assert len(prompts) == 17
+    assert sum("需求合同可行性评审 Agent" in prompt for prompt in prompts) == 1
+    assert sum("需求合同可验收性评审 Agent" in prompt for prompt in prompts) == 1
     assert sum("动态编排器" in prompt for prompt in prompts) == 3
     assert sum("执行前承诺 Agent" in prompt for prompt in prompts) == 2
     assert db.scalar(
@@ -339,7 +341,7 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
     await process_workflow(db, response.workflow_id)
     db.expire_all()
     assert db.get(WorkflowRun, response.workflow_id).status == WorkflowStatus.completed
-    assert len(prompts) == 16
+    assert len(prompts) == 18
 
 
 @pytest.mark.asyncio

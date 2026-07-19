@@ -33,11 +33,11 @@
 
 ## 节点
 
-1. Requirement Agent
+1. Requirement Consensus：产品经理生成结构化合同，架构师与测试工程师独立评审，必要时执行一次有界修订。
 2. Product Agent
 3. Architect Agent
 4. Planning Agent：从三个隔离视角生成候选，经执行者承诺、确定性评分和架构师仲裁后形成动态执行 DAG。
-5. Plan Review：用户请求审批或选中计划仍有执行者质疑时进入人工门禁，批准后才允许启动并行分支，或携带反馈退回 Planner 重做。
+5. Plan Review：用户请求审批、需求共识仍有质疑或选中计划仍有执行者质疑时进入人工门禁，批准后才允许启动并行分支，或携带反馈退回 Planner 重做。
 6. Specialist Branches：根据已批准 DAG 按拓扑波次执行 2 至 4 个专业分支，同波并行并生成结构化 Handoff。
 7. Quality Gate：合并确定性检查和测试 Agent 评审，最多触发一轮自动修订。
 8. Project Manager Agent
@@ -45,6 +45,8 @@
 10. Report Generator
 
 工作流由 LangGraph `StateGraph`、`START`、条件边和 `END` 构建，不使用手写顺序分支。创建工作流时按发起者角色冻结各 Agent 的 Prompt、模型、Prompt 版本、可用工具、知识权限、人工审批配置和并发限制，同时冻结专业分支重试策略；架构师读取真实 PRD，动态专家读取需求与架构，项目经理和测试工程师消费完整 Handoff 与质量门禁证据，避免运行中配置漂移和“多个 Agent 实际各说各话”。每个节点开始和完成时分别写入 `workflow_events`，完成时同步更新 `state_json` 和下一个节点，因此 worker 崩溃后可以从最后一个已提交节点恢复。
+
+Requirement 节点不再把固定的登录、项目空间和知识库功能当成所有项目的需求。产品经理输出目标用户、范围内/外、约束、假设及 2-10 项验收标准；服务端严格解析、顺序分配 `AC-xx` 并计算 SHA-256 指纹，解析失败时生成包含原始目标的确定性基线。架构师与测试工程师通过 `asyncio.gather` 在互不可见意见下分别检查可行性与可验收性，单次异常或无效合同仅使对应 Reviewer `ABSTAIN`。合法 `CHALLENGE` 触发产品经理一次修订，重复或无效结果保留原合同；有效新合同必须重新经过两名 Reviewer。最终共识按 `READY|CHALLENGED|INCOMPLETE` 归约，只有真实结构化质疑会强制计划审批。合同、初始质疑和最终签署保存在受控状态，项目页默认折叠展示。
 
 服务端从四类专业角色的冻结快照生成确定性能力目录。角色固有能力与当前启用工具映射为能力集合；知识检索只有在 `knowledge_access=true` 且 `knowledge_search` 可用时存在；缺少 Agent、并发额度或全部专业工具的角色标记为不合格。Planner 只接收本次合格角色及其能力、工具、知识权限和并发额度；少于两个合格角色，或用户明确要求的知识检索/通知投递能力在目录中不存在时，都在调用模型前失败。每轮规划以相同输入分别调用交付完整性、风险控制和并行效率三个视角，候选彼此不可见。每个候选严格解析，不合法时只隔离该候选；全部候选无效才生成保留显式领域能力的确定性计划。
 
@@ -62,7 +64,7 @@
 
 质量门禁先检查角色覆盖、交付内容、Handoff 证据链、成功标准和专业广度，再用 `asyncio.gather` 并行调用测试、运营和架构三个互不可见结论的 Reviewer。至少两份合法结构化合同构成 quorum；有效票按 Reviewer 自身分数、结论与阻塞项归约，最终分数取确定性分数与有效 Reviewer 分数中位数的较低值，并要求多数票通过。单个调用异常或合同无效只弃权，低于 quorum 则抛出专用错误，由 worker 在同一 `quality_gate` 检查点重试并持久化脱敏人数。账本合同包含共同决策、来源角色、审查置信度、冲突双方立场、解决状态、待确认问题和责任角色；服务端过滤计划外角色，精确去重多 Reviewer 的相同结论，并在任一阻塞冲突或阻塞问题仍开放时把评分封顶为 79、强制 `passed=false`、推导定向返修角色。自动修订仍未通过时，工作流暂停在 `quality_review`；后续节点消费同一仲裁账本，不重新猜测结论。
 
-除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `PLAN_COMMITMENTS_COLLECTED`、`PLAN_NEGOTIATION_REPAIRED`、`PLAN_DELIBERATED`、`PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`SPECIALIST_REVIEW_REQUIRED`、`SPECIALIST_RETRY_REQUESTED`、`SPECIALIST_REPLAN_REQUESTED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`。事件 API 与追踪共用 payload 允许列表，只返回版本号、来源版本、修复来源和候选 ID、修复是否尝试/有效、波次、角色、依赖角色、分支数、候选数、就绪候选数、接受/质疑/弃权计数、不同结构数、无效候选数、仲裁模式、选中候选、成功/失败/可重试计数、恢复次数、证据链封存状态与上游数量、Reviewer 总数/有效数/quorum/通过票/分歧数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据。候选计划、承诺正文、Reviewer 原始正文和无效输出不会进入事件；只有归一化仲裁与承诺证据、摘要、票型和账本进入受控状态。完整指纹、Handoff、失败与恢复指令、决策与冲突正文、错误、Prompt、质量问题与人工反馈不会进入 SSE 或追踪响应。人工检查点重试仍创建不可变子运行；分支恢复则在原运行的已提交波次上继续。
+除通用 `NODE_STARTED/NODE_COMPLETED/NODE_FAILED` 外，事件流还会记录 `REQUIREMENTS_CONSENSUS_REACHED`、`PLAN_COMMITMENTS_COLLECTED`、`PLAN_NEGOTIATION_REPAIRED`、`PLAN_DELIBERATED`、`PLAN_CREATED`、`PLAN_APPROVED`、`PLAN_REVISION_REQUESTED`、`WAVE_STARTED`、`WAVE_COMPLETED`、`WAVE_CHECKPOINTED`、`WAVE_RESTORED`、`BRANCH_STARTED`、`BRANCH_COMPLETED`、`BRANCH_FAILED`、`BRANCH_RETRY_SCHEDULED`、`SPECIALIST_REVIEW_REQUIRED`、`SPECIALIST_RETRY_REQUESTED`、`SPECIALIST_REPLAN_REQUESTED`、`QUALITY_GATE_PASSED`、`REVISION_REQUESTED` 和 `QUALITY_GATE_FAILED`。事件 API 与追踪共用 payload 允许列表，只返回需求合同来源、验收标准数、需求评审与修订计数/状态、版本号、来源版本、修复来源和候选 ID、修复是否尝试/有效、波次、角色、依赖角色、分支数、候选数、就绪候选数、接受/质疑/弃权计数、不同结构数、无效候选数、仲裁模式、选中候选、成功/失败/可重试计数、恢复次数、证据链封存状态与上游数量、Reviewer 总数/有效数/quorum/通过票/分歧数、决策/冲突/开放阻塞计数、修订轮次、worker/分支尝试和退避时长等运行元数据。需求合同、候选计划、评审与承诺正文、Reviewer 原始正文和无效输出不会进入事件；只有归一化证据保存在受控状态。完整指纹、Handoff、失败与恢复指令、决策与冲突正文、错误、Prompt、质量问题与人工反馈不会进入 SSE 或追踪响应。人工检查点重试仍创建不可变子运行；分支恢复则在原运行的已提交波次上继续。
 
 项目页在加载时回放最近的持久化事件，并在 SSE 更新后按角色重新归约状态；`workflow_attempt`、`branch_attempt`、`will_retry`、退避秒数和 `WAVE_RESTORED.roles` 共同区分等待、执行中、等待重试、失败、检查点恢复和已交接。SSE 中断或刷新不会把已知 Agent 退回“等待执行”。完成或恢复的分支可展开 Handoff 并查看来源指纹；质量门禁下方先展示三名 Reviewer 的关注域、有效性、票型、评分、摘要、quorum 和分歧数，再展示共同决策、冲突与待确认责任。失败门禁仍提供定向重试与重新规划。移动端使用相同文字、图标和元数据，不依赖 hover 或单一颜色。追踪中的质量节点归属 `reviewer_panel`，三个模型调用仍分别归属实际 Agent。
 
