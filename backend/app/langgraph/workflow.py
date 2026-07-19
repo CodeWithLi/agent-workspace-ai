@@ -33,6 +33,7 @@ from app.agent.orchestration import (
     infer_required_specialist_capabilities,
     merge_reviewer_panel,
     parse_execution_plan_candidate,
+    parse_specialist_handoff,
     parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
@@ -1310,19 +1311,26 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 {
                     "role": upstream_handoff_models[role].role,
                     "deliverable": upstream_handoff_models[role].deliverable,
-                    "content": upstream_handoff_models[role].content[:12000],
                     "revision_round": upstream_handoff_models[role].revision_round,
                     "output_fingerprint": (
                         upstream_handoff_models[role].output_fingerprint or None
                     ),
+                    **upstream_handoff_models[role].downstream_context(),
                 }
                 for role in assignment.depends_on
             ]
-            content = await invoke_agent(
+            raw_handoff = await invoke_agent(
                 AgentRole(assignment.role),
                 (
                     "你是专业交接 Agent。围绕分配目标输出可供其他 Agent 直接使用的专业 Handoff。"
-                    "必须包含范围判断、关键决策、风险、边界场景、验收证据和下一步负责人。"
+                    "只返回 JSON 对象，不要 Markdown。字段必须为："
+                    "summary（完整摘要）；decisions（title、outcome、rationale）；"
+                    "evidence（claim、source、verification）；"
+                    "risks（risk、mitigation、owner_role）；"
+                    "open_questions（question、owner_role、blocking，可为空数组）；"
+                    "next_actions（action、owner_role、acceptance_criteria）。"
+                    "decisions、evidence、risks、next_actions 均至少一项且最多八项；"
+                    "owner_role 只能来自当前执行计划角色。"
                 ),
                 json.dumps(
                     agent_context(state, {
@@ -1333,19 +1341,27 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "architecture": state["architecture"],
                         "upstream_handoffs": upstream_handoffs,
                         "revision_feedback": revision_feedback,
-                        "previous_handoff": previous.content if previous else "",
+                        "previous_handoff": (
+                            previous.downstream_context() if previous else None
+                        ),
                     }),
                     ensure_ascii=False,
                 ),
                 isolated_usage=True,
             )
+            contract = parse_specialist_handoff(
+                raw_handoff,
+                assignment.role,
+                {item.role for item in plan.assignments},
+            )
             return seal_handoff(
                 plan,
                 assignment,
-                content,
+                contract.content,
                 plan_version=plan_version,
                 revision_round=revision_round,
                 upstream_handoffs=upstream_handoff_models,
+                contract=contract,
             )
 
         for wave_number, wave in enumerate(execution_waves, start=1):
@@ -1471,6 +1487,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                             "workflow_attempt": workflow_attempt,
                             "branch_attempt": branch_attempt,
                             "output_chars": len(handoff.content),
+                            "contract_version": handoff.contract_version,
+                            "structured": handoff.structured,
+                            "decision_count": len(handoff.decisions),
+                            "evidence_count": len(handoff.evidence),
+                            "risk_count": len(handoff.risks),
+                            "open_question_count": len(handoff.open_questions),
+                            "next_action_count": len(handoff.next_actions),
                             "lineage_sealed": True,
                             "upstream_count": len(handoff.upstream_fingerprints),
                             "plan_version": handoff.plan_version,

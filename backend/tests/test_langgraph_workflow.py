@@ -24,6 +24,53 @@ from app.models import Agent, AgentRole, AgentTool, Project, Report, Task, User,
 from app.services.workflows import process_workflow
 
 
+def structured_handoff_response(role: str) -> str:
+    return json.dumps(
+        {
+            "summary": (
+                "The specialist completed a verifiable handoff with explicit scope, "
+                "ownership, evidence, risk controls, and recovery criteria."
+            ),
+            "decisions": [
+                {
+                    "title": "Stage delivery",
+                    "outcome": "Validate the core path before expanding the delivery scope.",
+                    "rationale": "A staged release limits risk and preserves a deterministic rollback point.",
+                }
+            ],
+            "evidence": [
+                {
+                    "claim": "The core path has reproducible acceptance evidence.",
+                    "source": "Automated acceptance records and the approved success criteria.",
+                    "verification": "Rerun the core cases and verify every linked success criterion.",
+                }
+            ],
+            "risks": [
+                {
+                    "risk": "Scope expansion could exceed the current error budget.",
+                    "mitigation": "Stop expansion and roll back when the alert threshold is reached.",
+                    "owner_role": role,
+                }
+            ],
+            "open_questions": [
+                {
+                    "question": "Has the release window been confirmed by the accountable owner?",
+                    "owner_role": role,
+                    "blocking": False,
+                }
+            ],
+            "next_actions": [
+                {
+                    "action": "Run the core-path acceptance suite and archive its evidence.",
+                    "owner_role": role,
+                    "acceptance_criteria": "All core cases pass and the evidence is independently reviewable.",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
 def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) -> None:
     user = User(email="boundary-pause@example.com", name="Boundary Pause", password_hash="hash")
     db.add(user)
@@ -142,6 +189,9 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
     db.commit()
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "专业交接 Agent" in system_prompt:
+            role = json.loads(user_prompt)["assignment"]["role"]
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             if json.loads(user_prompt)["reviewer_role"] == "architect":
                 raise TimeoutError("architect reviewer unavailable")
@@ -274,11 +324,8 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            return (
-                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
-                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限，并逐项关联成功标准。"
-                "同时记录测试数据、预期结果、实际结果、告警阈值、演练时间和审批责任人，确保审计可追溯。"
-            )
+            role = json.loads(user_prompt)["assignment"]["role"]
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -513,11 +560,8 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            return (
-                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
-                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-                "所有结论均与用户目标和成功标准建立可追溯关系。"
-            )
+            role = json.loads(user_prompt)["assignment"]["role"]
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -707,11 +751,8 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            return (
-                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
-                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-                "所有结论均与用户目标和成功标准建立可追溯关系，并记录实际结果和审计责任人。"
-            )
+            role = json.loads(user_prompt)["assignment"]["role"]
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -842,10 +883,7 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
             max_parallel = max(max_parallel, len(active_roles))
             await asyncio.sleep(0.01)
             active_roles.remove(role)
-            return (
-                f"{role} 已给出明确范围、关键决策、依赖关系、失败信号、监控指标、边界场景、"
-                "灰度策略、回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-            )
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -887,8 +925,15 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         handoff["role"]: handoff for handoff in state["specialist_handoffs"]
     }
     assert all(handoff["plan_version"] == 1 for handoff in handoffs_by_role.values())
+    assert all(handoff["contract_version"] == 2 for handoff in handoffs_by_role.values())
+    assert all(handoff["structured"] is True for handoff in handoffs_by_role.values())
     assert all(len(handoff["input_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
     assert all(len(handoff["output_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
+    test_upstream = specialist_contexts["test_engineer"]["upstream_handoffs"][0]
+    assert test_upstream["contract_version"] == 2
+    assert test_upstream["summary"] == handoffs_by_role["knowledge_admin"]["summary"]
+    assert test_upstream["evidence"] == handoffs_by_role["knowledge_admin"]["evidence"]
+    assert "content" not in test_upstream
     assert handoffs_by_role["knowledge_admin"]["upstream_fingerprints"] == {}
     assert handoffs_by_role["test_engineer"]["upstream_fingerprints"] == {
         "knowledge_admin": handoffs_by_role["knowledge_admin"]["output_fingerprint"]
@@ -926,6 +971,14 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         json.loads(event.payload_json)["lineage_sealed"] is True
         for event in branch_completed_events
     )
+    branch_payloads = [json.loads(event.payload_json) for event in branch_completed_events]
+    assert all(payload["contract_version"] == 2 for payload in branch_payloads)
+    assert all(payload["structured"] is True for payload in branch_payloads)
+    assert all(payload["decision_count"] == 1 for payload in branch_payloads)
+    assert all(payload["evidence_count"] == 1 for payload in branch_payloads)
+    assert all(payload["risk_count"] == 1 for payload in branch_payloads)
+    assert all(payload["open_question_count"] == 1 for payload in branch_payloads)
+    assert all(payload["next_action_count"] == 1 for payload in branch_payloads)
     assert sorted(
         json.loads(event.payload_json)["upstream_count"]
         for event in branch_completed_events
@@ -1004,10 +1057,7 @@ async def test_specialist_wave_checkpoint_survives_operator_recovery_without_rep
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise RuntimeError("transient test specialist failure")
-            return (
-                f"{role} 已给出明确范围、关键决策、依赖关系、失败信号、监控指标、边界场景、"
-                "灰度策略、回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-            )
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1145,11 +1195,7 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "knowledge_admin" and specialist_calls[role] == 1:
                 raise LLMRetryableError("transient provider failure")
-            return (
-                f"{role} 已给出明确范围、关键决策、直接依赖、失败信号、监控指标、告警阈值、"
-                "边界场景、容量假设、灰度策略、回滚条件、证据来源、权限约束、可复现验收步骤、"
-                "后续负责人、完成时限和升级处理路径。"
-            )
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1219,11 +1265,7 @@ async def test_deterministic_branch_failure_pauses_for_targeted_operator_recover
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise ValueError("测试环境配置缺少验收凭据")
-            return (
-                "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
-                "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-                "所有结论均与用户目标和成功标准建立可追溯关系。"
-            )
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1360,11 +1402,8 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
             max_parallel_branches = max(max_parallel_branches, active_branches)
             try:
                 await asyncio.sleep(0.01)
-                return (
-                    "明确范围、关键决策、依赖关系、边界场景与失败信号；提供监控指标、灰度策略、"
-                    "回滚条件、可复现验收步骤、证据来源、后续负责人和完成时限。"
-                    "所有结论均与用户目标和成功标准建立可追溯关系。"
-                )
+                role = json.loads(_user_prompt)["assignment"]["role"]
+                return structured_handoff_response(role)
             finally:
                 active_branches -= 1
         if "报告生成器" in system_prompt:

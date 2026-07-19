@@ -22,6 +22,7 @@ from app.agent.orchestration import (
     merge_reviewer_panel,
     parse_execution_plan,
     parse_execution_plan_candidate,
+    parse_specialist_handoff,
     parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
@@ -885,6 +886,156 @@ def test_execution_plan_builds_dependency_waves_and_rejects_invalid_graphs() -> 
     ]
     with pytest.raises(ValidationError):
         MultiAgentExecutionPlan.model_validate({**plan_data, "assignments": unknown_dependency})
+
+
+def specialist_handoff_response(role: str) -> str:
+    return json.dumps(
+        {
+            "summary": "已形成可供下游直接执行和验证的专业结论，并明确责任、边界与失败恢复方式。",
+            "decisions": [
+                {
+                    "title": "分阶段交付",
+                    "outcome": "先验证核心路径，再按观测结果扩大交付范围。",
+                    "rationale": "缩小首轮风险面，并保留确定性的停止和回滚条件。",
+                }
+            ],
+            "evidence": [
+                {
+                    "claim": "核心路径具备可重复的验收证据。",
+                    "source": "自动化验收记录与当前计划成功标准",
+                    "verification": "重新执行核心用例并核对成功标准编号。",
+                }
+            ],
+            "risks": [
+                {
+                    "risk": "扩大范围后可能超过当前错误预算。",
+                    "mitigation": "达到告警阈值时停止扩容并执行回滚。",
+                    "owner_role": role,
+                }
+            ],
+            "open_questions": [
+                {
+                    "question": "正式发布窗口是否已经由负责人确认？",
+                    "owner_role": role,
+                    "blocking": False,
+                }
+            ],
+            "next_actions": [
+                {
+                    "action": "执行核心路径验收并归档运行记录。",
+                    "owner_role": role,
+                    "acceptance_criteria": "全部核心用例通过且证据可由 Reviewer 复核。",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_specialist_handoff_parser_builds_a_bounded_v2_contract() -> None:
+    payload = parse_specialist_handoff(
+        specialist_handoff_response("test_engineer"),
+        "test_engineer",
+        {"test_engineer", "operations_analyst"},
+    )
+
+    assert payload.contract_version == 2
+    assert payload.structured is True
+    assert payload.summary.startswith("已形成可供下游")
+    assert payload.decisions[0].title == "分阶段交付"
+    assert payload.evidence[0].verification.startswith("重新执行")
+    assert payload.risks[0].owner_role == "test_engineer"
+    assert payload.next_actions[0].acceptance_criteria.startswith("全部核心用例")
+    assert "关键决策" in payload.content
+
+    invalid = parse_specialist_handoff(
+        "这是一段很长但没有机器可验证字段的自由文本。" * 20,
+        "test_engineer",
+        {"test_engineer", "operations_analyst"},
+    )
+
+    assert invalid.contract_version == 2
+    assert invalid.structured is False
+    assert invalid.decisions == []
+    assert invalid.content.startswith("这是一段很长")
+    assert invalid.model_dump()["content"].startswith("这是一段很长")
+
+
+def test_handoff_v2_quality_gate_rejects_unstructured_or_tampered_contracts() -> None:
+    plan = build_fallback_plan("设计可灰度发布并可回滚的项目交付流程")
+    allowed_roles = {assignment.role for assignment in plan.assignments}
+    structured_handoffs = []
+    for assignment in plan.assignments:
+        payload = parse_specialist_handoff(
+            specialist_handoff_response(assignment.role),
+            assignment.role,
+            allowed_roles,
+        )
+        structured_handoffs.append(
+            seal_handoff(
+                plan,
+                assignment,
+                payload.content,
+                plan_version=2,
+                revision_round=0,
+                upstream_handoffs={},
+                contract=payload,
+            )
+        )
+
+    valid = evaluate_handoffs(plan, structured_handoffs, plan_version=2)
+    contract_check = next(
+        check for check in valid.checks if check["name"] == "handoff_contract"
+    )
+    assert valid.passed is True
+    assert contract_check["passed"] is True
+    assert contract_check["detail"].startswith("2 structured handoffs")
+    downstream = structured_handoffs[0].downstream_context()
+    assert downstream["summary"] == structured_handoffs[0].summary
+    assert "content" not in downstream
+
+    invalid_payload = parse_specialist_handoff(
+        "自由文本足够长，可以绕过旧的长度门禁，但不具备结构化决策、证据、风险和行动。" * 8,
+        plan.assignments[0].role,
+        allowed_roles,
+    )
+    invalid_handoff = seal_handoff(
+        plan,
+        plan.assignments[0],
+        invalid_payload.content,
+        plan_version=2,
+        revision_round=0,
+        upstream_handoffs={},
+        contract=invalid_payload,
+    )
+    unstructured = evaluate_handoffs(
+        plan,
+        [invalid_handoff, *structured_handoffs[1:]],
+        plan_version=2,
+    )
+    assert unstructured.passed is False
+    assert unstructured.revision_roles == [plan.assignments[0].role]
+    assert any("结构化合同无效" in issue for issue in unstructured.issues)
+    assert invalid_handoff.downstream_context() == {
+        "contract_version": 2,
+        "structured": False,
+    }
+
+    original = structured_handoffs[0]
+    changed_decision = original.decisions[0].model_copy(
+        update={"outcome": "未经封存修改后的决策"}
+    )
+    tampered_handoff = original.model_copy(
+        update={"decisions": [changed_decision, *original.decisions[1:]]}
+    )
+    tampered = evaluate_handoffs(
+        plan,
+        [tampered_handoff, *structured_handoffs[1:]],
+        plan_version=2,
+    )
+    assert tampered.passed is False
+    assert original.role in tampered.revision_roles
+    assert any("证据链失效" in issue for issue in tampered.issues)
 
 
 def test_quality_gate_requires_complete_substantive_handoffs() -> None:

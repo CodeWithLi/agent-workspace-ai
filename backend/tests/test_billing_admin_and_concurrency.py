@@ -252,6 +252,42 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
 
     async def fake_chat(system_prompt: str, _user_prompt: str, *_args) -> str:
         prompts.append(system_prompt)
+        if "专业交接 Agent" in system_prompt:
+            role = json.loads(_user_prompt)["assignment"]["role"]
+            return json.dumps(
+                {
+                    "summary": "The specialist completed a verifiable handoff with explicit ownership and recovery criteria.",
+                    "decisions": [
+                        {
+                            "title": "Stage delivery",
+                            "outcome": "Validate the core path before expanding scope.",
+                            "rationale": "A staged release preserves a deterministic rollback point.",
+                        }
+                    ],
+                    "evidence": [
+                        {
+                            "claim": "The core path has reproducible acceptance evidence.",
+                            "source": "Automated acceptance records.",
+                            "verification": "Rerun the core cases and verify the linked success criteria.",
+                        }
+                    ],
+                    "risks": [
+                        {
+                            "risk": "Expansion could exceed the current error budget.",
+                            "mitigation": "Stop expansion and roll back at the alert threshold.",
+                            "owner_role": role,
+                        }
+                    ],
+                    "open_questions": [],
+                    "next_actions": [
+                        {
+                            "action": "Run the acceptance suite and archive its evidence.",
+                            "owner_role": role,
+                            "acceptance_criteria": "All core cases pass and evidence is reviewable.",
+                        }
+                    ],
+                }
+            )
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {

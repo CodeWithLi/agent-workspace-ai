@@ -844,12 +844,97 @@ def expand_revision_roles(
     return expanded
 
 
+HANDOFF_CONTRACT_JSON_LIMIT = 16000
+
+
+class HandoffDecision(BaseModel):
+    title: str = Field(min_length=2, max_length=160)
+    outcome: str = Field(min_length=4, max_length=2000)
+    rationale: str = Field(min_length=4, max_length=2000)
+
+
+class HandoffEvidence(BaseModel):
+    claim: str = Field(min_length=4, max_length=2000)
+    source: str = Field(min_length=2, max_length=1000)
+    verification: str = Field(min_length=4, max_length=2000)
+
+
+class HandoffRisk(BaseModel):
+    risk: str = Field(min_length=4, max_length=1000)
+    mitigation: str = Field(min_length=4, max_length=2000)
+    owner_role: SpecialistRole
+
+
+class HandoffQuestion(BaseModel):
+    question: str = Field(min_length=4, max_length=1000)
+    owner_role: SpecialistRole
+    blocking: bool = False
+
+
+class HandoffAction(BaseModel):
+    action: str = Field(min_length=4, max_length=1000)
+    owner_role: SpecialistRole
+    acceptance_criteria: str = Field(min_length=4, max_length=2000)
+
+
+class SpecialistHandoffPayload(BaseModel):
+    contract_version: Literal[2] = 2
+    structured: bool
+    content: str = Field(min_length=1, max_length=24000)
+    summary: str = Field(default="", max_length=2000)
+    decisions: list[HandoffDecision] = Field(default_factory=list, max_length=8)
+    evidence: list[HandoffEvidence] = Field(default_factory=list, max_length=8)
+    risks: list[HandoffRisk] = Field(default_factory=list, max_length=8)
+    open_questions: list[HandoffQuestion] = Field(default_factory=list, max_length=8)
+    next_actions: list[HandoffAction] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "SpecialistHandoffPayload":
+        contract_lists = (
+            self.decisions,
+            self.evidence,
+            self.risks,
+            self.open_questions,
+            self.next_actions,
+        )
+        if self.structured and (
+            len(self.summary.strip()) < 20
+            or not self.decisions
+            or not self.evidence
+            or not self.risks
+            or not self.next_actions
+        ):
+            raise ValueError(
+                "structured handoffs require summary, decisions, evidence, risks and actions"
+            )
+        if not self.structured and (
+            self.summary.strip() or any(contract_lists)
+        ):
+            raise ValueError("unstructured handoffs cannot contain trusted contract fields")
+        if self.structured and len(
+            json.dumps(self.contract_data(), ensure_ascii=False)
+        ) > HANDOFF_CONTRACT_JSON_LIMIT:
+            raise ValueError("structured handoff contract exceeds its context budget")
+        return self
+
+    def contract_data(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content"})
+
+
 class AgentHandoff(BaseModel):
     role: SpecialistRole
     objective: str = Field(min_length=4, max_length=500)
     deliverable: str = Field(min_length=2, max_length=200)
     content: str = Field(min_length=1, max_length=24000)
     revision_round: int = Field(default=0, ge=0, le=20)
+    contract_version: int = Field(default=1, ge=1, le=2)
+    structured: bool = False
+    summary: str = Field(default="", max_length=2000)
+    decisions: list[HandoffDecision] = Field(default_factory=list, max_length=8)
+    evidence: list[HandoffEvidence] = Field(default_factory=list, max_length=8)
+    risks: list[HandoffRisk] = Field(default_factory=list, max_length=8)
+    open_questions: list[HandoffQuestion] = Field(default_factory=list, max_length=8)
+    next_actions: list[HandoffAction] = Field(default_factory=list, max_length=8)
     plan_version: int = Field(default=0, ge=0)
     upstream_fingerprints: dict[SpecialistRole, str] = Field(default_factory=dict)
     input_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
@@ -866,6 +951,35 @@ class AgentHandoff(BaseModel):
 
     @model_validator(mode="after")
     def validate_lineage_contract(self) -> "AgentHandoff":
+        contract_lists = (
+            self.decisions,
+            self.evidence,
+            self.risks,
+            self.open_questions,
+            self.next_actions,
+        )
+        if self.contract_version == 1 and (
+            self.structured or self.summary.strip() or any(contract_lists)
+        ):
+            raise ValueError("legacy handoffs cannot contain v2 contract fields")
+        if self.contract_version >= 2 and self.structured and (
+            len(self.summary.strip()) < 20
+            or not self.decisions
+            or not self.evidence
+            or not self.risks
+            or not self.next_actions
+        ):
+            raise ValueError(
+                "structured handoffs require summary, decisions, evidence, risks and actions"
+            )
+        if self.contract_version >= 2 and not self.structured and (
+            self.summary.strip() or any(contract_lists)
+        ):
+            raise ValueError("unstructured handoffs cannot contain trusted contract fields")
+        if self.structured and len(
+            json.dumps(self.contract_data(), ensure_ascii=False)
+        ) > HANDOFF_CONTRACT_JSON_LIMIT:
+            raise ValueError("structured handoff contract exceeds its context budget")
         if not self.is_sealed:
             return self
         if self.plan_version < 1 or not self.input_fingerprint or not self.output_fingerprint:
@@ -880,6 +994,49 @@ class AgentHandoff(BaseModel):
         ):
             raise ValueError("handoff upstream fingerprints must be lowercase SHA-256 values")
         return self
+
+    def contract_data(self) -> dict[str, Any] | None:
+        if self.contract_version < 2:
+            return None
+        return {
+            "contract_version": self.contract_version,
+            "structured": self.structured,
+            "summary": self.summary,
+            "decisions": [
+                item.model_dump(mode="json") for item in self.decisions
+            ],
+            "evidence": [
+                item.model_dump(mode="json") for item in self.evidence
+            ],
+            "risks": [item.model_dump(mode="json") for item in self.risks],
+            "open_questions": [
+                item.model_dump(mode="json") for item in self.open_questions
+            ],
+            "next_actions": [
+                item.model_dump(mode="json") for item in self.next_actions
+            ],
+        }
+
+    def downstream_context(self) -> dict[str, Any]:
+        if self.contract_version == 1:
+            return {
+                "contract_version": self.contract_version,
+                "structured": False,
+                "content": self.content[:12000],
+            }
+        if not self.structured:
+            return {
+                "contract_version": self.contract_version,
+                "structured": False,
+            }
+        return self.contract_data() or {}
+
+    def contract_owner_roles(self) -> set[SpecialistRole]:
+        return {
+            *[item.owner_role for item in self.risks],
+            *[item.owner_role for item in self.open_questions],
+            *[item.owner_role for item in self.next_actions],
+        }
 
 
 def _stable_fingerprint(value: Any) -> str:
@@ -932,15 +1089,26 @@ def _handoff_output_fingerprint(
     deliverable: str,
     content: str,
     input_fingerprint: str,
+    contract_data: dict[str, Any] | None = None,
 ) -> str:
+    contract_version = int((contract_data or {}).get("contract_version", 1))
     return _stable_fingerprint(
         {
-            "contract": "agent-handoff-output-v1",
+            "contract": (
+                "agent-handoff-output-v2"
+                if contract_version >= 2
+                else "agent-handoff-output-v1"
+            ),
             "role": role,
             "objective": objective,
             "deliverable": deliverable,
             "content": content,
             "input_fingerprint": input_fingerprint,
+            **(
+                {"handoff_contract": contract_data}
+                if contract_version >= 2
+                else {}
+            ),
         }
     )
 
@@ -953,6 +1121,7 @@ def seal_handoff(
     plan_version: int,
     revision_round: int,
     upstream_handoffs: dict[SpecialistRole, AgentHandoff],
+    contract: SpecialistHandoffPayload | None = None,
 ) -> AgentHandoff:
     missing_roles = [
         role for role in assignment.depends_on if role not in upstream_handoffs
@@ -976,12 +1145,16 @@ def seal_handoff(
         revision_round=revision_round,
         upstream_fingerprints=upstream_fingerprints,
     )
+    if contract is not None and contract.content != content:
+        raise ValueError("handoff content must match its structured contract")
+    contract_data = contract.contract_data() if contract else None
     output_fingerprint = _handoff_output_fingerprint(
         role=assignment.role,
         objective=assignment.objective,
         deliverable=assignment.deliverable,
         content=content,
         input_fingerprint=input_fingerprint,
+        contract_data=contract_data,
     )
     return AgentHandoff(
         role=assignment.role,
@@ -989,6 +1162,7 @@ def seal_handoff(
         deliverable=assignment.deliverable,
         content=content,
         revision_round=revision_round,
+        **(contract_data or {}),
         plan_version=plan_version,
         upstream_fingerprints=upstream_fingerprints,
         input_fingerprint=input_fingerprint,
@@ -1033,6 +1207,7 @@ def _lineage_invalid_roles(
                 deliverable=handoff.deliverable,
                 content=handoff.content,
                 input_fingerprint=expected_input,
+                contract_data=handoff.contract_data(),
             )
             valid = (
                 set(handoff.upstream_fingerprints) == set(assignment.depends_on)
@@ -1142,6 +1317,95 @@ def _json_candidates(text: str) -> list[str]:
     if first >= 0 and last > first:
         candidates.append(text[first : last + 1])
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+class _SpecialistHandoffResponse(BaseModel):
+    summary: str = Field(min_length=20, max_length=2000)
+    decisions: list[HandoffDecision] = Field(min_length=1, max_length=8)
+    evidence: list[HandoffEvidence] = Field(min_length=1, max_length=8)
+    risks: list[HandoffRisk] = Field(min_length=1, max_length=8)
+    open_questions: list[HandoffQuestion] = Field(default_factory=list, max_length=8)
+    next_actions: list[HandoffAction] = Field(min_length=1, max_length=8)
+
+
+def _render_specialist_handoff(response: _SpecialistHandoffResponse) -> str:
+    lines = ["## 摘要", response.summary, "", "## 关键决策"]
+    for item in response.decisions:
+        lines.extend(
+            [
+                f"- **{item.title}**：{item.outcome}",
+                f"  - 依据：{item.rationale}",
+            ]
+        )
+    lines.extend(["", "## 验收证据"])
+    for item in response.evidence:
+        lines.extend(
+            [
+                f"- **结论**：{item.claim}",
+                f"  - 来源：{item.source}",
+                f"  - 验证：{item.verification}",
+            ]
+        )
+    lines.extend(["", "## 风险与缓解"])
+    for item in response.risks:
+        lines.extend(
+            [
+                f"- **风险**：{item.risk}",
+                f"  - 缓解：{item.mitigation}",
+                f"  - 负责人：{item.owner_role}",
+            ]
+        )
+    lines.extend(["", "## 开放问题"])
+    if response.open_questions:
+        for item in response.open_questions:
+            lines.append(
+                f"- {item.question}（负责人：{item.owner_role}；"
+                f"{'阻塞' if item.blocking else '非阻塞'}）"
+            )
+    else:
+        lines.append("- 无")
+    lines.extend(["", "## 下一步行动"])
+    for item in response.next_actions:
+        lines.extend(
+            [
+                f"- **{item.action}**",
+                f"  - 负责人：{item.owner_role}",
+                f"  - 完成标准：{item.acceptance_criteria}",
+            ]
+        )
+    return "\n".join(lines)[:24000]
+
+
+def parse_specialist_handoff(
+    text: str,
+    role: SpecialistRole,
+    allowed_roles: set[SpecialistRole] | None = None,
+) -> SpecialistHandoffPayload:
+    permitted_roles = allowed_roles or {role}
+    for candidate in _json_candidates(text):
+        try:
+            response = _SpecialistHandoffResponse.model_validate(json.loads(candidate))
+            owner_roles = {
+                *[item.owner_role for item in response.risks],
+                *[item.owner_role for item in response.open_questions],
+                *[item.owner_role for item in response.next_actions],
+            }
+            if owner_roles - permitted_roles:
+                continue
+            return SpecialistHandoffPayload(
+                structured=True,
+                content=_render_specialist_handoff(response),
+                **response.model_dump(mode="json"),
+            )
+        except (json.JSONDecodeError, ValidationError, ValueError):
+            continue
+    return SpecialistHandoffPayload(
+        structured=False,
+        content=(
+            text.strip()[:24000]
+            or "Agent 未返回有效的结构化专业交接。"
+        ),
+    )
 
 
 class _SpecialistPlanCommitmentResponse(BaseModel):
@@ -1406,6 +1670,26 @@ def evaluate_handoffs(
         for role in expected_roles
         if role in handoffs_by_role and len(handoffs_by_role[role].content.strip()) < 80
     ]
+    expected_role_set = set(expected_roles)
+    invalid_contract_roles = [
+        role
+        for role in expected_roles
+        if role in handoffs_by_role
+        and handoffs_by_role[role].contract_version >= 2
+        and (
+            not handoffs_by_role[role].structured
+            or bool(
+                handoffs_by_role[role].contract_owner_roles()
+                - expected_role_set
+            )
+        )
+    ]
+    structured_count = sum(
+        handoff.structured for handoff in handoffs_by_role.values()
+    )
+    legacy_count = sum(
+        handoff.contract_version == 1 for handoff in handoffs_by_role.values()
+    )
     lineage_invalid_roles, sealed_count = _lineage_invalid_roles(
         plan,
         handoffs,
@@ -1416,13 +1700,24 @@ def evaluate_handoffs(
             "name": "role_coverage",
             "passed": not missing_roles,
             "detail": f"{len(expected_roles) - len(missing_roles)}/{len(expected_roles)} specialist roles completed",
-            "weight": 20,
+            "weight": 15,
         },
         {
             "name": "substantive_handoffs",
             "passed": not short_roles and not missing_roles,
             "detail": "all handoffs contain substantive evidence" if not short_roles else f"short outputs: {', '.join(short_roles)}",
             "weight": 25,
+        },
+        {
+            "name": "handoff_contract",
+            "passed": not invalid_contract_roles,
+            "detail": (
+                f"{structured_count} structured handoffs; "
+                f"{legacy_count} legacy handoffs accepted"
+                if not invalid_contract_roles
+                else f"invalid structured contracts: {', '.join(invalid_contract_roles)}"
+            ),
+            "weight": 20,
         },
         {
             "name": "handoff_lineage",
@@ -1432,19 +1727,19 @@ def evaluate_handoffs(
                 if not lineage_invalid_roles
                 else f"invalid or stale lineage: {', '.join(lineage_invalid_roles)}"
             ),
-            "weight": 20,
+            "weight": 15,
         },
         {
             "name": "success_contract",
             "passed": len(plan.success_criteria) >= 2,
             "detail": f"{len(plan.success_criteria)} success criteria defined",
-            "weight": 20,
+            "weight": 15,
         },
         {
             "name": "specialist_breadth",
             "passed": len(expected_roles) >= 2,
             "detail": f"{len(expected_roles)} specialist branches across {len(build_execution_waves(plan))} execution waves",
-            "weight": 15,
+            "weight": 10,
         },
     ]
     score = float(sum(check["weight"] for check in checks if check["passed"]))
@@ -1453,14 +1748,26 @@ def evaluate_handoffs(
         issues.append(f"缺少专业交接：{', '.join(missing_roles)}")
     if short_roles:
         issues.append(f"交接内容不足：{', '.join(short_roles)}")
+    if invalid_contract_roles:
+        issues.append(
+            f"结构化合同无效：{', '.join(invalid_contract_roles)}"
+        )
     if lineage_invalid_roles:
         issues.append(f"交接证据链失效：{', '.join(lineage_invalid_roles)}")
     revision_roles = list(
-        dict.fromkeys([*missing_roles, *short_roles, *lineage_invalid_roles])
+        dict.fromkeys(
+            [
+                *missing_roles,
+                *short_roles,
+                *invalid_contract_roles,
+                *lineage_invalid_roles,
+            ]
+        )
     )
     passed = (
         not missing_roles
         and not short_roles
+        and not invalid_contract_roles
         and not lineage_invalid_roles
         and score >= 80
     )

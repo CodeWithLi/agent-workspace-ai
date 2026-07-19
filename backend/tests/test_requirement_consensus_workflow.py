@@ -9,6 +9,47 @@ from app.langgraph.workflow import run_workspace_graph
 from app.models import Project, Task, User, WorkflowEvent, WorkflowStatus
 
 
+def structured_handoff_response(role: str) -> str:
+    return json.dumps(
+        {
+            "summary": (
+                "The specialist completed a verifiable handoff with explicit scope, "
+                "ownership, evidence, risk controls, and recovery criteria."
+            ),
+            "decisions": [
+                {
+                    "title": "Stage delivery",
+                    "outcome": "Validate the core path before expanding the delivery scope.",
+                    "rationale": "A staged release limits risk and preserves a deterministic rollback point.",
+                }
+            ],
+            "evidence": [
+                {
+                    "claim": "The core path has reproducible acceptance evidence.",
+                    "source": "Automated acceptance records and the approved success criteria.",
+                    "verification": "Rerun the core cases and verify every linked success criterion.",
+                }
+            ],
+            "risks": [
+                {
+                    "risk": "Scope expansion could exceed the current error budget.",
+                    "mitigation": "Stop expansion and roll back when the alert threshold is reached.",
+                    "owner_role": role,
+                }
+            ],
+            "open_questions": [],
+            "next_actions": [
+                {
+                    "action": "Run the core-path acceptance suite and archive its evidence.",
+                    "owner_role": role,
+                    "acceptance_criteria": "All core cases pass and the evidence is independently reviewable.",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
 def execution_plan() -> dict:
     return {
         "objective": "形成可验证、可恢复的会员平台交付计划",
@@ -151,11 +192,8 @@ async def test_requirement_challenges_are_revised_re_reviewed_and_forwarded(
         if "独立执行计划仲裁 Agent" in system_prompt:
             return arbiter_decision()
         if "专业交接 Agent" in system_prompt:
-            return (
-                "明确范围、关键决策、依赖、风险、边界、验收证据和负责人；记录监控阈值、"
-                "灰度步骤、回滚条件、数据来源、实际结果、完成时限和可审计责任。"
-                "逐项关联需求合同 AC 编号、成功标准、上游证据和后续责任人。"
-            )
+            role = json.loads(user_prompt)["assignment"]["role"]
+            return structured_handoff_response(role)
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
