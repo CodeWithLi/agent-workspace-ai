@@ -199,6 +199,17 @@
         </div>
         <el-collapse v-if="specialistHandoffs.length" v-model="activeHandoffRoles" class="handoff-details">
           <el-collapse-item v-for="handoff in specialistHandoffs" :id="`handoff-${handoff.role}`" :key="handoff.role" :name="handoff.role" :title="`${specialistRoleLabel(handoff.role)} Handoff · ${handoff.deliverable}`">
+            <section v-if="handoff.output_fingerprint" class="handoff-lineage" aria-label="Handoff 证据链">
+              <div class="handoff-lineage-status">
+                <el-icon aria-hidden="true"><Connection /></el-icon>
+                <strong>证据链已封存</strong>
+                <span>计划 v{{ handoff.plan_version }} · 修订 R{{ handoff.revision_round }}</span>
+              </div>
+              <div class="handoff-lineage-route">
+                <span>{{ handoffUpstreamLabel(handoff) }}</span>
+                <code>{{ shortFingerprint(handoff.input_fingerprint) }} → {{ shortFingerprint(handoff.output_fingerprint) }}</code>
+              </div>
+            </section>
             <pre>{{ handoff.content }}</pre>
           </el-collapse-item>
         </el-collapse>
@@ -468,6 +479,10 @@ interface WorkflowPlanRevision {
 interface WorkflowHandoff extends WorkflowAssignment {
   content: string
   revision_round: number
+  plan_version?: number
+  upstream_fingerprints?: Record<string, string>
+  input_fingerprint?: string
+  output_fingerprint?: string
 }
 
 interface WorkflowCollaborationDecision {
@@ -1004,6 +1019,17 @@ function specialistFailureCategoryLabel(category: WorkflowSpecialistFailure['cat
 
 function handoffFor(role: string) {
   return specialistHandoffs.value.find((handoff) => handoff.role === role)
+}
+
+function shortFingerprint(fingerprint?: string) {
+  return fingerprint?.slice(0, 10) || '—'
+}
+
+function handoffUpstreamLabel(handoff: WorkflowHandoff) {
+  const roles = Object.keys(handoff.upstream_fingerprints || {})
+  return roles.length
+    ? `来源 ${roles.map(specialistRoleLabel).join('、')}`
+    : '独立根分支'
 }
 
 function branchRuntimeState(role: string): BranchRuntimeState {
@@ -1902,6 +1928,40 @@ onBeforeUnmount(disposeWorkflowEventStream)
 .handoff-details :deep(.el-collapse-item__header) {
   min-height: 44px;
   font-size: 12px;
+}
+
+.handoff-lineage {
+  display: flex;
+  min-height: 38px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--color-border);
+  background: #f0fdf4;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+}
+
+.handoff-lineage-status,
+.handoff-lineage-route {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 8px;
+}
+
+.handoff-lineage-status .el-icon,
+.handoff-lineage-status strong {
+  color: var(--color-success);
+}
+
+.handoff-lineage-route code {
+  color: var(--color-muted-text);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 11px;
 }
 
 .handoff-details pre {

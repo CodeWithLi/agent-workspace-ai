@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from typing import Any, Literal
@@ -100,6 +101,203 @@ class AgentHandoff(BaseModel):
     deliverable: str = Field(min_length=2, max_length=200)
     content: str = Field(min_length=1, max_length=24000)
     revision_round: int = Field(default=0, ge=0, le=20)
+    plan_version: int = Field(default=0, ge=0)
+    upstream_fingerprints: dict[SpecialistRole, str] = Field(default_factory=dict)
+    input_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
+    output_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
+
+    @property
+    def is_sealed(self) -> bool:
+        return bool(
+            self.plan_version
+            or self.upstream_fingerprints
+            or self.input_fingerprint
+            or self.output_fingerprint
+        )
+
+    @model_validator(mode="after")
+    def validate_lineage_contract(self) -> "AgentHandoff":
+        if not self.is_sealed:
+            return self
+        if self.plan_version < 1 or not self.input_fingerprint or not self.output_fingerprint:
+            raise ValueError("sealed handoffs require plan version and input/output fingerprints")
+        if len(self.upstream_fingerprints) > 3:
+            raise ValueError("handoff lineage cannot contain more than three upstream roles")
+        if self.role in self.upstream_fingerprints:
+            raise ValueError("handoff lineage cannot reference its own role")
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            for fingerprint in self.upstream_fingerprints.values()
+        ):
+            raise ValueError("handoff upstream fingerprints must be lowercase SHA-256 values")
+        return self
+
+
+def _stable_fingerprint(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _legacy_handoff_fingerprint(handoff: AgentHandoff) -> str:
+    return _stable_fingerprint(
+        {
+            "contract": "legacy-agent-handoff",
+            "role": handoff.role,
+            "objective": handoff.objective,
+            "deliverable": handoff.deliverable,
+            "content": handoff.content,
+            "revision_round": handoff.revision_round,
+        }
+    )
+
+
+def _handoff_input_fingerprint(
+    plan: MultiAgentExecutionPlan,
+    assignment: SpecialistAssignment,
+    *,
+    plan_version: int,
+    revision_round: int,
+    upstream_fingerprints: dict[SpecialistRole, str],
+) -> str:
+    return _stable_fingerprint(
+        {
+            "contract": "agent-handoff-input-v1",
+            "plan": plan.model_dump(mode="json"),
+            "plan_version": plan_version,
+            "assignment": assignment.model_dump(mode="json"),
+            "revision_round": revision_round,
+            "upstream_fingerprints": upstream_fingerprints,
+        }
+    )
+
+
+def _handoff_output_fingerprint(
+    *,
+    role: SpecialistRole,
+    objective: str,
+    deliverable: str,
+    content: str,
+    input_fingerprint: str,
+) -> str:
+    return _stable_fingerprint(
+        {
+            "contract": "agent-handoff-output-v1",
+            "role": role,
+            "objective": objective,
+            "deliverable": deliverable,
+            "content": content,
+            "input_fingerprint": input_fingerprint,
+        }
+    )
+
+
+def seal_handoff(
+    plan: MultiAgentExecutionPlan,
+    assignment: SpecialistAssignment,
+    content: str,
+    *,
+    plan_version: int,
+    revision_round: int,
+    upstream_handoffs: dict[SpecialistRole, AgentHandoff],
+) -> AgentHandoff:
+    missing_roles = [
+        role for role in assignment.depends_on if role not in upstream_handoffs
+    ]
+    if missing_roles:
+        raise ValueError(
+            f"cannot seal {assignment.role} handoff without upstream roles: "
+            f"{', '.join(missing_roles)}"
+        )
+    upstream_fingerprints = {
+        role: (
+            upstream_handoffs[role].output_fingerprint
+            or _legacy_handoff_fingerprint(upstream_handoffs[role])
+        )
+        for role in assignment.depends_on
+    }
+    input_fingerprint = _handoff_input_fingerprint(
+        plan,
+        assignment,
+        plan_version=plan_version,
+        revision_round=revision_round,
+        upstream_fingerprints=upstream_fingerprints,
+    )
+    output_fingerprint = _handoff_output_fingerprint(
+        role=assignment.role,
+        objective=assignment.objective,
+        deliverable=assignment.deliverable,
+        content=content,
+        input_fingerprint=input_fingerprint,
+    )
+    return AgentHandoff(
+        role=assignment.role,
+        objective=assignment.objective,
+        deliverable=assignment.deliverable,
+        content=content,
+        revision_round=revision_round,
+        plan_version=plan_version,
+        upstream_fingerprints=upstream_fingerprints,
+        input_fingerprint=input_fingerprint,
+        output_fingerprint=output_fingerprint,
+    )
+
+
+def _lineage_invalid_roles(
+    plan: MultiAgentExecutionPlan,
+    handoffs: list[AgentHandoff],
+    plan_version: int | None,
+) -> tuple[list[SpecialistRole], int]:
+    handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
+    invalid_roles: list[SpecialistRole] = []
+    sealed_count = 0
+    effective_outputs: dict[SpecialistRole, str] = {}
+
+    for wave in build_execution_waves(plan):
+        for assignment in wave:
+            handoff = handoffs_by_role.get(assignment.role)
+            if handoff is None:
+                continue
+            if not handoff.is_sealed:
+                effective_outputs[handoff.role] = _legacy_handoff_fingerprint(handoff)
+                continue
+            sealed_count += 1
+            upstream_fingerprints = {
+                role: effective_outputs[role]
+                for role in assignment.depends_on
+                if role in effective_outputs
+            }
+            expected_input = _handoff_input_fingerprint(
+                plan,
+                assignment,
+                plan_version=handoff.plan_version,
+                revision_round=handoff.revision_round,
+                upstream_fingerprints=upstream_fingerprints,
+            )
+            expected_output = _handoff_output_fingerprint(
+                role=handoff.role,
+                objective=handoff.objective,
+                deliverable=handoff.deliverable,
+                content=handoff.content,
+                input_fingerprint=expected_input,
+            )
+            valid = (
+                set(handoff.upstream_fingerprints) == set(assignment.depends_on)
+                and handoff.upstream_fingerprints == upstream_fingerprints
+                and handoff.objective == assignment.objective
+                and handoff.deliverable == assignment.deliverable
+                and handoff.input_fingerprint == expected_input
+                and handoff.output_fingerprint == expected_output
+                and (plan_version is None or handoff.plan_version == plan_version)
+            )
+            if not valid:
+                invalid_roles.append(handoff.role)
+            effective_outputs[handoff.role] = expected_output
+    return invalid_roles, sealed_count
 
 
 class CollaborationDecision(BaseModel):
@@ -264,6 +462,8 @@ def parse_execution_plan(text: str, user_input: str) -> MultiAgentExecutionPlan:
 def evaluate_handoffs(
     plan: MultiAgentExecutionPlan,
     handoffs: list[AgentHandoff],
+    *,
+    plan_version: int | None = None,
 ) -> QualityGateDecision:
     expected_roles = [assignment.role for assignment in plan.assignments]
     handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
@@ -273,18 +473,33 @@ def evaluate_handoffs(
         for role in expected_roles
         if role in handoffs_by_role and len(handoffs_by_role[role].content.strip()) < 80
     ]
+    lineage_invalid_roles, sealed_count = _lineage_invalid_roles(
+        plan,
+        handoffs,
+        plan_version,
+    )
     checks = [
         {
             "name": "role_coverage",
             "passed": not missing_roles,
             "detail": f"{len(expected_roles) - len(missing_roles)}/{len(expected_roles)} specialist roles completed",
-            "weight": 25,
+            "weight": 20,
         },
         {
             "name": "substantive_handoffs",
             "passed": not short_roles and not missing_roles,
             "detail": "all handoffs contain substantive evidence" if not short_roles else f"short outputs: {', '.join(short_roles)}",
-            "weight": 35,
+            "weight": 25,
+        },
+        {
+            "name": "handoff_lineage",
+            "passed": not lineage_invalid_roles,
+            "detail": (
+                f"{sealed_count} sealed handoffs preserve current upstream lineage"
+                if not lineage_invalid_roles
+                else f"invalid or stale lineage: {', '.join(lineage_invalid_roles)}"
+            ),
+            "weight": 20,
         },
         {
             "name": "success_contract",
@@ -296,7 +511,7 @@ def evaluate_handoffs(
             "name": "specialist_breadth",
             "passed": len(expected_roles) >= 2,
             "detail": f"{len(expected_roles)} specialist branches across {len(build_execution_waves(plan))} execution waves",
-            "weight": 20,
+            "weight": 15,
         },
     ]
     score = float(sum(check["weight"] for check in checks if check["passed"]))
@@ -305,8 +520,17 @@ def evaluate_handoffs(
         issues.append(f"缺少专业交接：{', '.join(missing_roles)}")
     if short_roles:
         issues.append(f"交接内容不足：{', '.join(short_roles)}")
-    revision_roles = list(dict.fromkeys([*missing_roles, *short_roles]))
-    passed = not missing_roles and not short_roles and score >= 80
+    if lineage_invalid_roles:
+        issues.append(f"交接证据链失效：{', '.join(lineage_invalid_roles)}")
+    revision_roles = list(
+        dict.fromkeys([*missing_roles, *short_roles, *lineage_invalid_roles])
+    )
+    passed = (
+        not missing_roles
+        and not short_roles
+        and not lineage_invalid_roles
+        and score >= 80
+    )
     return QualityGateDecision(
         score=score,
         passed=passed,

@@ -430,6 +430,20 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         "operations_analyst",
     ]
     assert len(state["specialist_handoffs"]) == 4
+    handoffs_by_role = {
+        handoff["role"]: handoff for handoff in state["specialist_handoffs"]
+    }
+    assert all(handoff["plan_version"] == 1 for handoff in handoffs_by_role.values())
+    assert all(len(handoff["input_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
+    assert all(len(handoff["output_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
+    assert handoffs_by_role["knowledge_admin"]["upstream_fingerprints"] == {}
+    assert handoffs_by_role["test_engineer"]["upstream_fingerprints"] == {
+        "knowledge_admin": handoffs_by_role["knowledge_admin"]["output_fingerprint"]
+    }
+    assert handoffs_by_role["notification_secretary"]["upstream_fingerprints"] == {
+        "test_engineer": handoffs_by_role["test_engineer"]["output_fingerprint"],
+        "operations_analyst": handoffs_by_role["operations_analyst"]["output_fingerprint"],
+    }
     wave_events = list(
         db.scalars(
             select(WorkflowEvent)
@@ -445,6 +459,24 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         ["test_engineer"],
         ["notification_secretary"],
     ]
+    branch_completed_events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .where(
+                WorkflowEvent.workflow_id == workflow.id,
+                WorkflowEvent.event_type == "BRANCH_COMPLETED",
+            )
+            .order_by(WorkflowEvent.id)
+        )
+    )
+    assert all(
+        json.loads(event.payload_json)["lineage_sealed"] is True
+        for event in branch_completed_events
+    )
+    assert sorted(
+        json.loads(event.payload_json)["upstream_count"]
+        for event in branch_completed_events
+    ) == [0, 0, 1, 2]
 
 
 @pytest.mark.asyncio

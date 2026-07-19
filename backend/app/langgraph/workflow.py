@@ -22,6 +22,7 @@ from app.agent.orchestration import (
     expand_revision_roles,
     merge_reviewer_decision,
     parse_execution_plan,
+    seal_handoff,
 )
 from app.models import Agent, AgentRole, Project, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.services.workflow_saga import (
@@ -567,6 +568,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             else {assignment.role for assignment in plan.assignments}
         )
         revision_round = int(state.get("revision_round", 0)) + int(state.get("manual_revision_count", 0))
+        plan_version = max(1, int(state.get("plan_version", 0)))
         revision_feedback = state.get("revision_feedback", "")
         working_handoffs = dict(previous_handoffs)
         messages = list(state.get("messages", []))
@@ -595,12 +597,19 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 raise RuntimeError(
                     f"Missing upstream handoffs for {assignment.role}: {', '.join(missing_dependencies)}"
                 )
+            upstream_handoff_models = {
+                role: working_handoffs[role]
+                for role in assignment.depends_on
+            }
             upstream_handoffs = [
                 {
-                    "role": working_handoffs[role].role,
-                    "deliverable": working_handoffs[role].deliverable,
-                    "content": working_handoffs[role].content[:12000],
-                    "revision_round": working_handoffs[role].revision_round,
+                    "role": upstream_handoff_models[role].role,
+                    "deliverable": upstream_handoff_models[role].deliverable,
+                    "content": upstream_handoff_models[role].content[:12000],
+                    "revision_round": upstream_handoff_models[role].revision_round,
+                    "output_fingerprint": (
+                        upstream_handoff_models[role].output_fingerprint or None
+                    ),
                 }
                 for role in assignment.depends_on
             ]
@@ -625,12 +634,13 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 ),
                 isolated_usage=True,
             )
-            return AgentHandoff(
-                role=assignment.role,
-                objective=assignment.objective,
-                deliverable=assignment.deliverable,
-                content=content,
+            return seal_handoff(
+                plan,
+                assignment,
+                content,
+                plan_version=plan_version,
                 revision_round=revision_round,
+                upstream_handoffs=upstream_handoff_models,
             )
 
         for wave_number, wave in enumerate(execution_waves, start=1):
@@ -756,6 +766,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                             "workflow_attempt": workflow_attempt,
                             "branch_attempt": branch_attempt,
                             "output_chars": len(handoff.content),
+                            "lineage_sealed": True,
+                            "upstream_count": len(handoff.upstream_fingerprints),
+                            "plan_version": handoff.plan_version,
                         },
                     )
                 for assignment, failure in failures:
@@ -912,7 +925,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         begin_node(db, workflow, "quality_gate", expected_lease_token)
         plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
         handoffs = [AgentHandoff.model_validate(item) for item in state.get("specialist_handoffs", [])]
-        deterministic = evaluate_handoffs(plan, handoffs)
+        deterministic = evaluate_handoffs(
+            plan,
+            handoffs,
+            plan_version=max(1, int(state.get("plan_version", 0))),
+        )
         reviewer_output = await invoke_agent(
             AgentRole.test_engineer,
             (

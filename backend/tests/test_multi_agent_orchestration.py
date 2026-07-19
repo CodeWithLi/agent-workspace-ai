@@ -13,6 +13,7 @@ from app.agent.orchestration import (
     expand_revision_roles,
     merge_reviewer_decision,
     parse_execution_plan,
+    seal_handoff,
 )
 
 
@@ -166,6 +167,80 @@ def test_quality_gate_requires_complete_substantive_handoffs() -> None:
     assert set(failed.revision_roles) == {item.role for item in plan.assignments}
     assert passed.passed is True
     assert passed.score >= 80
+
+
+def test_handoff_lineage_rejects_tampered_or_stale_downstream_evidence() -> None:
+    plan = MultiAgentExecutionPlan.model_validate(
+        {
+            "objective": "形成可验证、可追溯的发布验收方案",
+            "rationale": "运营先定义发布控制，再由测试验证准入条件",
+            "assignments": [
+                {
+                    "role": "operations_analyst",
+                    "objective": "定义灰度、监控、失败信号和回滚边界",
+                    "deliverable": "发布控制清单",
+                    "depends_on": [],
+                },
+                {
+                    "role": "test_engineer",
+                    "objective": "基于发布控制清单验证核心路径和边界场景",
+                    "deliverable": "验收证据清单",
+                    "depends_on": ["operations_analyst"],
+                },
+            ],
+            "success_criteria": ["每项准入条件可复现", "上游结论变化后下游必须重验"],
+        }
+    )
+    operations_assignment, test_assignment = plan.assignments
+    operations = seal_handoff(
+        plan,
+        operations_assignment,
+        "发布窗口、监控阈值、失败信号和回滚条件均已绑定负责人及可复现证据。" * 3,
+        plan_version=3,
+        revision_round=0,
+        upstream_handoffs={},
+    )
+    testing = seal_handoff(
+        plan,
+        test_assignment,
+        "核心路径、边界状态、回滚演练和准入门禁均已引用发布控制清单并完成验证。" * 3,
+        plan_version=3,
+        revision_round=0,
+        upstream_handoffs={"operations_analyst": operations},
+    )
+
+    valid = evaluate_handoffs(plan, [operations, testing], plan_version=3)
+    tampered_operations = operations.model_copy(
+        update={"content": f"{operations.content}未经封存的修改"}
+    )
+    tampered = evaluate_handoffs(
+        plan,
+        [tampered_operations, testing],
+        plan_version=3,
+    )
+    revised_operations = seal_handoff(
+        plan,
+        operations_assignment,
+        f"{operations.content} 已批准的新阈值",
+        plan_version=3,
+        revision_round=1,
+        upstream_handoffs={},
+    )
+    stale = evaluate_handoffs(
+        plan,
+        [revised_operations, testing],
+        plan_version=3,
+    )
+
+    lineage_check = next(check for check in valid.checks if check["name"] == "handoff_lineage")
+    assert valid.passed is True
+    assert lineage_check["passed"] is True
+    assert lineage_check["detail"].startswith("2 sealed handoffs")
+    assert tampered.passed is False
+    assert set(tampered.revision_roles) == {"operations_analyst", "test_engineer"}
+    assert stale.passed is False
+    assert stale.revision_roles == ["test_engineer"]
+    assert any("证据链失效" in issue for issue in stale.issues)
 
 
 def test_reviewer_cannot_override_deterministic_failure_and_can_request_revision() -> None:

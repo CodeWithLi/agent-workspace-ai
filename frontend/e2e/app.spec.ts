@@ -2399,7 +2399,7 @@ test('lists index versions and rolls knowledge search back on desktop and mobile
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
-test('restores live specialist retry states and opens completed handoffs', async ({ page }) => {
+test('restores live specialist retry states and opens completed handoffs', async ({ page }, testInfo) => {
   const liveWorkflow = {
     workflow_id: 150,
     project_id: 2,
@@ -2413,6 +2413,7 @@ test('restores live specialist retry states and opens completed handoffs', async
     status: 'RUNNING',
     current_node: 'specialists',
     state: {
+      plan_version: 2,
       execution_plan: {
         objective: '恢复可观察的专业 Agent 执行现场',
         rationale: '运营与测试并行，瞬时失败只重试测试 Agent。',
@@ -2428,7 +2429,11 @@ test('restores live specialist retry states and opens completed handoffs', async
           objective: '定义发布和回滚边界',
           deliverable: '发布运行手册',
           content: '已完成发布窗口、监控阈值、失败信号和回滚负责人定义。',
-          revision_round: 0
+          revision_round: 0,
+          plan_version: 2,
+          upstream_fingerprints: {},
+          input_fingerprint: 'a'.repeat(64),
+          output_fingerprint: 'b'.repeat(64)
         }
       ],
       quality_gate: {},
@@ -2448,7 +2453,7 @@ test('restores live specialist retry states and opens completed handoffs', async
     { id: 1, workflow_id: 150, node: 'specialists', event_type: 'WAVE_STARTED', message: 'wave started', payload: { wave: 1, roles: ['operations_analyst', 'test_engineer'] }, created_at: '2026-07-19T10:00:02Z' },
     { id: 2, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'operations started', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
     { id: 3, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'test started', payload: { role: 'test_engineer', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
-    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:07Z' },
+    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1, lineage_sealed: true, upstream_count: 0, plan_version: 2 }, created_at: '2026-07-19T10:00:07Z' },
     { id: 5, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_FAILED', message: 'test failed', payload: { role: 'test_engineer', branch_attempt: 1, retryable: true, will_retry: true }, created_at: '2026-07-19T10:00:07Z' },
     { id: 6, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_RETRY_SCHEDULED', message: 'test retry scheduled', payload: { role: 'test_engineer', branch_attempt: 1, next_branch_attempt: 2, retry_delay_seconds: 1 }, created_at: '2026-07-19T10:00:08Z' }
   ]
@@ -2468,7 +2473,20 @@ test('restores live specialist retry states and opens completed handoffs', async
   await expect(testBranch.getByRole('status')).toContainText('等待重试')
   await expect(testBranch.getByRole('status')).toContainText('A1 · 1s')
   await operationsBranch.getByRole('button', { name: '查看运营分析师交接' }).click()
+  const lineage = page.getByRole('region', { name: 'Handoff 证据链' })
+  await expect(lineage.getByText('证据链已封存', { exact: true })).toBeVisible()
+  await expect(lineage.getByText('计划 v2 · 修订 R0', { exact: true })).toBeVisible()
+  await expect(lineage.getByText('独立根分支', { exact: true })).toBeVisible()
+  await expect(lineage.getByText('aaaaaaaaaa → bbbbbbbbbb', { exact: true })).toBeVisible()
   await expect(page.getByText('已完成发布窗口、监控阈值、失败信号和回滚负责人定义。')).toBeVisible()
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+      await page.setViewportSize(viewport)
+      await expect(lineage).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+    }
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
