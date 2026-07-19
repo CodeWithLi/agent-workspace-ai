@@ -9,6 +9,11 @@ from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agent.orchestration import (
+    SPECIALIST_CAPABILITY_LABELS,
+    build_specialist_capability_catalog,
+    infer_required_specialist_capabilities,
+)
 from app.api.deps import get_current_user
 from app.api.routes.projects import get_project_for_user
 from app.core.audit import record_audit
@@ -24,7 +29,7 @@ from app.langgraph.workflow import (
     validate_execution_plan_for_dispatch,
 )
 from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
-from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
+from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPreflightRequest, WorkflowPreflightResponse, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut, WorkflowSpecialistPreflightOut
 from app.services.billing import InsufficientTokensError, apply_token_change
 from app.services.workflows import finish_workflow_compensation, refund_workflow_charge
 from app.rag.service import DuplicateDocumentError, queue_document
@@ -112,6 +117,42 @@ def workflow_state(workflow: WorkflowRun) -> dict:
     except (json.JSONDecodeError, TypeError):
         state = {}
     return state if isinstance(state, dict) else {}
+
+
+def build_workflow_preflight(
+    agent_snapshot: dict,
+    user_input: str,
+) -> WorkflowPreflightResponse:
+    minimum_required = 2
+    catalog = build_specialist_capability_catalog(agent_snapshot)
+    eligible = [profile for profile in catalog if profile.eligible]
+    required = infer_required_specialist_capabilities(user_input)
+    available = {
+        capability
+        for profile in eligible
+        for capability in profile.capabilities
+    }
+    missing = required - available
+    blockers: list[str] = []
+    if len(eligible) < minimum_required:
+        blockers.append(
+            f"至少需要 {minimum_required} 个可用专业 Agent，当前仅 {len(eligible)} 个。"
+        )
+    if missing:
+        labels = "、".join(SPECIALIST_CAPABILITY_LABELS[item] for item in sorted(missing))
+        blockers.append(f"当前团队缺少所需能力：{labels}。")
+    return WorkflowPreflightResponse(
+        ready=not blockers,
+        required_capabilities=sorted(required),
+        available_capabilities=sorted(available),
+        eligible_count=len(eligible),
+        minimum_required=minimum_required,
+        specialists=[
+            WorkflowSpecialistPreflightOut.model_validate(profile.model_dump(mode="json"))
+            for profile in catalog
+        ],
+        blockers=blockers,
+    )
 
 
 def retry_checkpoint_state(db: Session, workflow: WorkflowRun) -> dict:
@@ -206,6 +247,13 @@ async def run_workflow(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Project already has an active workflow: {active.id}",
         )
+    agent_snapshot = snapshot_agent_configs(db, current_user.role)
+    preflight = build_workflow_preflight(agent_snapshot, payload.user_input)
+    if not preflight.ready:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=" ".join(preflight.blockers),
+        )
     try:
         billing = apply_token_change(
             db,
@@ -230,7 +278,7 @@ async def run_workflow(
             initial_state(
                 project,
                 payload.user_input,
-                snapshot_agent_configs(db, current_user.role),
+                agent_snapshot,
                 require_plan_approval=payload.require_plan_approval,
             ),
             ensure_ascii=False,
@@ -259,6 +307,19 @@ async def run_workflow(
     db.commit()
     db.refresh(workflow)
     return to_response(workflow)
+
+
+@router.post("/preflight", response_model=WorkflowPreflightResponse)
+def preflight_workflow(
+    payload: WorkflowPreflightRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> WorkflowPreflightResponse:
+    get_project_for_user(payload.project_id, current_user, db, write=True)
+    return build_workflow_preflight(
+        snapshot_agent_configs(db, current_user.role),
+        payload.user_input,
+    )
 
 
 @router.get("", response_model=list[WorkflowResponse])

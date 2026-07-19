@@ -60,6 +60,7 @@ declare module 'vue' {
     RouterView: typeof import('vue-router')['RouterView']
     TraceComparisonDialog: typeof import('./components/TraceComparisonDialog.vue')['default']
     TraceHealthPanel: typeof import('./components/TraceHealthPanel.vue')['default']
+    WorkflowLaunchDialog: typeof import('./components/WorkflowLaunchDialog.vue')['default']
   }
   export interface GlobalDirectives {
     vLoading: typeof import('element-plus/es')['ElLoadingDirective']

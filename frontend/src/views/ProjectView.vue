@@ -9,7 +9,7 @@
         <el-tag :type="project?.status === 'ARCHIVED' ? 'info' : 'success'">{{ project?.status === 'ARCHIVED' ? '已归档' : '进行中' }}</el-tag>
         <el-tag>{{ roleLabel(project?.current_user_role) }}</el-tag>
         <el-button v-if="project?.current_user_role !== 'viewer'" :icon="Edit" @click="openProjectEdit">编辑项目</el-button>
-        <el-button v-if="project?.current_user_role !== 'viewer' && auth.hasPermission('projects:write')" :icon="MagicStick" type="primary" :loading="running" :disabled="workflowRunLocked" @click="runWorkflow">{{ workflowRunLocked ? '工作流处理中' : '运行多 Agent 工作流' }}</el-button>
+        <el-button v-if="project?.current_user_role !== 'viewer' && auth.hasPermission('projects:write')" :icon="MagicStick" type="primary" :loading="running" :disabled="workflowRunLocked" @click="openWorkflowLaunchDialog">{{ workflowRunLocked ? '工作流处理中' : '运行多 Agent 工作流' }}</el-button>
       </div>
     </div>
 
@@ -435,6 +435,14 @@
       <el-empty v-else description="工作流正在准备产物" />
     </section>
 
+    <WorkflowLaunchDialog
+      v-model="workflowLaunchDialog"
+      :project-id="projectId"
+      :initial-goal="`${project?.name || ''}: ${project?.description || ''}`"
+      :launching="running"
+      @launch="runWorkflow"
+    />
+
     <el-dialog v-model="workflowPauseDialog" title="安全暂停工作流" width="min(520px, 94vw)" destroy-on-close>
       <p class="workflow-pause-dialog-copy">运行会在当前 Agent 节点完成并提交检查点后暂停。</p>
       <el-form label-position="top" @submit.prevent="submitWorkflowPause">
@@ -504,6 +512,7 @@ import { CircleCheck, CircleClose, Clock, Connection, Delete, Edit, Loading, Mag
 import { api, apiBaseURL } from '../api/client'
 import type { Agent, Project, ProjectActivity, ProjectMember, Task, WorkflowEvent, WorkflowRun, WorkflowSagaStep } from '../api/types'
 import MarkdownRenderer from '../components/MarkdownRenderer.vue'
+import WorkflowLaunchDialog from '../components/WorkflowLaunchDialog.vue'
 import { useAuthStore } from '../stores/auth'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
@@ -512,6 +521,11 @@ import 'element-plus/es/components/message-box/style/css.mjs'
 import axios from 'axios'
 import { confirmDestructiveAction } from '../utils/confirm'
 import { useWorkflowEventStream } from '../composables/useWorkflowEventStream'
+import {
+  specialistCapabilityLabel,
+  specialistRoleLabel,
+  specialistToolLabel
+} from '../utils/specialists'
 
 interface WorkflowAssignment {
   role: string
@@ -656,6 +670,7 @@ const activities = ref<ProjectActivity[]>([])
 const memberDialog = ref(false)
 const memberForm = reactive<{ email: string; role: 'editor' | 'viewer' }>({ email: '', role: 'viewer' })
 const workflowRequestId = ref(crypto.randomUUID())
+const workflowLaunchDialog = ref(false)
 const projectEditDialog = ref(false)
 const projectSaving = ref(false)
 const workflowPauseDialog = ref(false)
@@ -1088,51 +1103,6 @@ function workflowEventLabel(eventType: string) {
   }[eventType] || eventType
 }
 
-function specialistRoleLabel(role: string) {
-  return {
-    test_engineer: '测试工程师',
-    operations_analyst: '运营分析师',
-    knowledge_admin: '知识库管理员',
-    notification_secretary: '通知秘书'
-  }[role] || role
-}
-
-function specialistCapabilityLabel(capability: string) {
-  const labels: Record<string, string> = {
-    quality_assurance: '质量保障',
-    acceptance_evidence: '验收证据',
-    boundary_analysis: '边界分析',
-    test_case_generation: '测试用例生成',
-    operational_readiness: '运营就绪',
-    risk_analysis: '风险分析',
-    observability: '可观测性',
-    release_recovery: '发布与恢复',
-    project_analytics: '项目分析',
-    delivery_reporting: '交付报告',
-    knowledge_governance: '知识治理',
-    source_traceability: '来源追溯',
-    knowledge_retrieval: '知识检索',
-    notification_design: '通知设计',
-    delivery_reliability: '触达可靠性',
-    audience_governance: '受众治理',
-    notification_delivery: '通知投递',
-    project_context: '项目上下文'
-  }
-  return labels[capability] || capability
-}
-
-function specialistToolLabel(tool: string) {
-  const labels: Record<string, string> = {
-    context_search: '项目上下文检索',
-    testcase_create: '测试用例生成',
-    analytics_report: '项目分析报告',
-    report_generate: '交付报告生成',
-    knowledge_search: '知识库检索',
-    notification_create: '通知投递'
-  }
-  return labels[tool] || tool
-}
-
 function capabilityProfileFor(role: string) {
   return executionPlan.value?.team_capabilities?.find((profile) => profile.role === role)
 }
@@ -1462,16 +1432,22 @@ async function removeMemberRow(row: unknown) {
   await load()
 }
 
-async function runWorkflow() {
+function openWorkflowLaunchDialog() {
+  if (workflowRunLocked.value) return
+  workflowLaunchDialog.value = true
+}
+
+async function runWorkflow(userInput: string) {
   running.value = true
   try {
     const { data } = await api.post('/workflow/run', {
       project_id: projectId,
-      user_input: `${project.value?.name}: ${project.value?.description}`,
+      user_input: userInput,
       pause_before_report: true,
       require_plan_approval: true,
       request_id: workflowRequestId.value
     }, { suppressErrorToast: true })
+    workflowLaunchDialog.value = false
     workflowEvents.value = []
     applyWorkflow(data)
     await auth.fetchMe()

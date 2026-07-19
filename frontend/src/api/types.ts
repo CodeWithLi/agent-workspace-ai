@@ -584,6 +584,27 @@ export interface WorkflowRun {
   finished_at?: string | null
 }
 
+export interface WorkflowSpecialistPreflight {
+  role: string
+  name: string
+  capabilities: string[]
+  enabled_tools: string[]
+  knowledge_access: boolean
+  concurrency_limit: number
+  eligible: boolean
+  unavailable_reasons: string[]
+}
+
+export interface WorkflowPreflight {
+  ready: boolean
+  required_capabilities: string[]
+  available_capabilities: string[]
+  eligible_count: number
+  minimum_required: number
+  specialists: WorkflowSpecialistPreflight[]
+  blockers: string[]
+}
+
 export interface WorkflowEvent {
   id: number
   workflow_id: number

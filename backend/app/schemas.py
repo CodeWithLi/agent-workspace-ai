@@ -406,6 +406,32 @@ class WorkflowRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=64)
 
 
+class WorkflowPreflightRequest(BaseModel):
+    project_id: int
+    user_input: str = Field(min_length=1, max_length=20000)
+
+
+class WorkflowSpecialistPreflightOut(BaseModel):
+    role: str
+    name: str
+    capabilities: list[str]
+    enabled_tools: list[str]
+    knowledge_access: bool
+    concurrency_limit: int
+    eligible: bool
+    unavailable_reasons: list[str]
+
+
+class WorkflowPreflightResponse(BaseModel):
+    ready: bool
+    required_capabilities: list[str]
+    available_capabilities: list[str]
+    eligible_count: int
+    minimum_required: int
+    specialists: list[WorkflowSpecialistPreflightOut]
+    blockers: list[str]
+
+
 class WorkflowContinueRequest(BaseModel):
     workflow_id: int
     human_feedback: str = Field(default="", max_length=4000)

@@ -376,6 +376,71 @@ function discussionEventStream() {
   return events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('')
 }
 
+function workflowPreflightFixture(goal: string, notificationAvailable = true) {
+  const specialists = [
+    {
+      role: 'test_engineer',
+      name: 'AI测试工程师',
+      capabilities: ['quality_assurance', 'acceptance_evidence', 'boundary_analysis', 'project_context', 'test_case_generation'],
+      enabled_tools: ['context_search', 'testcase_create'],
+      knowledge_access: true,
+      concurrency_limit: 4,
+      eligible: true,
+      unavailable_reasons: []
+    },
+    {
+      role: 'operations_analyst',
+      name: 'AI运营分析师',
+      capabilities: ['operational_readiness', 'risk_analysis', 'observability', 'release_recovery', 'project_context', 'project_analytics', 'delivery_reporting'],
+      enabled_tools: ['context_search', 'analytics_report', 'report_generate'],
+      knowledge_access: true,
+      concurrency_limit: 4,
+      eligible: true,
+      unavailable_reasons: []
+    },
+    {
+      role: 'knowledge_admin',
+      name: 'AI知识库管理员',
+      capabilities: ['knowledge_governance', 'source_traceability', 'project_context', 'knowledge_retrieval'],
+      enabled_tools: ['context_search', 'knowledge_search'],
+      knowledge_access: true,
+      concurrency_limit: 2,
+      eligible: true,
+      unavailable_reasons: []
+    },
+    {
+      role: 'notification_secretary',
+      name: 'AI通知秘书',
+      capabilities: [
+        'notification_design',
+        'delivery_reliability',
+        'audience_governance',
+        'project_context',
+        ...(notificationAvailable ? ['notification_delivery'] : [])
+      ],
+      enabled_tools: ['context_search', ...(notificationAvailable ? ['notification_create'] : [])],
+      knowledge_access: true,
+      concurrency_limit: 2,
+      eligible: true,
+      unavailable_reasons: []
+    }
+  ]
+  const requiresNotification = /通知|邮件|短信|提醒|notification|email/i.test(goal)
+  const requiredCapabilities = requiresNotification ? ['notification_delivery'] : []
+  const blockers = requiresNotification && !notificationAvailable
+    ? ['当前团队缺少所需能力：通知投递。']
+    : []
+  return {
+    ready: blockers.length === 0,
+    required_capabilities: requiredCapabilities,
+    available_capabilities: [...new Set(specialists.flatMap((profile) => profile.capabilities))].sort(),
+    eligible_count: specialists.filter((profile) => profile.eligible).length,
+    minimum_required: 2,
+    specialists,
+    blockers
+  }
+}
+
 async function authenticate(page: Page) {
   await page.addInitScript((sessionUser) => {
     localStorage.setItem('token', 'e2e-token')
@@ -1476,6 +1541,10 @@ async function mockApi(page: Page) {
     else if (method === 'GET' && path === '/dashboard/stats') {
       body = { projects: projects.length, agents: 0, tasks: { TODO: 2, RUNNING: 1, DONE: 3, FAILED: 0 }, documents: 4, recent_activities: ['完成灰度检查'] }
     } else if (method === 'GET' && path === '/requirements') body = requirements
+    else if (method === 'POST' && path === '/workflow/preflight') {
+      const input = request.postDataJSON() as { user_input: string }
+      body = workflowPreflightFixture(input.user_input)
+    }
     else if (method === 'GET' && path === '/workflow') body = url.searchParams.get('project_id') === '2' ? [qualityWorkflow] : [workflow]
     else if (method === 'GET' && path === '/workflow/88') body = workflow
     else if (method === 'GET' && path === '/workflow/99') body = qualityWorkflow
@@ -2760,6 +2829,11 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   }
 
   await page.route(/\/api\/v1\/workflow\?project_id=2$/, (route) => route.fulfill({ json: workflowStarted ? [planWorkflow] : [] }))
+  await page.route(/\/api\/v1\/workflow\/preflight$/, async (route) => {
+    const input = route.request().postDataJSON() as { user_input: string }
+    const notificationAvailable = !/通知|邮件|短信|提醒|notification|email/i.test(input.user_input)
+    await route.fulfill({ json: workflowPreflightFixture(input.user_input, notificationAvailable) })
+  })
   await page.route(/\/api\/v1\/workflow\/run$/, async (route) => {
     runPayload = route.request().postDataJSON() as Record<string, unknown>
     workflowStarted = true
@@ -2837,7 +2911,33 @@ test('reviews, replans and approves an execution plan before specialist dispatch
 
   await page.goto('/projects/2')
   await page.getByRole('button', { name: '运行多 Agent 工作流', exact: true }).click()
-  await expect.poll(() => runPayload.require_plan_approval).toBe(true)
+  const launchDialog = page.getByRole('dialog')
+  await expect(launchDialog.getByRole('heading', { name: '启动工作流', exact: true })).toBeVisible()
+  await expect(launchDialog.getByRole('list', { name: '专业 Agent 资格' }).getByRole('listitem')).toHaveCount(4)
+  await expect(launchDialog.getByText('可以启动', { exact: true })).toBeVisible()
+
+  const goalInput = launchDialog.getByLabel('多 Agent 工作目标')
+  const launchButton = launchDialog.getByRole('button', { name: '启动并进入计划审批', exact: true })
+  await goalInput.fill('生成并发送项目邮件通知')
+  await expect(launchDialog.getByText('当前团队缺少所需能力：通知投递。', { exact: true })).toBeVisible()
+  await expect(launchButton).toBeDisabled()
+
+  if (testInfo.project.name === 'mobile-chromium') {
+    for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+      await page.setViewportSize(viewport)
+      await expect(launchDialog).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+    }
+    await page.setViewportSize({ width: 375, height: 812 })
+  }
+
+  const editedGoal = '设计可灰度发布并可回滚的会员平台'
+  await goalInput.fill(editedGoal)
+  await expect(launchDialog.getByText('可以启动', { exact: true })).toBeVisible()
+  await expect(launchButton).toBeEnabled()
+  await launchButton.click()
+  await expect.poll(() => runPayload.user_input).toBe(editedGoal)
+  expect(runPayload).toMatchObject({ user_input: editedGoal, require_plan_approval: true })
   const workflowReloaded = page.waitForResponse((response) => (
     response.request().method() === 'GET'
     && /\/api\/v1\/workflow\?project_id=2$/.test(response.url())

@@ -589,6 +589,7 @@ def test_workflow_retry_cleans_compensated_checkpoint_and_supports_descendants(d
 async def test_queued_workflow_pause_is_idempotent_and_resume_applies_operator_instruction(
     db: Session,
 ) -> None:
+    ensure_default_agents(db)
     with pytest.raises(ValueError):
         WorkflowPauseRequest(request_id="workflow-empty-pause", reason="   ")
 
@@ -971,6 +972,7 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
 
 @pytest.mark.asyncio
 async def test_queued_workflow_cancel_refunds_idempotently(db: Session) -> None:
+    ensure_default_agents(db)
     user = User(
         email="cancel@example.com",
         name="Cancel",

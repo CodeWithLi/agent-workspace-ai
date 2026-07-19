@@ -81,6 +81,7 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 
 ## 工作流与知识库
 
+- `POST /workflow/preflight`：只读检查给定项目和工作目标所需的专业能力，返回四类专业 Agent 的资格、当前能力视图和阻断原因；不扣费、不创建运行。
 - `POST /workflow/run`
 - `GET /workflow?project_id=...`
 - `GET /workflow/{workflow_id}`
@@ -114,6 +115,8 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 知识库上传和删除要求 `knowledge:write`；查询和检索只要求项目读取权限。上传返回 `202 QUEUED`，相同范围的重复内容返回 `409` 和已有文档 ID。
 
 `POST /knowledge/search` 支持 `project_id`、`document_ids`、`tags`、`source_labels`、`top_k` 和 `min_score`。结果包含稳定 chunk ID、索引版本、标题路径、页码、sparse/dense/hybrid/rerank 分数和引用；个人文档只能由 owner 检索，项目文档要求当前项目成员身份。
+
+`POST /workflow/preflight` 与运行入口使用同一套确定性团队就绪规则：至少两个合格专业 Agent，并覆盖工作目标明确要求的领域能力。`POST /workflow/run` 不信任此前的客户端结果，而是在项目互斥检查后重新冻结配置并复核；只有通过后才预扣额度和创建队列运行，同一次运行继续复用这份快照，避免检查与执行使用不同配置。
 
 `POST /workflow/run` 需要唯一 `request_id`，返回 `202 QUEUED`；创建时按发起者角色冻结 Agent 的 Prompt、模型、版本、启用工具、知识权限和并发限制。Planner 只接收本次冻结快照中合格的专业角色及能力目录；少于两个合格角色，或用户明确要求的知识检索/通知投递能力不可用时不调用模型。设置 `require_plan_approval=true` 后，Planner 生成结构化执行计划即暂停，批准前不会启动专业分支。计划中的每个 assignment 声明 `required_capabilities`、`selection_reason`，并可使用 `depends_on` 引用同一计划内的前置角色；服务端拒绝不可用角色、能力越权、明确领域能力遗漏、重复、自依赖、未知依赖和环，批准及调度时都会复核。缺少能力元数据或依赖字段的旧计划由服务端补齐基线能力并按无依赖处理。同一拓扑波次内并行执行，后续波次接收直接上游 Handoff。新 Handoff 在服务端写入 `plan_version`、`upstream_fingerprints`、`input_fingerprint` 和 `output_fingerprint`；Quality Gate 会根据当前计划和拓扑重新计算这些值，阻断被修改或引用旧上游的交接，缺少这些字段的历史快照保持兼容。Quality Gate 并行调用测试、运营和架构 Reviewer；至少两份合法 JSON 合同构成 quorum，有效评分取中位数且有效票必须多数通过，确定性检查和任一开放阻塞项仍可否决。单 Reviewer 异常按弃权处理，低于 quorum 时 worker 从质量节点重试。每个尝试批次都会原子提交已成功 Handoff 和消息；瞬时分支错误只重试失败角色，确定性错误或局部重试耗尽进入 `specialist_review`。事件公开脱敏的退避、恢复、证据链和 Reviewer 计数，不公开完整指纹或评审正文。创建运行时冻结局部重试参数；每次重规划追加不可变快照并重新审批。同一项目存在活动工作流时拒绝第二条；幂等请求不重复扣费。后台 worker 按节点和专业波次持久化快照，取消或真正终态失败才进入补偿与幂等退款。
 
