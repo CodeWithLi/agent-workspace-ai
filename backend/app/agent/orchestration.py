@@ -19,6 +19,96 @@ ALLOWED_SPECIALIST_ROLES: tuple[SpecialistRole, ...] = (
     "knowledge_admin",
     "notification_secretary",
 )
+SpecialistCapability = Literal[
+    "quality_assurance",
+    "acceptance_evidence",
+    "boundary_analysis",
+    "test_case_generation",
+    "operational_readiness",
+    "risk_analysis",
+    "observability",
+    "release_recovery",
+    "project_analytics",
+    "delivery_reporting",
+    "knowledge_governance",
+    "source_traceability",
+    "knowledge_retrieval",
+    "notification_design",
+    "delivery_reliability",
+    "audience_governance",
+    "notification_delivery",
+    "project_context",
+]
+SPECIALIST_CAPABILITY_LABELS: dict[SpecialistCapability, str] = {
+    "quality_assurance": "质量保障",
+    "acceptance_evidence": "验收证据",
+    "boundary_analysis": "边界分析",
+    "test_case_generation": "测试用例生成",
+    "operational_readiness": "运营就绪",
+    "risk_analysis": "风险分析",
+    "observability": "可观测性",
+    "release_recovery": "发布与恢复",
+    "project_analytics": "项目分析",
+    "delivery_reporting": "交付报告",
+    "knowledge_governance": "知识治理",
+    "source_traceability": "来源追溯",
+    "knowledge_retrieval": "知识检索",
+    "notification_design": "通知设计",
+    "delivery_reliability": "触达可靠性",
+    "audience_governance": "受众治理",
+    "notification_delivery": "通知投递",
+    "project_context": "项目上下文",
+}
+_SPECIALIST_ROLE_NAMES: dict[SpecialistRole, str] = {
+    "test_engineer": "AI测试工程师",
+    "operations_analyst": "AI运营分析师",
+    "knowledge_admin": "AI知识库管理员",
+    "notification_secretary": "AI通知秘书",
+}
+_SPECIALIST_ROLE_CORE_CAPABILITIES: dict[SpecialistRole, tuple[SpecialistCapability, ...]] = {
+    "test_engineer": ("quality_assurance", "acceptance_evidence", "boundary_analysis"),
+    "operations_analyst": (
+        "operational_readiness",
+        "risk_analysis",
+        "observability",
+        "release_recovery",
+    ),
+    "knowledge_admin": ("knowledge_governance", "source_traceability"),
+    "notification_secretary": (
+        "notification_design",
+        "delivery_reliability",
+        "audience_governance",
+    ),
+}
+_SPECIALIST_ROLE_BASELINE_CAPABILITIES: dict[SpecialistRole, tuple[SpecialistCapability, ...]] = {
+    role: capabilities[:2]
+    for role, capabilities in _SPECIALIST_ROLE_CORE_CAPABILITIES.items()
+}
+_SPECIALIST_ROLE_TOOL_CAPABILITIES: dict[
+    SpecialistRole, dict[str, tuple[SpecialistCapability, ...]]
+] = {
+    "test_engineer": {
+        "context_search": ("project_context",),
+        "testcase_create": ("test_case_generation",),
+    },
+    "operations_analyst": {
+        "context_search": ("project_context",),
+        "analytics_report": ("project_analytics",),
+        "report_generate": ("delivery_reporting",),
+    },
+    "knowledge_admin": {
+        "context_search": ("project_context",),
+        "knowledge_search": ("knowledge_retrieval",),
+    },
+    "notification_secretary": {
+        "context_search": ("project_context",),
+        "notification_create": ("notification_delivery",),
+    },
+}
+_SPECIALIST_ROLE_DEFAULT_TOOLS: dict[SpecialistRole, tuple[str, ...]] = {
+    role: tuple(tool_capabilities)
+    for role, tool_capabilities in _SPECIALIST_ROLE_TOOL_CAPABILITIES.items()
+}
 ReviewerPanelRole = Literal["test_engineer", "operations_analyst", "architect"]
 
 
@@ -32,11 +122,174 @@ class ReviewerPanelQuorumError(ValueError):
         )
 
 
+class SpecialistTeamUnavailableError(ValueError):
+    pass
+
+
+class SpecialistCapabilityProfile(BaseModel):
+    role: SpecialistRole
+    name: str = Field(min_length=1, max_length=100)
+    capabilities: list[SpecialistCapability] = Field(default_factory=list, max_length=18)
+    enabled_tools: list[str] = Field(default_factory=list, max_length=10)
+    knowledge_access: bool = False
+    concurrency_limit: int = Field(default=0, ge=0, le=100)
+    eligible: bool = False
+    unavailable_reasons: list[str] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_unique_values(self) -> "SpecialistCapabilityProfile":
+        if len(self.capabilities) != len(set(self.capabilities)):
+            raise ValueError(f"capabilities for {self.role} must be unique")
+        if len(self.enabled_tools) != len(set(self.enabled_tools)):
+            raise ValueError(f"enabled tools for {self.role} must be unique")
+        if self.eligible and self.unavailable_reasons:
+            raise ValueError(f"eligible specialist {self.role} cannot have unavailable reasons")
+        return self
+
+
+def build_specialist_capability_catalog(
+    agent_snapshot: dict[str, dict[str, Any]],
+) -> list[SpecialistCapabilityProfile]:
+    catalog: list[SpecialistCapabilityProfile] = []
+    for role in ALLOWED_SPECIALIST_ROLES:
+        frozen = agent_snapshot.get(role)
+        reasons: list[str] = []
+        if not isinstance(frozen, dict) or not frozen:
+            frozen = {}
+            reasons.append("Agent 配置缺失")
+
+        if "enabled_tools" in frozen:
+            raw_tools = frozen.get("enabled_tools")
+            enabled_tools = (
+                sorted(
+                    {tool for tool in raw_tools if isinstance(tool, str) and tool}
+                    & set(_SPECIALIST_ROLE_TOOL_CAPABILITIES[role])
+                )
+                if isinstance(raw_tools, list)
+                else []
+            )
+        elif frozen:
+            # Older workflow snapshots predate tool freezing; use role defaults when resuming them.
+            enabled_tools = list(_SPECIALIST_ROLE_DEFAULT_TOOLS[role])
+        else:
+            enabled_tools = []
+
+        concurrency_limit = int(frozen.get("concurrency_limit") or 0)
+        if frozen and concurrency_limit < 1:
+            reasons.append("并发额度不可用")
+        if frozen and not enabled_tools:
+            reasons.append("没有启用的专业工具")
+
+        knowledge_access = bool(frozen.get("knowledge_access", True)) if frozen else False
+        capabilities: list[SpecialistCapability] = []
+        if frozen:
+            capabilities.extend(_SPECIALIST_ROLE_CORE_CAPABILITIES[role])
+            for tool in enabled_tools:
+                if tool == "knowledge_search" and not knowledge_access:
+                    continue
+                capabilities.extend(_SPECIALIST_ROLE_TOOL_CAPABILITIES[role].get(tool, ()))
+
+        catalog.append(
+            SpecialistCapabilityProfile(
+                role=role,
+                name=str(frozen.get("name") or _SPECIALIST_ROLE_NAMES[role]),
+                capabilities=list(dict.fromkeys(capabilities)),
+                enabled_tools=enabled_tools,
+                knowledge_access=knowledge_access,
+                concurrency_limit=concurrency_limit,
+                eligible=not reasons,
+                unavailable_reasons=reasons,
+            )
+        )
+    return catalog
+
+
+def default_specialist_capability_catalog() -> list[SpecialistCapabilityProfile]:
+    return build_specialist_capability_catalog(
+        {
+            role: {
+                "name": _SPECIALIST_ROLE_NAMES[role],
+                "enabled_tools": list(_SPECIALIST_ROLE_DEFAULT_TOOLS[role]),
+                "knowledge_access": True,
+                "concurrency_limit": 1,
+            }
+            for role in ALLOWED_SPECIALIST_ROLES
+        }
+    )
+
+
+def ensure_specialist_team_ready(
+    catalog: list[SpecialistCapabilityProfile],
+    minimum: int = 2,
+) -> list[SpecialistCapabilityProfile]:
+    eligible = [profile for profile in catalog if profile.eligible]
+    if len(eligible) >= minimum:
+        return eligible
+    unavailable = "; ".join(
+        f"{profile.role}: {', '.join(profile.unavailable_reasons) or '不可用'}"
+        for profile in catalog
+        if not profile.eligible
+    )
+    raise SpecialistTeamUnavailableError(
+        f"specialist team requires at least {minimum} eligible roles; "
+        f"found {len(eligible)} ({unavailable or 'no specialist profiles'})"
+    )
+
+
+def infer_required_specialist_capabilities(user_input: str) -> set[SpecialistCapability]:
+    normalized = user_input.lower()
+    required: set[SpecialistCapability] = set()
+    if any(
+        keyword in normalized
+        for keyword in (
+            "rag",
+            "知识库",
+            "知识检索",
+            "知识搜索",
+            "文档检索",
+            "文档搜索",
+            "向量检索",
+            "数据治理",
+            "embedding",
+            "knowledge base",
+            "knowledge retrieval",
+            "document search",
+            "document retrieval",
+        )
+    ):
+        required.add("knowledge_retrieval")
+    if any(
+        keyword in normalized
+        for keyword in ("通知", "邮件", "短信", "提醒", "notification", "email")
+    ):
+        required.add("notification_delivery")
+    return required
+
+
+def ensure_specialist_capabilities_available(
+    catalog: list[SpecialistCapabilityProfile],
+    required: set[SpecialistCapability],
+) -> None:
+    available = {
+        capability
+        for profile in ensure_specialist_team_ready(catalog)
+        for capability in profile.capabilities
+    }
+    missing = required - available
+    if missing:
+        raise SpecialistTeamUnavailableError(
+            "specialist team cannot satisfy required capabilities: "
+            f"{', '.join(sorted(missing))}"
+        )
+
+
 class SpecialistAssignment(BaseModel):
     role: SpecialistRole
     objective: str = Field(min_length=4, max_length=500)
     deliverable: str = Field(min_length=2, max_length=200)
     depends_on: list[SpecialistRole] = Field(default_factory=list, max_length=3)
+    required_capabilities: list[SpecialistCapability] = Field(default_factory=list, max_length=8)
+    selection_reason: str = Field(default="", max_length=500)
 
 
 class MultiAgentExecutionPlan(BaseModel):
@@ -44,6 +297,7 @@ class MultiAgentExecutionPlan(BaseModel):
     rationale: str = Field(min_length=4, max_length=1000)
     assignments: list[SpecialistAssignment] = Field(min_length=2, max_length=4)
     success_criteria: list[str] = Field(min_length=2, max_length=10)
+    team_capabilities: list[SpecialistCapabilityProfile] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="after")
     def validate_assignment_graph(self) -> "MultiAgentExecutionPlan":
@@ -72,7 +326,91 @@ class MultiAgentExecutionPlan(BaseModel):
                 raise ValueError("specialist assignment dependencies must form an acyclic graph")
             resolved.update(ready)
             remaining.difference_update(ready)
+        if self.team_capabilities:
+            profile_roles = [profile.role for profile in self.team_capabilities]
+            if len(profile_roles) != len(set(profile_roles)):
+                raise ValueError("specialist capability profile roles must be unique")
+            if set(profile_roles) != role_set:
+                raise ValueError("specialist capability profiles must match assigned roles")
+            profiles = {profile.role: profile for profile in self.team_capabilities}
+            for assignment in self.assignments:
+                profile = profiles[assignment.role]
+                if not profile.eligible:
+                    raise ValueError(f"specialist assignment {assignment.role} is unavailable")
+                unsupported = set(assignment.required_capabilities) - set(profile.capabilities)
+                if unsupported:
+                    raise ValueError(
+                        f"specialist assignment {assignment.role} lacks capabilities: "
+                        f"{', '.join(sorted(unsupported))}"
+                    )
         return self
+
+
+def bind_execution_plan_capabilities(
+    plan: MultiAgentExecutionPlan,
+    catalog: list[SpecialistCapabilityProfile],
+) -> MultiAgentExecutionPlan:
+    ensure_specialist_team_ready(catalog)
+    profiles = {profile.role: profile for profile in catalog}
+    assignments: list[dict[str, Any]] = []
+    selected_profiles: list[SpecialistCapabilityProfile] = []
+    for assignment in plan.assignments:
+        profile = profiles.get(assignment.role)
+        if not profile or not profile.eligible:
+            reasons = ", ".join(profile.unavailable_reasons) if profile else "配置缺失"
+            raise ValueError(f"specialist assignment {assignment.role} is unavailable: {reasons}")
+        required = list(
+            dict.fromkeys(
+                assignment.required_capabilities
+                or _SPECIALIST_ROLE_BASELINE_CAPABILITIES[assignment.role]
+            )
+        )
+        unsupported = set(required) - set(profile.capabilities)
+        if unsupported:
+            raise ValueError(
+                f"specialist assignment {assignment.role} lacks capabilities: "
+                f"{', '.join(sorted(unsupported))}"
+            )
+        reason = assignment.selection_reason.strip() or (
+            f"该分支需要{'、'.join(SPECIALIST_CAPABILITY_LABELS[item] for item in required)}，"
+            f"{profile.name}的冻结能力与当前工具权限匹配。"
+        )
+        assignments.append(
+            {
+                **assignment.model_dump(mode="json"),
+                "required_capabilities": required,
+                "selection_reason": reason,
+            }
+        )
+        selected_profiles.append(profile)
+    return MultiAgentExecutionPlan.model_validate(
+        {
+            **plan.model_dump(mode="json", exclude={"assignments", "team_capabilities"}),
+            "assignments": assignments,
+            "team_capabilities": [profile.model_dump(mode="json") for profile in selected_profiles],
+        }
+    )
+
+
+def validate_execution_plan_capabilities(
+    plan: MultiAgentExecutionPlan,
+    catalog: list[SpecialistCapabilityProfile],
+    required_capabilities: set[SpecialistCapability] | None = None,
+) -> MultiAgentExecutionPlan:
+    bound = bind_execution_plan_capabilities(plan, catalog)
+    required = required_capabilities or set()
+    covered = {
+        capability
+        for assignment in bound.assignments
+        for capability in assignment.required_capabilities
+    }
+    missing = required - covered
+    if missing:
+        raise ValueError(
+            "execution plan does not cover required capabilities: "
+            f"{', '.join(sorted(missing))}"
+        )
+    return bound
 
 
 def build_execution_waves(plan: MultiAgentExecutionPlan) -> list[list[SpecialistAssignment]]:
@@ -407,64 +745,81 @@ def _json_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
-def build_fallback_plan(user_input: str) -> MultiAgentExecutionPlan:
-    normalized = user_input.lower()
-    includes_knowledge = any(
-        keyword in normalized
-        for keyword in (
-            "rag",
-            "知识",
-            "文档",
-            "搜索",
-            "检索",
-            "数据治理",
-            "embedding",
-        )
-    )
-    includes_notification = any(
-        keyword in normalized
-        for keyword in (
-            "通知",
-            "邮件",
-            "短信",
-            "提醒",
-            "调度",
-            "定时",
-            "notification",
-            "email",
-        )
-    )
-    assignments = [
-        SpecialistAssignment(
-            role="test_engineer",
-            objective="审查核心用户路径、边界状态、安全风险和可验证验收标准",
-            deliverable="测试策略、边界场景与验收门禁",
-            depends_on=["knowledge_admin"] if includes_knowledge else [],
-        ),
-        SpecialistAssignment(
-            role="operations_analyst",
-            objective="审查交付成本、可观测性、灰度发布、故障恢复和运营风险",
-            deliverable="发布运行手册与风险缓解方案",
-        ),
+def build_fallback_plan(
+    user_input: str,
+    capability_catalog: list[SpecialistCapabilityProfile] | None = None,
+) -> MultiAgentExecutionPlan:
+    catalog = capability_catalog or default_specialist_capability_catalog()
+    eligible = ensure_specialist_team_ready(catalog)
+    profiles = {profile.role: profile for profile in eligible}
+    required_capabilities = infer_required_specialist_capabilities(user_input)
+    ensure_specialist_capabilities_available(catalog, required_capabilities)
+    includes_knowledge = "knowledge_retrieval" in required_capabilities
+    includes_notification = "notification_delivery" in required_capabilities
+    selected_roles: list[SpecialistRole] = [
+        role
+        for role in ("test_engineer", "operations_analyst")
+        if role in profiles
     ]
-    if includes_knowledge:
+    if (
+        includes_knowledge
+        and "knowledge_admin" in profiles
+        and "knowledge_retrieval" in profiles["knowledge_admin"].capabilities
+    ):
+        selected_roles.append("knowledge_admin")
+    if (
+        includes_notification
+        and "notification_secretary" in profiles
+        and "notification_delivery" in profiles["notification_secretary"].capabilities
+    ):
+        selected_roles.append("notification_secretary")
+    for profile in eligible:
+        if len(selected_roles) >= 2:
+            break
+        if profile.role not in selected_roles:
+            selected_roles.append(profile.role)
+
+    templates: dict[SpecialistRole, tuple[str, str]] = {
+        "test_engineer": (
+            "审查核心用户路径、边界状态、安全风险和可验证验收标准",
+            "测试策略、边界场景与验收门禁",
+        ),
+        "operations_analyst": (
+            "审查交付成本、可观测性、灰度发布、故障恢复和运营风险",
+            "发布运行手册与风险缓解方案",
+        ),
+        "knowledge_admin": (
+            "审查知识来源、索引质量、检索证据、权限边界和内容生命周期",
+            "知识与检索治理方案",
+        ),
+        "notification_secretary": (
+            "审查触达时机、收件人规则、幂等发送、失败重试和用户退订边界",
+            "通知触达与失败恢复方案",
+        ),
+    }
+    assignments: list[SpecialistAssignment] = []
+    for role in selected_roles[:4]:
+        objective, deliverable = templates[role]
+        required = list(_SPECIALIST_ROLE_BASELINE_CAPABILITIES[role])
+        if role == "knowledge_admin" and includes_knowledge:
+            required.append("knowledge_retrieval")
+        if role == "notification_secretary" and includes_notification:
+            required.append("notification_delivery")
+        dependencies: list[SpecialistRole] = []
+        if role == "test_engineer" and includes_knowledge and "knowledge_admin" in selected_roles:
+            dependencies.append("knowledge_admin")
+        if role == "notification_secretary" and "operations_analyst" in selected_roles:
+            dependencies.append("operations_analyst")
         assignments.append(
             SpecialistAssignment(
-                role="knowledge_admin",
-                objective="审查知识来源、索引质量、检索证据、权限边界和内容生命周期",
-                deliverable="知识与检索治理方案",
+                role=role,
+                objective=objective,
+                deliverable=deliverable,
+                depends_on=dependencies,
+                required_capabilities=required,
             )
         )
-    if includes_notification:
-        assignments.append(
-            SpecialistAssignment(
-                role="notification_secretary",
-                objective="审查触达时机、收件人规则、幂等发送、失败重试和用户退订边界",
-                deliverable="通知触达与失败恢复方案",
-                depends_on=["operations_analyst"],
-            )
-        )
-    return MultiAgentExecutionPlan(
+    plan = MultiAgentExecutionPlan(
         objective=f"形成可实施、可验收、可发布的项目交付方案：{user_input[:500]}",
         rationale="独立专业角色按依赖波次并行审查质量与交付风险，再由项目经理统一集成。",
         assignments=assignments,
@@ -474,15 +829,24 @@ def build_fallback_plan(user_input: str) -> MultiAgentExecutionPlan:
             "每个专业结论都有明确交付物和后续负责人",
         ],
     )
+    return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
 
 
-def parse_execution_plan(text: str, user_input: str) -> MultiAgentExecutionPlan:
+def parse_execution_plan(
+    text: str,
+    user_input: str,
+    capability_catalog: list[SpecialistCapabilityProfile] | None = None,
+) -> MultiAgentExecutionPlan:
+    catalog = capability_catalog or default_specialist_capability_catalog()
+    required_capabilities = infer_required_specialist_capabilities(user_input)
+    ensure_specialist_capabilities_available(catalog, required_capabilities)
     for candidate in _json_candidates(text):
         try:
-            return MultiAgentExecutionPlan.model_validate(json.loads(candidate))
-        except (json.JSONDecodeError, ValidationError):
+            plan = MultiAgentExecutionPlan.model_validate(json.loads(candidate))
+            return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
+        except (json.JSONDecodeError, ValidationError, ValueError):
             continue
-    return build_fallback_plan(user_input)
+    return build_fallback_plan(user_input, catalog)
 
 
 def evaluate_handoffs(

@@ -7,6 +7,8 @@ from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
     ReviewerPanelQuorumError,
+    SpecialistTeamUnavailableError,
+    build_specialist_capability_catalog,
     build_fallback_plan,
     build_execution_waves,
     build_task_blueprints,
@@ -16,6 +18,7 @@ from app.agent.orchestration import (
     merge_reviewer_panel,
     parse_execution_plan,
     seal_handoff,
+    validate_execution_plan_capabilities,
 )
 
 
@@ -62,7 +65,185 @@ def test_execution_plan_parser_accepts_valid_json_and_falls_back_safely() -> Non
     assert parsed.objective == "交付可灰度发布的会员增长能力"
     assert [item.role for item in parsed.assignments] == ["test_engineer", "operations_analyst"]
     assert [item.depends_on for item in parsed.assignments] == [[], []]
+    assert all(item.required_capabilities for item in parsed.assignments)
+    assert all(item.selection_reason for item in parsed.assignments)
+    assert [item.role for item in parsed.team_capabilities] == [
+        "test_engineer",
+        "operations_analyst",
+    ]
     assert [item.role for item in fallback.assignments][:2] == ["test_engineer", "operations_analyst"]
+
+
+def test_specialist_catalog_respects_frozen_tool_and_knowledge_permissions() -> None:
+    catalog = build_specialist_capability_catalog(
+        {
+            "test_engineer": {
+                "name": "Test",
+                "enabled_tools": ["context_search", "testcase_create"],
+                "knowledge_access": True,
+                "concurrency_limit": 2,
+            },
+            "operations_analyst": {
+                "name": "Operations",
+                "enabled_tools": ["untrusted_tool"],
+                "knowledge_access": True,
+                "concurrency_limit": 2,
+            },
+            "knowledge_admin": {
+                "name": "Knowledge",
+                "enabled_tools": ["context_search", "knowledge_search"],
+                "knowledge_access": False,
+                "concurrency_limit": 1,
+            },
+            "notification_secretary": {
+                "name": "Notification",
+                "enabled_tools": ["context_search"],
+                "knowledge_access": True,
+                "concurrency_limit": 1,
+            },
+        }
+    )
+    profiles = {profile.role: profile for profile in catalog}
+
+    assert profiles["test_engineer"].eligible is True
+    assert "test_case_generation" in profiles["test_engineer"].capabilities
+    assert profiles["operations_analyst"].eligible is False
+    assert profiles["operations_analyst"].unavailable_reasons == ["没有启用的专业工具"]
+    assert profiles["knowledge_admin"].eligible is True
+    assert "knowledge_governance" in profiles["knowledge_admin"].capabilities
+    assert "knowledge_retrieval" not in profiles["knowledge_admin"].capabilities
+    assert "notification_delivery" not in profiles["notification_secretary"].capabilities
+
+
+def test_capability_aware_parser_rejects_overclaim_and_uses_eligible_fallback() -> None:
+    catalog = build_specialist_capability_catalog(
+        {
+            "test_engineer": {
+                "name": "Test",
+                "enabled_tools": ["testcase_create"],
+                "knowledge_access": True,
+                "concurrency_limit": 1,
+            },
+            "operations_analyst": {
+                "name": "Operations",
+                "enabled_tools": ["analytics_report"],
+                "knowledge_access": True,
+                "concurrency_limit": 1,
+            },
+            "knowledge_admin": {
+                "name": "Knowledge",
+                "enabled_tools": ["context_search", "knowledge_search"],
+                "knowledge_access": False,
+                "concurrency_limit": 1,
+            },
+        }
+    )
+    overclaimed = json.dumps(
+        {
+            "objective": "使用知识检索证据完成发布评审",
+            "rationale": "由知识与运营角色共同交付",
+            "assignments": [
+                {
+                    "role": "knowledge_admin",
+                    "objective": "检索并追溯知识证据",
+                    "deliverable": "知识证据清单",
+                    "required_capabilities": ["knowledge_retrieval"],
+                    "selection_reason": "需要知识检索",
+                },
+                {
+                    "role": "operations_analyst",
+                    "objective": "设计灰度发布与恢复策略",
+                    "deliverable": "发布运行手册",
+                    "required_capabilities": ["operational_readiness"],
+                    "selection_reason": "需要运营就绪能力",
+                },
+            ],
+            "success_criteria": ["证据可追溯", "发布可恢复"],
+        },
+        ensure_ascii=False,
+    )
+
+    plan = parse_execution_plan(overclaimed, "构建会员增长平台", catalog)
+
+    assert plan.objective.startswith("形成可实施、可验收、可发布的项目交付方案")
+    assert [assignment.role for assignment in plan.assignments] == [
+        "test_engineer",
+        "operations_analyst",
+    ]
+    assert all(
+        "knowledge_retrieval" not in assignment.required_capabilities
+        for assignment in plan.assignments
+    )
+
+    with pytest.raises(
+        SpecialistTeamUnavailableError,
+        match="cannot satisfy required capabilities: knowledge_retrieval",
+    ):
+        parse_execution_plan(overclaimed, "构建 RAG 知识检索平台", catalog)
+
+
+def test_capability_validation_requires_two_eligible_specialists() -> None:
+    catalog = build_specialist_capability_catalog(
+        {
+            "test_engineer": {
+                "name": "Test",
+                "enabled_tools": ["testcase_create"],
+                "knowledge_access": True,
+                "concurrency_limit": 1,
+            }
+        }
+    )
+    legacy_plan = MultiAgentExecutionPlan.model_validate(
+        {
+            "objective": "验证只有单角色时拒绝调度",
+            "rationale": "专业团队至少需要两个独立角色",
+            "assignments": [
+                {
+                    "role": "test_engineer",
+                    "objective": "定义质量与验收门禁",
+                    "deliverable": "验收清单",
+                },
+                {
+                    "role": "operations_analyst",
+                    "objective": "定义发布和恢复门禁",
+                    "deliverable": "发布手册",
+                },
+            ],
+            "success_criteria": ["质量可验证", "发布可恢复"],
+        }
+    )
+
+    with pytest.raises(SpecialistTeamUnavailableError, match="at least 2 eligible roles"):
+        validate_execution_plan_capabilities(legacy_plan, catalog)
+
+
+def test_parser_fallback_preserves_explicit_domain_capabilities() -> None:
+    incomplete = json.dumps(
+        {
+            "objective": "交付知识平台",
+            "rationale": "仅安排通用质量和运营分支",
+            "assignments": [
+                {
+                    "role": "test_engineer",
+                    "objective": "验证核心用户路径与验收标准",
+                    "deliverable": "验收清单",
+                },
+                {
+                    "role": "operations_analyst",
+                    "objective": "验证发布恢复与运营风险",
+                    "deliverable": "发布手册",
+                },
+            ],
+            "success_criteria": ["用户路径可验收", "发布过程可恢复"],
+        },
+        ensure_ascii=False,
+    )
+
+    plan = parse_execution_plan(incomplete, "构建带 RAG 文档检索的知识平台")
+
+    assert plan.objective.startswith("形成可实施、可验收、可发布的项目交付方案")
+    knowledge = next(item for item in plan.assignments if item.role == "knowledge_admin")
+    assert "knowledge_retrieval" in knowledge.required_capabilities
 
 
 def test_execution_plan_builds_dependency_waves_and_rejects_invalid_graphs() -> None:

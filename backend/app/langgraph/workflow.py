@@ -16,21 +16,29 @@ from app.agent.concurrency import AgentBusyError, acquire_agent_slot
 from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
+    SpecialistCapabilityProfile,
     build_execution_waves,
+    build_specialist_capability_catalog,
     build_task_blueprints,
+    default_specialist_capability_catalog,
+    ensure_specialist_capabilities_available,
+    ensure_specialist_team_ready,
     evaluate_handoffs,
     expand_revision_roles,
+    infer_required_specialist_capabilities,
     merge_reviewer_panel,
     parse_execution_plan,
     seal_handoff,
+    validate_execution_plan_capabilities,
 )
-from app.models import Agent, AgentRole, Project, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.models import Agent, AgentRole, Project, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.services.workflow_saga import (
     WorkflowLeaseLost,
     execute_report_creation,
     execute_task_creation,
 )
 from app.tools.project_tools import architecture_generate, requirement_create, testcase_create
+from app.tools.registry import allowed_tools_for_role
 
 
 logger = logging.getLogger(__name__)
@@ -83,18 +91,65 @@ class WorkspaceGraphState(ProjectState, total=False):
 STATE_FIELDS = set(ProjectState.__optional_keys__)
 
 
-def snapshot_agent_configs(db: Session) -> dict[str, dict[str, Any]]:
-    return {
-        agent.role.value: {
+def snapshot_agent_configs(
+    db: Session,
+    initiator_role: UserRole | str = UserRole.member,
+) -> dict[str, dict[str, Any]]:
+    user_role = initiator_role.value if isinstance(initiator_role, UserRole) else str(initiator_role)
+    snapshot: dict[str, dict[str, Any]] = {}
+    for agent in db.scalars(select(Agent)):
+        role = agent.role.value
+        links = list(agent.tool_links)
+        if links:
+            configured_tools = {
+                tool.name
+                for tool in links
+                if tool.enabled
+                and user_role in {item.strip() for item in tool.allowed_roles.split(",")}
+            }
+        else:
+            configured_tools = {tool.strip() for tool in agent.tools.split(",") if tool.strip()}
+        enabled_tools = configured_tools & allowed_tools_for_role(role)
+        if not agent.knowledge_access:
+            enabled_tools.discard("knowledge_search")
+        snapshot[role] = {
             "agent_id": agent.id,
             "name": agent.name,
+            "description": agent.description,
             "system_prompt": agent.system_prompt,
             "model": agent.model,
+            "enabled_tools": sorted(enabled_tools),
+            "knowledge_access": agent.knowledge_access,
+            "memory_enable": agent.memory_enable,
+            "human_approval_required": agent.human_approval_required,
             "concurrency_limit": agent.concurrency_limit,
             "prompt_version": agent.current_version,
         }
-        for agent in db.scalars(select(Agent))
-    }
+    return snapshot
+
+
+def specialist_capability_catalog(
+    state: dict[str, Any],
+) -> list[SpecialistCapabilityProfile]:
+    snapshot = state.get("agent_snapshot")
+    if isinstance(snapshot, dict) and snapshot:
+        return build_specialist_capability_catalog(snapshot)
+    return default_specialist_capability_catalog()
+
+
+def validate_execution_plan_for_dispatch(
+    state: dict[str, Any],
+    plan_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_plan = plan_snapshot if plan_snapshot is not None else state.get("execution_plan")
+    plan = MultiAgentExecutionPlan.model_validate(raw_plan)
+    required = infer_required_specialist_capabilities(str(state.get("user_input") or ""))
+    validated = validate_execution_plan_capabilities(
+        plan,
+        specialist_capability_catalog(state),
+        required,
+    )
+    return validated.model_dump(mode="json")
 
 
 def initial_state(
@@ -468,14 +523,23 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
     async def planning_node(state: WorkspaceGraphState) -> dict[str, Any]:
         begin_node(db, workflow, "planning", expected_lease_token)
         revision_feedback = state.get("plan_revision_feedback", "").strip()
+        capability_catalog = specialist_capability_catalog(state)
+        eligible_specialists = ensure_specialist_team_ready(capability_catalog)
+        ensure_specialist_capabilities_available(
+            capability_catalog,
+            infer_required_specialist_capabilities(state["user_input"]),
+        )
+        eligible_roles = ", ".join(profile.role for profile in eligible_specialists)
         planner_output = await invoke_agent(
             AgentRole.project_manager,
             (
                 "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
                 "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
-                "role、objective、deliverable、depends_on。depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
-                "role 仅允许 test_engineer、operations_analyst、"
-                "knowledge_admin、notification_secretary。"
+                "role、objective、deliverable、depends_on、required_capabilities、selection_reason。"
+                "depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
+                f"role 仅允许本次冻结目录中的合格角色：{eligible_roles}。"
+                "required_capabilities 必须是对应角色 capabilities 的非空子集；selection_reason 必须说明"
+                "任务所需能力为何与该角色的冻结能力、工具和知识权限匹配，不得虚构能力。"
                 "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
                 "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
             ),
@@ -486,6 +550,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "architecture": state["architecture"],
                     "product_prd": document_content(state, "PRD"),
                     "system_design": document_content(state, "SYSTEM_DESIGN"),
+                    "eligible_specialists": [
+                        profile.model_dump(mode="json", exclude={"unavailable_reasons"})
+                        for profile in eligible_specialists
+                    ],
                     "prior_execution_plan": state.get("execution_plan") or None,
                     "plan_revision": {
                         "round": int(state.get("plan_revision_count", 0)),
@@ -495,7 +563,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 ensure_ascii=False,
             ),
         )
-        plan = parse_execution_plan(planner_output, state["user_input"])
+        plan = parse_execution_plan(
+            planner_output,
+            state["user_input"],
+            capability_catalog,
+        )
         approval_required = bool(state.get("require_plan_approval", False))
         revisions = state.get("plan_revisions")
         revisions = revisions if isinstance(revisions, list) else []
@@ -532,6 +604,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "plan_version": plan_version,
                 "wave_count": len(execution_waves),
                 "dependency_count": sum(len(assignment.depends_on) for assignment in plan.assignments),
+                "capability_count": sum(
+                    len(assignment.required_capabilities) for assignment in plan.assignments
+                ),
             },
         )
         return complete_node(db, workflow, "planning", state, {
@@ -551,7 +626,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         if state.get("require_plan_approval") and not state.get("plan_approved"):
             raise RuntimeError("Execution plan must be approved before specialist branches start")
         begin_node(db, workflow, "specialists", expected_lease_token)
-        plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
+        plan_snapshot = validate_execution_plan_for_dispatch(state)
+        plan = MultiAgentExecutionPlan.model_validate(plan_snapshot)
         execution_waves = build_execution_waves(plan)
         previous_handoffs = {
             handoff.role: handoff
@@ -914,6 +990,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             for assignment in plan.assignments
         ]
         return complete_node(db, workflow, "specialists", state, {
+            "execution_plan": plan.model_dump(mode="json"),
             "specialist_handoffs": [handoff.model_dump(mode="json") for handoff in merged_handoffs],
             "specialist_failures": [],
             "messages": messages,
@@ -1230,6 +1307,7 @@ async def run_workspace_graph(
     require_plan_approval: bool = False,
     request_id: str | None = None,
 ) -> WorkflowRun:
+    user = db.get(User, user_id)
     workflow = WorkflowRun(
         project_id=project.id,
         user_id=user_id,
@@ -1239,7 +1317,7 @@ async def run_workspace_graph(
             initial_state(
                 project,
                 user_input,
-                snapshot_agent_configs(db),
+                snapshot_agent_configs(db, user.role if user else UserRole.member),
                 require_plan_approval=require_plan_approval,
             ),
             ensure_ascii=False,
@@ -1282,6 +1360,10 @@ async def continue_workspace_graph(
         persisted["execution_plan"] = selected_plan
         persisted["plan_version"] = selected_version
         if decision == "APPROVE":
+            persisted["execution_plan"] = validate_execution_plan_for_dispatch(
+                persisted,
+                selected_plan,
+            )
             persisted["plan_approved"] = True
             workflow.current_node = "specialists"
             record_workflow_event(

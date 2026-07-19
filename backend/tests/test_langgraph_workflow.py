@@ -20,7 +20,7 @@ from app.langgraph.workflow import (
     run_workspace_graph,
     snapshot_agent_configs,
 )
-from app.models import Agent, AgentRole, Project, Report, Task, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
+from app.models import Agent, AgentRole, AgentTool, Project, Report, Task, User, UserRole, WorkflowEvent, WorkflowRun, WorkflowStatus
 from app.services.workflows import process_workflow
 
 
@@ -279,6 +279,21 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
     assert first_state["plan_revisions"][0]["plan"]["objective"] == "首版交付计划"
     assert first_state["plan_revision_count"] == 0
     assert first_state["specialist_handoffs"] == []
+    first_assignments = first_state["execution_plan"]["assignments"]
+    assert all(assignment["required_capabilities"] for assignment in first_assignments)
+    assert all(assignment["selection_reason"] for assignment in first_assignments)
+    assert [profile["role"] for profile in first_state["execution_plan"]["team_capabilities"]] == [
+        "test_engineer",
+        "operations_analyst",
+    ]
+    planner_context = json.loads(planner_prompts[0])
+    assert {profile["role"] for profile in planner_context["eligible_specialists"]} == {
+        "test_engineer",
+        "operations_analyst",
+        "knowledge_admin",
+        "notification_secretary",
+    }
+    assert all(profile["capabilities"] for profile in planner_context["eligible_specialists"])
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == 0
 
     with pytest.raises(ValueError, match="APPROVE or REVISE"):
@@ -1180,3 +1195,28 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
     assert calls
     for _system_prompt, user_prompt in calls:
         assert json.loads(user_prompt)["operator_interventions"] == persisted_state["interventions"]
+
+
+def test_agent_snapshot_freezes_initiator_tool_and_knowledge_permissions(db: Session) -> None:
+    ensure_default_agents(db)
+    notification = db.scalar(
+        select(Agent).where(Agent.role == AgentRole.notification_secretary)
+    )
+    notification_tool = db.scalar(
+        select(AgentTool).where(
+            AgentTool.agent_id == notification.id,
+            AgentTool.name == "notification_create",
+        )
+    )
+    notification_tool.allowed_roles = "admin"
+    knowledge = db.scalar(select(Agent).where(Agent.role == AgentRole.knowledge_admin))
+    knowledge.knowledge_access = False
+    db.flush()
+
+    member_snapshot = snapshot_agent_configs(db, UserRole.member)
+    admin_snapshot = snapshot_agent_configs(db, UserRole.admin)
+
+    assert "notification_create" not in member_snapshot["notification_secretary"]["enabled_tools"]
+    assert "notification_create" in admin_snapshot["notification_secretary"]["enabled_tools"]
+    assert "knowledge_search" not in member_snapshot["knowledge_admin"]["enabled_tools"]
+    assert member_snapshot["knowledge_admin"]["knowledge_access"] is False

@@ -171,6 +171,35 @@
                     <span class="branch-dependency-label">依赖</span>
                     <span class="branch-dependency-roles">{{ assignment.depends_on.map(specialistRoleLabel).join('、') }}</span>
                   </small>
+                  <dl v-if="assignment.required_capabilities?.length" class="branch-capability-summary">
+                    <div>
+                      <dt>所需能力</dt>
+                      <dd>{{ assignment.required_capabilities.map(specialistCapabilityLabel).join(' · ') }}</dd>
+                    </div>
+                  </dl>
+                  <p v-if="assignment.selection_reason" class="branch-selection-reason">
+                    <el-icon aria-hidden="true"><CircleCheck /></el-icon>
+                    <span><strong>组队依据</strong>{{ assignment.selection_reason }}</span>
+                  </p>
+                  <details v-if="capabilityProfileFor(assignment.role)" class="branch-capability-details">
+                    <summary>
+                      能力匹配 {{ assignment.required_capabilities?.length || 0 }}/{{ capabilityProfileFor(assignment.role)?.capabilities.length || 0 }} · 查看冻结配置
+                    </summary>
+                    <dl>
+                      <div>
+                        <dt>已验证能力</dt>
+                        <dd>{{ capabilityProfileFor(assignment.role)?.capabilities.map(specialistCapabilityLabel).join('、') }}</dd>
+                      </div>
+                      <div>
+                        <dt>冻结工具</dt>
+                        <dd>{{ capabilityProfileFor(assignment.role)?.enabled_tools.map(specialistToolLabel).join('、') || '无' }}</dd>
+                      </div>
+                      <div>
+                        <dt>运行约束</dt>
+                        <dd>并发 {{ capabilityProfileFor(assignment.role)?.concurrency_limit }} · 知识访问{{ capabilityProfileFor(assignment.role)?.knowledge_access ? '已启用' : '未启用' }}</dd>
+                      </div>
+                    </dl>
+                  </details>
                 </div>
                 <div class="branch-runtime-actions">
                   <span
@@ -489,6 +518,18 @@ interface WorkflowAssignment {
   objective: string
   deliverable: string
   depends_on?: string[]
+  required_capabilities?: string[]
+  selection_reason?: string
+}
+
+interface WorkflowCapabilityProfile {
+  role: string
+  name: string
+  capabilities: string[]
+  enabled_tools: string[]
+  knowledge_access: boolean
+  concurrency_limit: number
+  eligible: boolean
 }
 
 interface WorkflowExecutionPlan {
@@ -496,6 +537,7 @@ interface WorkflowExecutionPlan {
   rationale: string
   assignments: WorkflowAssignment[]
   success_criteria: string[]
+  team_capabilities?: WorkflowCapabilityProfile[]
 }
 
 interface WorkflowPlanRevision {
@@ -760,6 +802,8 @@ const planVersionChanges = computed(() => {
       prior.objective !== next.objective
       || prior.deliverable !== next.deliverable
       || JSON.stringify(prior.depends_on || []) !== JSON.stringify(next.depends_on || [])
+      || JSON.stringify(prior.required_capabilities || []) !== JSON.stringify(next.required_capabilities || [])
+      || prior.selection_reason !== next.selection_reason
     )
   })
   if (updatedRoles.length) changes.push(`更新分支：${updatedRoles.map(specialistRoleLabel).join('、')}`)
@@ -1051,6 +1095,46 @@ function specialistRoleLabel(role: string) {
     knowledge_admin: '知识库管理员',
     notification_secretary: '通知秘书'
   }[role] || role
+}
+
+function specialistCapabilityLabel(capability: string) {
+  const labels: Record<string, string> = {
+    quality_assurance: '质量保障',
+    acceptance_evidence: '验收证据',
+    boundary_analysis: '边界分析',
+    test_case_generation: '测试用例生成',
+    operational_readiness: '运营就绪',
+    risk_analysis: '风险分析',
+    observability: '可观测性',
+    release_recovery: '发布与恢复',
+    project_analytics: '项目分析',
+    delivery_reporting: '交付报告',
+    knowledge_governance: '知识治理',
+    source_traceability: '来源追溯',
+    knowledge_retrieval: '知识检索',
+    notification_design: '通知设计',
+    delivery_reliability: '触达可靠性',
+    audience_governance: '受众治理',
+    notification_delivery: '通知投递',
+    project_context: '项目上下文'
+  }
+  return labels[capability] || capability
+}
+
+function specialistToolLabel(tool: string) {
+  const labels: Record<string, string> = {
+    context_search: '项目上下文检索',
+    testcase_create: '测试用例生成',
+    analytics_report: '项目分析报告',
+    report_generate: '交付报告生成',
+    knowledge_search: '知识库检索',
+    notification_create: '通知投递'
+  }
+  return labels[tool] || tool
+}
+
+function capabilityProfileFor(role: string) {
+  return executionPlan.value?.team_capabilities?.find((profile) => profile.role === role)
 }
 
 function specialistFailureCategoryLabel(category: WorkflowSpecialistFailure['category']) {
@@ -1868,13 +1952,14 @@ onBeforeUnmount(disposeWorkflowEventStream)
   display: grid;
   min-height: 62px;
   grid-template-columns: 112px minmax(0, 1fr) auto;
-  align-items: center;
+  align-items: start;
   gap: 12px;
   padding: 9px 0;
   border-bottom: 1px solid var(--color-border);
 }
 
 .branch-role {
+  padding-top: 2px;
   color: var(--color-primary);
   font-size: 12px;
   font-weight: 700;
@@ -1910,10 +1995,92 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-weight: 600;
 }
 
+.branch-capability-summary {
+  margin: 3px 0 0;
+}
+
+.branch-capability-summary > div,
+.branch-capability-details dl > div {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.branch-capability-summary dt,
+.branch-capability-summary dd,
+.branch-capability-details dt,
+.branch-capability-details dd {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.branch-capability-summary dt,
+.branch-capability-details dt {
+  color: var(--color-muted-text);
+  font-weight: 650;
+}
+
+.branch-capability-summary dd,
+.branch-capability-details dd {
+  color: var(--color-secondary-text);
+}
+
+.branch-selection-reason {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 3px 0 0;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.branch-selection-reason .el-icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--color-success);
+  font-size: 13px;
+}
+
+.branch-selection-reason strong {
+  margin-right: 6px;
+  color: var(--color-secondary-text);
+  font-size: 11px;
+}
+
+.branch-capability-details {
+  margin-top: 2px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.branch-capability-details summary {
+  min-height: 32px;
+  padding: 7px 2px;
+  color: var(--color-primary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.branch-capability-details summary:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.branch-capability-details dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 1px 0 8px 16px;
+}
+
 .branch-runtime-actions {
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: flex-start;
   justify-content: flex-end;
   gap: 8px;
 }
@@ -2584,6 +2751,17 @@ onBeforeUnmount(disposeWorkflowEventStream)
   .branch-runtime-actions {
     align-items: flex-end;
     flex-direction: column;
+  }
+
+  .branch-capability-details summary {
+    min-height: 44px;
+    padding-block: 12px;
+  }
+
+  .branch-capability-summary > div,
+  .branch-capability-details dl > div {
+    grid-template-columns: 1fr;
+    gap: 1px;
   }
 
   .conflict-positions > div {

@@ -21,6 +21,7 @@ from app.langgraph.workflow import (
     record_workflow_event,
     select_execution_plan_version,
     snapshot_agent_configs,
+    validate_execution_plan_for_dispatch,
 )
 from app.models import Project, Report, User, WorkflowArtifactPublication, WorkflowEvent, WorkflowRun, WorkflowSagaStep, WorkflowStatus
 from app.schemas import WorkflowContinueRequest, WorkflowEventResponse, WorkflowPauseRequest, WorkflowPublicationOut, WorkflowPublishRequest, WorkflowRequest, WorkflowResponse, WorkflowRetryRequest, WorkflowSagaStepOut
@@ -229,7 +230,7 @@ async def run_workflow(
             initial_state(
                 project,
                 payload.user_input,
-                snapshot_agent_configs(db),
+                snapshot_agent_configs(db, current_user.role),
                 require_plan_approval=payload.require_plan_approval,
             ),
             ensure_ascii=False,
@@ -612,6 +613,16 @@ async def continue_workflow(
                 },
             )
         elif payload.decision == "APPROVE":
+            try:
+                state["execution_plan"] = validate_execution_plan_for_dispatch(
+                    state,
+                    selected_plan,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
             state["plan_approved"] = True
             workflow.current_node = "specialists"
             record_workflow_event(

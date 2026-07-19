@@ -862,7 +862,20 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
     assert revision.state["plan_revision_feedback"] == "增加安全评审角色并量化回滚验收标准"
 
     workflow = db.get(WorkflowRun, workflow.id)
-    revised_plan = {**plan, "objective": "增加安全边界后的 v2 方案"}
+    revised_plan = {
+        **plan,
+        "objective": "增加安全边界后的 v2 方案",
+        "assignments": [
+            {
+                **assignment,
+                "required_capabilities": ["knowledge_retrieval"],
+                "selection_reason": "篡改版本虚构测试角色的知识检索能力",
+            }
+            if assignment["role"] == "test_engineer"
+            else assignment
+            for assignment in plan["assignments"]
+        ],
+    }
     revised_state = json.loads(workflow.state_json)
     revised_state["execution_plan"] = revised_plan
     revised_state["plan_version"] = 2
@@ -893,6 +906,20 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
         )
     assert invalid_version.value.status_code == 422
 
+    with pytest.raises(HTTPException) as unsupported_capability:
+        await continue_workflow(
+            WorkflowContinueRequest(
+                workflow_id=workflow.id,
+                decision="APPROVE",
+                plan_version=2,
+            ),
+            http_request("/api/v1/workflow/continue"),
+            user,
+            db,
+        )
+    assert unsupported_capability.value.status_code == 422
+    assert "lacks capabilities: knowledge_retrieval" in unsupported_capability.value.detail
+
     approval = await continue_workflow(
         WorkflowContinueRequest(workflow_id=workflow.id, decision="APPROVE", plan_version=1),
         http_request("/api/v1/workflow/continue"),
@@ -904,6 +931,11 @@ async def test_plan_review_validates_decisions_and_records_governance(db: Sessio
     assert approval.state["plan_approved"] is True
     assert approval.state["plan_version"] == 1
     assert approval.state["execution_plan"]["objective"] == plan["objective"]
+    assert all(
+        assignment["required_capabilities"]
+        for assignment in approval.state["execution_plan"]["assignments"]
+    )
+    assert len(approval.state["execution_plan"]["team_capabilities"]) == 2
     assert len(approval.state["plan_revisions"]) == 2
     assert db.scalar(
         select(func.count(WorkflowEvent.id)).where(

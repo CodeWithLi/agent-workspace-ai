@@ -2675,18 +2675,55 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
-test('reviews, replans and approves an execution plan before specialist dispatch', async ({ page }) => {
+test('reviews, replans and approves an execution plan before specialist dispatch', async ({ page }, testInfo) => {
   let workflowStarted = false
   let runPayload: Record<string, unknown> = {}
   const decisions: Array<Record<string, unknown>> = []
+  const teamCapabilities = [
+    {
+      role: 'test_engineer',
+      name: 'AI测试工程师',
+      capabilities: ['quality_assurance', 'acceptance_evidence', 'boundary_analysis', 'test_case_generation', 'project_context'],
+      enabled_tools: ['context_search', 'testcase_create'],
+      knowledge_access: true,
+      concurrency_limit: 4,
+      eligible: true,
+      unavailable_reasons: []
+    },
+    {
+      role: 'operations_analyst',
+      name: 'AI运营分析师',
+      capabilities: ['operational_readiness', 'risk_analysis', 'observability', 'release_recovery', 'project_analytics', 'delivery_reporting', 'project_context'],
+      enabled_tools: ['analytics_report', 'context_search', 'report_generate'],
+      knowledge_access: true,
+      concurrency_limit: 4,
+      eligible: true,
+      unavailable_reasons: []
+    }
+  ]
   const initialPlan = {
     objective: '先验证可恢复交付，再启动专业 Agent',
     rationale: '测试先确认验收证据，运营再基于测试结论设计灰度和恢复。',
     assignments: [
-      { role: 'test_engineer', objective: '验证边界场景与验收证据', deliverable: '可复现验收清单', depends_on: [] },
-      { role: 'operations_analyst', objective: '基于测试结论验证灰度发布与故障恢复', deliverable: '发布与回滚手册', depends_on: ['test_engineer'] }
+      {
+        role: 'test_engineer',
+        objective: '验证边界场景与验收证据',
+        deliverable: '可复现验收清单',
+        depends_on: [],
+        required_capabilities: ['quality_assurance', 'acceptance_evidence'],
+        selection_reason: '该分支需要质量保障与验收证据，冻结工具权限已满足。'
+      },
+      {
+        role: 'operations_analyst',
+        objective: '基于测试结论验证灰度发布与故障恢复',
+        deliverable: '发布与回滚手册',
+        depends_on: ['test_engineer'],
+        required_capabilities: ['operational_readiness', 'release_recovery'],
+        selection_reason: '该分支需要运营就绪与发布恢复能力，冻结工具权限已满足。'
+      }
     ],
-    success_criteria: ['核心路径具备可复现证据', '失败场景具备负责人和回滚条件']
+    success_criteria: ['核心路径具备可复现证据', '失败场景具备负责人和回滚条件'],
+    team_capabilities: teamCapabilities
   }
   let planWorkflow = {
     workflow_id: 140,
@@ -2814,6 +2851,14 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   const firstWave = page.getByLabel('执行计划第 1 波')
   const secondWave = page.getByLabel('执行计划第 2 波')
   await expect(firstWave.getByText('测试工程师', { exact: true })).toBeVisible()
+  await expect(firstWave.getByText('所需能力', { exact: true })).toBeVisible()
+  await expect(firstWave.getByText('质量保障 · 验收证据', { exact: true })).toBeVisible()
+  const selectionReason = firstWave.locator('.branch-selection-reason')
+  await expect(selectionReason).toContainText('组队依据')
+  await expect(selectionReason).toContainText('该分支需要质量保障与验收证据，冻结工具权限已满足。')
+  await firstWave.getByText('能力匹配 2/5 · 查看冻结配置', { exact: true }).click()
+  await expect(firstWave.getByText('项目上下文检索、测试用例生成', { exact: true })).toBeVisible()
+  await expect(firstWave.getByText('并发 4 · 知识访问已启用', { exact: true })).toBeVisible()
   await expect(secondWave.getByText('运营分析师', { exact: true })).toBeVisible()
   await expect(secondWave.getByText('依赖', { exact: true })).toBeVisible()
   await expect(secondWave.getByText('测试工程师', { exact: true })).toBeVisible()
@@ -2840,6 +2885,13 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   await page.getByRole('button', { name: '批准 v1 并启动 2 个分支', exact: true }).click()
   await expect(page.getByText('已批准', { exact: true })).toBeVisible()
   expect(decisions[1]).toMatchObject({ decision: 'APPROVE', human_feedback: '', plan_version: 1 })
+  if (testInfo.project.name === 'mobile-chromium') {
+    for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+      await page.setViewportSize(viewport)
+      await expect(page.getByLabel('多 Agent 执行计划')).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+    }
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
