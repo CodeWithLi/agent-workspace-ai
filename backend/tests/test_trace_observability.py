@@ -951,6 +951,7 @@ def test_trace_detail_pairs_node_retries_and_legacy_starts_by_workflow_attempt(d
         ("FAILED", 10_000),
         ("COMPLETED", 20_000),
     ]
+    assert {span.agent_role for span in quality_spans} == {"reviewer_panel"}
     assert [span.payload["workflow_attempt"] for span in quality_spans] == [1, 2]
     tester_span = next(span for span in detail.spans if span.node == "tester")
     assert tester_span.status == "COMPLETED"

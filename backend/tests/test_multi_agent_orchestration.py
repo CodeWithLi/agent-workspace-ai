@@ -6,12 +6,14 @@ from pydantic import ValidationError
 from app.agent.orchestration import (
     AgentHandoff,
     MultiAgentExecutionPlan,
+    ReviewerPanelQuorumError,
     build_fallback_plan,
     build_execution_waves,
     build_task_blueprints,
     evaluate_handoffs,
     expand_revision_roles,
     merge_reviewer_decision,
+    merge_reviewer_panel,
     parse_execution_plan,
     seal_handoff,
 )
@@ -365,3 +367,158 @@ def test_blocking_collaboration_ledger_forces_targeted_revision() -> None:
     assert resolved.score == 96
     assert resolved.conflicts[0].status == "RESOLVED"
     assert resolved.conflicts[0].resolution.startswith("核心冒烟通过后")
+
+
+def test_reviewer_panel_uses_structured_majority_and_preserves_dissent() -> None:
+    plan = build_fallback_plan("设计可灰度发布并可回滚的项目交付流程")
+    handoffs = [
+        AgentHandoff(
+            role=assignment.role,
+            objective=assignment.objective,
+            deliverable=assignment.deliverable,
+            content=(
+                "明确范围、关键决策、依赖、边界场景、失败信号、验收证据和后续负责人。"
+                "同时给出灰度发布、回滚条件、监控阈值和可复现的验证步骤。"
+                "每项结论都关联成功标准、证据来源、完成时限和可审计责任边界。"
+            ),
+            revision_round=0,
+        )
+        for assignment in plan.assignments
+    ]
+    deterministic = evaluate_handoffs(plan, handoffs)
+    shared_decision = {
+        "title": "发布策略",
+        "outcome": "采用分阶段灰度发布。",
+        "rationale": "降低首发风险并保留快速回滚窗口。",
+        "source_roles": ["test_engineer", "operations_analyst"],
+        "confidence": 0.91,
+    }
+
+    def reviewer_output(*, passed: bool, score: int, summary: str) -> str:
+        return json.dumps(
+            {
+                "passed": passed,
+                "score": score,
+                "issues": [] if passed else ["架构依赖仍需收敛"],
+                "revision_roles": [] if passed else ["operations_analyst"],
+                "summary": summary,
+                "decisions": [shared_decision],
+                "conflicts": [],
+                "open_questions": [],
+            },
+            ensure_ascii=False,
+        )
+
+    panel = merge_reviewer_panel(
+        deterministic,
+        {
+            "test_engineer": reviewer_output(
+                passed=True,
+                score=94,
+                summary="质量与安全证据满足门禁。",
+            ),
+            "operations_analyst": reviewer_output(
+                passed=True,
+                score=88,
+                summary="发布和回滚方案可执行。",
+            ),
+            "architect": reviewer_output(
+                passed=False,
+                score=72,
+                summary="少数意见：架构依赖仍可收敛。",
+            ),
+        },
+        plan,
+    )
+
+    assert panel.passed is True
+    assert panel.score == 88
+    assert panel.reviewer_quorum == 2
+    assert panel.reviewer_valid_count == 3
+    assert panel.reviewer_pass_count == 2
+    assert panel.reviewer_disagreement_count == 1
+    assert [reviewer.role for reviewer in panel.reviewers] == [
+        "test_engineer",
+        "operations_analyst",
+        "architect",
+    ]
+    assert [reviewer.passed for reviewer in panel.reviewers] == [True, True, False]
+    assert len(panel.decisions) == 1
+    assert panel.revision_roles == []
+    assert "架构依赖仍需收敛" in panel.issues
+
+
+def test_reviewer_panel_blocks_any_open_blocker_and_requires_quorum() -> None:
+    plan = build_fallback_plan("设计可灰度发布并可回滚的项目交付流程")
+    handoffs = [
+        AgentHandoff(
+            role=assignment.role,
+            objective=assignment.objective,
+            deliverable=assignment.deliverable,
+            content=(
+                "范围、决策、依赖、风险、边界、验收证据和负责人完整。"
+                "灰度、监控、失败信号、回滚条件和复现步骤均已确认。" * 2
+            ),
+            revision_round=0,
+        )
+        for assignment in plan.assignments
+    ]
+    deterministic = evaluate_handoffs(plan, handoffs)
+    passing = json.dumps(
+        {
+            "passed": True,
+            "score": 93,
+            "issues": [],
+            "revision_roles": [],
+            "summary": "同意放行。",
+            "decisions": [],
+            "conflicts": [],
+            "open_questions": [],
+        },
+        ensure_ascii=False,
+    )
+    blocker = json.dumps(
+        {
+            "passed": True,
+            "score": 96,
+            "issues": [],
+            "revision_roles": [],
+            "summary": "存在尚未闭合的发布责任。",
+            "decisions": [],
+            "conflicts": [],
+            "open_questions": [
+                {
+                    "question": "谁负责确认灰度扩容阈值？",
+                    "owner_role": "operations_analyst",
+                    "blocking": True,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    blocked = merge_reviewer_panel(
+        deterministic,
+        {
+            "test_engineer": passing,
+            "operations_analyst": passing,
+            "architect": blocker,
+        },
+        plan,
+    )
+    with pytest.raises(ReviewerPanelQuorumError):
+        merge_reviewer_panel(
+            deterministic,
+            {
+                "test_engineer": passing,
+                "operations_analyst": "not-json",
+                "architect": "also-not-json",
+            },
+            plan,
+        )
+
+    assert blocked.passed is False
+    assert blocked.score == 79
+    assert blocked.revision_roles == ["operations_analyst"]
+    assert blocked.open_questions[0].blocking is True
+    assert blocked.reviewer_pass_count == 2

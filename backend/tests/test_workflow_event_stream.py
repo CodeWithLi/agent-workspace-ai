@@ -53,6 +53,11 @@ def add_event(db: Session, workflow: WorkflowRun, event_type: str, sequence: int
                 "retryable_count": 1,
                 "lineage_sealed": True,
                 "upstream_count": sequence - 1,
+                "reviewer_count": 3,
+                "reviewer_valid_count": 3,
+                "reviewer_quorum": 2,
+                "reviewer_pass_count": sequence,
+                "reviewer_disagreement_count": 3 - sequence,
                 "input_fingerprint": "a" * 64,
                 "output_fingerprint": "b" * 64,
                 "error": f"secret-error-{sequence}",
@@ -78,8 +83,8 @@ def test_event_history_returns_latest_window_in_chronological_order_and_is_tenan
 
     assert [event.id for event in history] == [events[1].id, events[2].id]
     assert [event.payload for event in history] == [
-        {"plan_version": 2, "decision_count": 2, "conflict_count": 1, "open_blocker_count": 0, "recovery_count": 2, "retryable_count": 1, "lineage_sealed": True, "upstream_count": 1},
-        {"plan_version": 3, "decision_count": 3, "conflict_count": 1, "open_blocker_count": 0, "recovery_count": 3, "retryable_count": 1, "lineage_sealed": True, "upstream_count": 2},
+        {"plan_version": 2, "decision_count": 2, "conflict_count": 1, "open_blocker_count": 0, "recovery_count": 2, "retryable_count": 1, "lineage_sealed": True, "upstream_count": 1, "reviewer_count": 3, "reviewer_valid_count": 3, "reviewer_quorum": 2, "reviewer_pass_count": 2, "reviewer_disagreement_count": 1},
+        {"plan_version": 3, "decision_count": 3, "conflict_count": 1, "open_blocker_count": 0, "recovery_count": 3, "retryable_count": 1, "lineage_sealed": True, "upstream_count": 2, "reviewer_count": 3, "reviewer_valid_count": 3, "reviewer_quorum": 2, "reviewer_pass_count": 3, "reviewer_disagreement_count": 0},
     ]
     assert "secret-" not in "".join(event.model_dump_json() for event in history)
     with pytest.raises(HTTPException) as hidden:
@@ -119,7 +124,7 @@ async def test_workflow_sse_resumes_after_header_cursor_and_emits_reconnect_cont
     assert f"id: {terminal.id}" in body
     assert f"id: {first.id}\n" not in body
     assert '"event_type":"COMPLETED"' in body
-    assert '"payload":{"plan_version":2,"decision_count":2,"conflict_count":1,"open_blocker_count":0,"recovery_count":2,"retryable_count":1,"lineage_sealed":true,"upstream_count":1}' in body
+    assert '"payload":{"plan_version":2,"decision_count":2,"conflict_count":1,"open_blocker_count":0,"recovery_count":2,"retryable_count":1,"lineage_sealed":true,"upstream_count":1,"reviewer_count":3,"reviewer_valid_count":3,"reviewer_quorum":2,"reviewer_pass_count":2,"reviewer_disagreement_count":1}' in body
     assert "secret-" not in body
 
 

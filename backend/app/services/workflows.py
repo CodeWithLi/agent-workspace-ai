@@ -8,6 +8,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from app.agent.orchestration import ReviewerPanelQuorumError
 from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -306,16 +307,25 @@ async def process_workflow(db: Session, workflow_id: int, *, claimed: bool = Fal
         workflow = db.get(WorkflowRun, workflow_id)
         workflow.locked_at = None
         workflow.error = str(exc)[:2000]
+        failure_payload = {
+            "workflow_attempt": workflow.attempt_count,
+            "error": workflow.error,
+        }
+        if isinstance(exc, ReviewerPanelQuorumError):
+            failure_payload.update(
+                {
+                    "reviewer_count": exc.panel_count,
+                    "reviewer_valid_count": exc.valid_count,
+                    "reviewer_quorum": exc.quorum,
+                }
+            )
         record_workflow_event(
             db,
             workflow,
             "NODE_FAILED",
             f"Failed {workflow.current_node}",
             node=workflow.current_node,
-            payload={
-                "workflow_attempt": workflow.attempt_count,
-                "error": workflow.error,
-            },
+            payload=failure_payload,
         )
         if workflow.attempt_count < workflow.max_attempts:
             workflow.status = WorkflowStatus.queued

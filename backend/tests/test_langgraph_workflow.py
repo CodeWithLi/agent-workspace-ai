@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.llm import LLMRetryableError, get_llm
+from app.agent.orchestration import AgentHandoff, build_fallback_plan
 from app.agent.service import ensure_default_agents
 from app.langgraph.workflow import (
     WorkflowPauseRequested,
@@ -140,7 +141,23 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
     db.add(project)
     db.commit()
 
-    async def fake_chat(system_prompt: str, _user_prompt: str, *_args) -> str:
+    async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
+        if "交接质量评审 Agent" in system_prompt:
+            if json.loads(user_prompt)["reviewer_role"] == "architect":
+                raise TimeoutError("architect reviewer unavailable")
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 95,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "独立评审通过。",
+                    "decisions": [],
+                    "conflicts": [],
+                    "open_questions": [],
+                },
+                ensure_ascii=False,
+            )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n已确认。"
         return f"# {system_prompt.split('，')[0]} 输出"
@@ -159,6 +176,13 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
     assert len(paused_state["execution_plan"]["assignments"]) >= 2
     assert len(paused_state["specialist_handoffs"]) == len(paused_state["execution_plan"]["assignments"])
     assert paused_state["quality_gate"]["passed"] is True
+    assert paused_state["quality_gate"]["reviewer_valid_count"] == 2
+    assert paused_state["quality_gate"]["reviewer_pass_count"] == 2
+    assert [reviewer["structured"] for reviewer in paused_state["quality_gate"]["reviewers"]] == [
+        True,
+        True,
+        False,
+    ]
     task_count = len(paused_state["tasks"])
     assert task_count >= 4
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == task_count
@@ -851,49 +875,57 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
     db.add(project)
     db.commit()
     review_calls = 0
+    active_reviewers = 0
+    max_parallel_reviewers = 0
     active_branches = 0
     max_parallel_branches = 0
 
     async def fake_chat(system_prompt: str, _user_prompt: str, *_args) -> str:
-        nonlocal active_branches, max_parallel_branches, review_calls
+        nonlocal active_branches, active_reviewers, max_parallel_branches, max_parallel_reviewers, review_calls
         if "动态编排器" in system_prompt:
             return "invalid JSON uses the validated fallback plan"
         if "交接质量评审 Agent" in system_prompt:
             review_calls += 1
-            passed = review_calls >= 3
-            return json.dumps(
-                {
-                    "passed": passed,
-                    "score": 95 if passed else 55,
-                    "issues": [] if passed else ["缺少可复现验收证据"],
-                    "revision_roles": [] if passed else ["test_engineer", "operations_analyst"],
-                    "summary": "质量门禁通过" if passed else "需要补充证据后复审",
-                    "decisions": [
-                        {
-                            "title": "发布准入",
-                            "outcome": "验收证据和回滚负责人同时就绪后开始灰度。",
-                            "rationale": "将质量证据与运营恢复能力绑定为同一门禁。",
-                            "source_roles": ["test_engineer", "operations_analyst"],
-                            "confidence": 0.94,
-                        }
-                    ] if passed else [],
-                    "conflicts": [] if passed else [
-                        {
-                            "topic": "验收证据负责人",
-                            "positions": [
-                                {"role": "test_engineer", "position": "由测试工程师维护。"},
-                                {"role": "operations_analyst", "position": "由发布负责人维护。"},
-                            ],
-                            "status": "OPEN",
-                            "resolution": "",
-                            "blocking": True,
-                            "revision_roles": ["test_engineer", "operations_analyst"],
-                        }
-                    ],
-                    "open_questions": [],
-                },
-                ensure_ascii=False,
-            )
+            passed = review_calls >= 7
+            active_reviewers += 1
+            max_parallel_reviewers = max(max_parallel_reviewers, active_reviewers)
+            try:
+                await asyncio.sleep(0.01)
+                return json.dumps(
+                    {
+                        "passed": passed,
+                        "score": 95 if passed else 55,
+                        "issues": [] if passed else ["缺少可复现验收证据"],
+                        "revision_roles": [] if passed else ["test_engineer", "operations_analyst"],
+                        "summary": "质量门禁通过" if passed else "需要补充证据后复审",
+                        "decisions": [
+                            {
+                                "title": "发布准入",
+                                "outcome": "验收证据和回滚负责人同时就绪后开始灰度。",
+                                "rationale": "将质量证据与运营恢复能力绑定为同一门禁。",
+                                "source_roles": ["test_engineer", "operations_analyst"],
+                                "confidence": 0.94,
+                            }
+                        ] if passed else [],
+                        "conflicts": [] if passed else [
+                            {
+                                "topic": "验收证据负责人",
+                                "positions": [
+                                    {"role": "test_engineer", "position": "由测试工程师维护。"},
+                                    {"role": "operations_analyst", "position": "由发布负责人维护。"},
+                                ],
+                                "status": "OPEN",
+                                "resolution": "",
+                                "blocking": True,
+                                "revision_roles": ["test_engineer", "operations_analyst"],
+                            }
+                        ],
+                        "open_questions": [],
+                    },
+                    ensure_ascii=False,
+                )
+            finally:
+                active_reviewers -= 1
         if "专业交接 Agent" in system_prompt:
             active_branches += 1
             max_parallel_branches = max(max_parallel_branches, active_branches)
@@ -952,6 +984,17 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
     assert revised_state["quality_gate"]["passed"] is True
     assert revised_state["quality_gate"]["decisions"][0]["title"] == "发布准入"
     assert revised_state["quality_gate"]["conflicts"] == []
+    assert revised_state["quality_gate"]["reviewer_quorum"] == 2
+    assert revised_state["quality_gate"]["reviewer_valid_count"] == 3
+    assert revised_state["quality_gate"]["reviewer_pass_count"] == 3
+    assert revised_state["quality_gate"]["reviewer_disagreement_count"] == 0
+    assert [reviewer["role"] for reviewer in revised_state["quality_gate"]["reviewers"]] == [
+        "test_engineer",
+        "operations_analyst",
+        "architect",
+    ]
+    assert review_calls == 9
+    assert max_parallel_reviewers == 3
     passed_event = db.scalar(
         select(WorkflowEvent)
         .where(
@@ -964,13 +1007,102 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
     passed_payload = json.loads(passed_event.payload_json)
     assert {
         key: passed_payload[key]
-        for key in ("decision_count", "conflict_count", "open_blocker_count")
+        for key in (
+            "decision_count",
+            "conflict_count",
+            "open_blocker_count",
+            "reviewer_count",
+            "reviewer_valid_count",
+            "reviewer_quorum",
+            "reviewer_pass_count",
+            "reviewer_disagreement_count",
+        )
     } == {
         "decision_count": 1,
         "conflict_count": 0,
         "open_blocker_count": 0,
+        "reviewer_count": 3,
+        "reviewer_valid_count": 3,
+        "reviewer_quorum": 2,
+        "reviewer_pass_count": 3,
+        "reviewer_disagreement_count": 0,
     }
     assert db.scalar(select(func.count(Task.id)).where(Task.project_id == project.id)) == len(revised_state["tasks"])
+
+
+@pytest.mark.asyncio
+async def test_reviewer_quorum_failure_retries_quality_node_with_public_counts(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(email="reviewer-quorum@example.com", name="Reviewer Quorum", password_hash="hash")
+    db.add(user)
+    db.flush()
+    project = Project(name="Reviewer Quorum", owner_id=user.id)
+    db.add(project)
+    db.flush()
+    plan = build_fallback_plan("设计可灰度发布并可回滚的项目交付流程")
+    state = initial_state(project, "设计可灰度发布并可回滚的项目交付流程")
+    state.update(
+        {
+            "execution_plan": plan.model_dump(mode="json"),
+            "plan_version": 1,
+            "plan_approved": True,
+            "specialist_handoffs": [
+                AgentHandoff(
+                    role=assignment.role,
+                    objective=assignment.objective,
+                    deliverable=assignment.deliverable,
+                    content=(
+                        "范围、决策、依赖、风险、边界、验收证据和负责人完整；"
+                        "灰度、监控、失败信号、回滚条件和复现步骤均已确认。" * 2
+                    ),
+                ).model_dump(mode="json")
+                for assignment in plan.assignments
+            ],
+            "current_node": "quality_gate",
+        }
+    )
+    workflow = WorkflowRun(
+        project_id=project.id,
+        user_id=user.id,
+        status=WorkflowStatus.running,
+        current_node="quality_gate",
+        state_json=json.dumps(state, ensure_ascii=False),
+        pause_before_report=True,
+        attempt_count=1,
+        max_attempts=2,
+        lease_token="reviewer-quorum-lease",
+    )
+    db.add(workflow)
+    db.commit()
+
+    async def invalid_reviewer(*_args) -> str:
+        return "not-json"
+
+    monkeypatch.setattr(get_llm(), "chat", invalid_reviewer)
+
+    result = await process_workflow(db, workflow.id, claimed=True)
+
+    assert result.status == WorkflowStatus.queued
+    assert result.current_node == "quality_gate"
+    assert "reviewer panel quorum unavailable" in result.error
+    failed_event = db.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "NODE_FAILED",
+        )
+        .order_by(WorkflowEvent.id.desc())
+    )
+    assert failed_event is not None
+    assert json.loads(failed_event.payload_json) == {
+        "workflow_attempt": 1,
+        "error": "reviewer panel quorum unavailable: 0/2 structured outputs",
+        "reviewer_count": 3,
+        "reviewer_valid_count": 0,
+        "reviewer_quorum": 2,
+    }
 
 
 @pytest.mark.asyncio
@@ -1012,6 +1144,20 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         calls.append((system_prompt, user_prompt))
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 95,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "独立评审合同有效。",
+                    "decisions": [],
+                    "conflicts": [],
+                    "open_questions": [],
+                },
+                ensure_ascii=False,
+            )
         if "产品经理" in system_prompt:
             return "PRODUCT-ARTIFACT"
         return "SPECIALIST-ARTIFACT"

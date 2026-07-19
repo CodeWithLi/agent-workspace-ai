@@ -99,7 +99,7 @@ NODE_AGENT_ROLES = {
     "product": "product_manager",
     "architect": "architect",
     "planning": "project_manager",
-    "quality_gate": "test_engineer",
+    "quality_gate": "reviewer_panel",
     "project_manager": "project_manager",
     "tester": "test_engineer",
     "report": "operations_analyst",
@@ -114,6 +114,7 @@ ROLE_LABELS = {
     "knowledge_admin": "AI知识库管理员",
     "notification_secretary": "AI通知秘书",
     "operations_analyst": "AI运营分析师",
+    "reviewer_panel": "独立评审团",
 }
 
 @dataclass

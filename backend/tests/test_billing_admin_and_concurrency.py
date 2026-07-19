@@ -252,6 +252,20 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
 
     async def fake_chat(system_prompt: str, _user_prompt: str, *_args) -> str:
         prompts.append(system_prompt)
+        if "交接质量评审 Agent" in system_prompt:
+            return json.dumps(
+                {
+                    "passed": True,
+                    "score": 95,
+                    "issues": [],
+                    "revision_roles": [],
+                    "summary": "独立评审通过。",
+                    "decisions": [],
+                    "conflicts": [],
+                    "open_questions": [],
+                },
+                ensure_ascii=False,
+            )
         return (
             "# Agent output\n\n"
             "明确范围、关键决策、依赖关系、边界场景、风险缓解和后续负责人。"
@@ -291,7 +305,7 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
         "PROJECT_PLAN",
         "TEST_PLAN",
     }
-    assert len(prompts) == 9
+    assert len(prompts) == 11
     assert db.scalar(
         select(func.count(WorkflowEvent.id)).where(
             WorkflowEvent.workflow_id == response.workflow_id,
@@ -323,7 +337,7 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
     await process_workflow(db, response.workflow_id)
     db.expire_all()
     assert db.get(WorkflowRun, response.workflow_id).status == WorkflowStatus.completed
-    assert len(prompts) == 10
+    assert len(prompts) == 12
 
 
 @pytest.mark.asyncio

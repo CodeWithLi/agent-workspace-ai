@@ -218,6 +218,35 @@
           <p>{{ qualityGate.summary }}</p>
           <ul v-if="qualityGate.issues.length"><li v-for="issue in qualityGate.issues" :key="issue">{{ issue }}</li></ul>
         </div>
+        <section v-if="qualityReviewers.length" class="reviewer-panel" aria-label="独立 Reviewer 仲裁">
+          <header class="reviewer-panel-heading">
+            <div>
+              <strong>独立 Reviewer 仲裁</strong>
+              <span>测试 · 运营 · 架构</span>
+            </div>
+            <div class="reviewer-panel-counts" aria-label="Reviewer 仲裁摘要">
+              <el-tag :type="qualityGate?.passed ? 'success' : 'danger'">{{ qualityGate?.reviewer_pass_count || 0 }}/{{ qualityGate?.reviewer_valid_count || 0 }} 通过</el-tag>
+              <el-tag type="info">quorum {{ qualityGate?.reviewer_quorum || 0 }}</el-tag>
+              <el-tag v-if="qualityGate?.reviewer_disagreement_count" type="warning">{{ qualityGate.reviewer_disagreement_count }} 份分歧</el-tag>
+            </div>
+          </header>
+          <ul class="reviewer-panel-list">
+            <li v-for="reviewer in qualityReviewers" :key="reviewer.role" :class="{ dissent: !reviewer.passed }">
+              <div class="reviewer-identity">
+                <el-icon aria-hidden="true"><component :is="reviewerStatusIcon(reviewer)" /></el-icon>
+                <div>
+                  <strong>{{ reviewerRoleLabel(reviewer.role) }}</strong>
+                  <small>{{ reviewerFocusLabel(reviewer.role) }}</small>
+                </div>
+              </div>
+              <div class="reviewer-verdict">
+                <el-tag size="small" :type="reviewerStatusType(reviewer)">{{ reviewerStatusLabel(reviewer) }}</el-tag>
+                <span>{{ reviewer.score != null ? `${Math.round(reviewer.score)} 分` : '弃权' }}</span>
+              </div>
+              <p>{{ reviewer.summary }}</p>
+            </li>
+          </ul>
+        </section>
         <section v-if="qualityLedgerVisible" class="decision-ledger" aria-label="多 Agent 协作决策账本">
           <div class="decision-ledger-heading">
             <div>
@@ -528,9 +557,23 @@ interface WorkflowQualityGate {
   issues: string[]
   revision_roles: string[]
   summary: string
+  reviewers?: WorkflowReviewerAssessment[]
+  reviewer_quorum?: number
+  reviewer_valid_count?: number
+  reviewer_pass_count?: number
+  reviewer_disagreement_count?: number
   decisions?: WorkflowCollaborationDecision[]
   conflicts?: WorkflowCollaborationConflict[]
   open_questions?: WorkflowCollaborationQuestion[]
+}
+
+interface WorkflowReviewerAssessment {
+  role: 'test_engineer' | 'operations_analyst' | 'architect'
+  structured: boolean
+  passed: boolean
+  score: number | null
+  summary: string
+  issues: string[]
 }
 
 type BranchRuntimeStatus = 'waiting' | 'running' | 'retrying' | 'completed' | 'restored' | 'failed' | 'paused' | 'cancelling' | 'cancelled'
@@ -855,6 +898,7 @@ const qualityGate = computed<WorkflowQualityGate | null>(() => {
   const gate = workflowState.value?.quality_gate
   return gate && typeof gate.score === 'number' ? gate as WorkflowQualityGate : null
 })
+const qualityReviewers = computed(() => Array.isArray(qualityGate.value?.reviewers) ? qualityGate.value.reviewers : [])
 const qualityDecisions = computed(() => Array.isArray(qualityGate.value?.decisions) ? qualityGate.value.decisions : [])
 const qualityConflicts = computed(() => Array.isArray(qualityGate.value?.conflicts) ? qualityGate.value.conflicts : [])
 const qualityOpenQuestions = computed(() => Array.isArray(qualityGate.value?.open_questions) ? qualityGate.value.open_questions : [])
@@ -1015,6 +1059,36 @@ function specialistFailureCategoryLabel(category: WorkflowSpecialistFailure['cat
     RETRY_EXHAUSTED: '自动重试已耗尽',
     RETRY_AVAILABLE: '可人工定向重试'
   }[category] || category
+}
+
+function reviewerRoleLabel(role: WorkflowReviewerAssessment['role']) {
+  return {
+    test_engineer: '测试 Reviewer',
+    operations_analyst: '运营 Reviewer',
+    architect: '架构 Reviewer'
+  }[role]
+}
+
+function reviewerFocusLabel(role: WorkflowReviewerAssessment['role']) {
+  return {
+    test_engineer: '质量、安全与验收证据',
+    operations_analyst: '发布、恢复与运营责任',
+    architect: '依赖、可行性与架构风险'
+  }[role]
+}
+
+function reviewerStatusLabel(reviewer: WorkflowReviewerAssessment) {
+  if (!reviewer.structured) return '合同无效'
+  return reviewer.passed ? '支持放行' : '建议返修'
+}
+
+function reviewerStatusType(reviewer: WorkflowReviewerAssessment) {
+  if (!reviewer.structured) return 'info'
+  return reviewer.passed ? 'success' : 'warning'
+}
+
+function reviewerStatusIcon(reviewer: WorkflowReviewerAssessment) {
+  return reviewer.structured && reviewer.passed ? CircleCheck : CircleClose
 }
 
 function handoffFor(role: string) {
@@ -1990,6 +2064,116 @@ onBeforeUnmount(disposeWorkflowEventStream)
   background: #fffbeb;
 }
 
+.reviewer-panel {
+  margin-top: 12px;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.reviewer-panel-heading {
+  display: flex;
+  min-height: 44px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  background: #f6f8fa;
+}
+
+.reviewer-panel-heading > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.reviewer-panel-heading strong {
+  font-size: 13px;
+}
+
+.reviewer-panel-heading span {
+  color: var(--color-muted-text);
+  font-size: 12px;
+}
+
+.reviewer-panel-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reviewer-panel-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reviewer-panel-list li {
+  display: grid;
+  min-height: 56px;
+  grid-template-columns: minmax(180px, 0.8fr) auto minmax(260px, 1.2fr);
+  align-items: center;
+  gap: 8px 16px;
+  padding: 9px 12px;
+}
+
+.reviewer-panel-list li + li {
+  border-top: 1px solid var(--color-border);
+}
+
+.reviewer-panel-list li.dissent {
+  box-shadow: inset 3px 0 0 var(--color-warning);
+}
+
+.reviewer-identity,
+.reviewer-verdict {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.reviewer-identity .el-icon {
+  flex: 0 0 auto;
+  color: var(--color-success);
+  font-size: 16px;
+}
+
+.reviewer-panel-list li.dissent .reviewer-identity .el-icon {
+  color: var(--color-warning);
+}
+
+.reviewer-identity > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.reviewer-identity strong,
+.reviewer-panel-list p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.reviewer-identity small,
+.reviewer-verdict span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.reviewer-verdict span {
+  font-variant-numeric: tabular-nums;
+}
+
+.reviewer-panel-list p {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-secondary-text);
+  overflow-wrap: anywhere;
+}
+
 .quality-gate-summary > div {
   display: flex;
   align-items: center;
@@ -2301,6 +2485,14 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
   .workflow-approval-gate.specialist-review {
     grid-template-columns: 1fr;
+  }
+
+  .reviewer-panel-list li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .reviewer-panel-list p {
+    grid-column: 1 / -1;
   }
 
   .workflow-approval-gate .el-button {

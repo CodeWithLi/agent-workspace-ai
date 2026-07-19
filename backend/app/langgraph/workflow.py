@@ -20,7 +20,7 @@ from app.agent.orchestration import (
     build_task_blueprints,
     evaluate_handoffs,
     expand_revision_roles,
-    merge_reviewer_decision,
+    merge_reviewer_panel,
     parse_execution_plan,
     seal_handoff,
 )
@@ -930,27 +930,64 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             handoffs,
             plan_version=max(1, int(state.get("plan_version", 0))),
         )
-        reviewer_output = await invoke_agent(
-            AgentRole.test_engineer,
-            (
-                "你是交接质量评审 Agent。只输出 JSON，字段为 passed、score、issues、"
-                "revision_roles、summary、decisions、conflicts、open_questions。"
-                "decisions 每项包含 title、outcome、rationale、source_roles、confidence；"
-                "conflicts 每项包含 topic、positions（role 与 position）、status（OPEN 或 RESOLVED）、"
-                "resolution、blocking、revision_roles；open_questions 每项包含 question、owner_role、blocking。"
-                "检查可追溯性、跨角色冲突、边界场景、验收证据和发布风险。"
-                "阻塞冲突未解决或阻塞问题未闭合时必须判定不通过，并指明需要返修的已分配角色。"
-            ),
-            json.dumps(
-                agent_context(state, {
-                    "execution_plan": plan.model_dump(mode="json"),
-                    "handoffs": [handoff.model_dump(mode="json") for handoff in handoffs],
-                    "deterministic_gate": deterministic.model_dump(mode="json"),
-                }),
-                ensure_ascii=False,
-            ),
+        reviewer_specs = (
+            (AgentRole.test_engineer, "质量、安全、边界场景与可复现验收证据"),
+            (AgentRole.operations_analyst, "可观测性、灰度发布、故障恢复与运营责任"),
+            (AgentRole.architect, "依赖一致性、技术可行性、可追溯性与架构风险"),
         )
-        decision = merge_reviewer_decision(deterministic, reviewer_output, plan)
+
+        async def run_reviewer(role: AgentRole, focus: str) -> str:
+            return await invoke_agent(
+                role,
+                (
+                    "你是独立交接质量评审 Agent。只输出 JSON，字段为 passed、score、issues、"
+                    "revision_roles、summary、decisions、conflicts、open_questions。"
+                    "decisions 每项包含 title、outcome、rationale、source_roles、confidence；"
+                    "conflicts 每项包含 topic、positions（role 与 position）、status（OPEN 或 RESOLVED）、"
+                    "resolution、blocking、revision_roles；open_questions 每项包含 question、owner_role、blocking。"
+                    f"你的独立评审焦点是：{focus}。"
+                    "不得读取其他 Reviewer 的结论。阻塞冲突未解决或阻塞问题未闭合时必须判定不通过，"
+                    "并指明需要返修的已分配角色。"
+                ),
+                json.dumps(
+                    agent_context(state, {
+                        "reviewer_role": role.value,
+                        "review_focus": focus,
+                        "execution_plan": plan.model_dump(mode="json"),
+                        "handoffs": [handoff.model_dump(mode="json") for handoff in handoffs],
+                        "deterministic_gate": deterministic.model_dump(mode="json"),
+                    }),
+                    ensure_ascii=False,
+                ),
+                isolated_usage=True,
+            )
+
+        reviewer_results = await asyncio.gather(
+            *(run_reviewer(role, focus) for role, focus in reviewer_specs),
+            return_exceptions=True,
+        )
+        cancellation = next(
+            (
+                result
+                for result in reviewer_results
+                if isinstance(result, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancellation:
+            raise cancellation
+        decision = merge_reviewer_panel(
+            deterministic,
+            {
+                role.value: result if isinstance(result, str) else ""
+                for (role, _focus), result in zip(
+                    reviewer_specs,
+                    reviewer_results,
+                    strict=True,
+                )
+            },
+            plan,
+        )
         revision_round = int(state.get("revision_round", 0))
         if decision.passed:
             next_node = "project_manager"
@@ -979,6 +1016,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "next_node": next_node,
                 "decision_count": len(decision.decisions),
                 "conflict_count": len(decision.conflicts),
+                "reviewer_count": len(decision.reviewers),
+                "reviewer_valid_count": decision.reviewer_valid_count,
+                "reviewer_quorum": decision.reviewer_quorum,
+                "reviewer_pass_count": decision.reviewer_pass_count,
+                "reviewer_disagreement_count": decision.reviewer_disagreement_count,
                 "open_blocker_count": sum(
                     conflict.status == "OPEN" and conflict.blocking
                     for conflict in decision.conflicts
@@ -990,7 +1032,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             "quality_gate": decision.model_dump(mode="json"),
             "revision_round": revision_round,
             "revision_feedback": feedback,
-            "messages": append_message(state, "quality_gate_agent", reviewer_output),
+            "messages": append_message(
+                state,
+                "quality_gate_agent",
+                decision.model_dump_json(exclude={"reviewer_summary"}),
+            ),
             "current_node": next_node,
         }, expected_lease_token)
 

@@ -466,7 +466,7 @@ const roleLabels: Record<string, string> = {
   product_manager: 'AI 产品经理', project_manager: 'AI 项目经理', architect: 'AI 架构师',
   test_engineer: 'AI 测试工程师', meeting_summarizer: 'AI 会议纪要员',
   knowledge_admin: 'AI 知识库管理员', notification_secretary: 'AI 通知秘书',
-  operations_analyst: 'AI 运营分析师'
+  operations_analyst: 'AI 运营分析师', reviewer_panel: '独立评审团'
 }
 const eventLabels: Record<string, string> = {
   QUEUED: '进入队列', STARTED: '开始运行', CONTINUED: '继续运行', NODE_STARTED: '节点开始',

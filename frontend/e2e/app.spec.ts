@@ -424,6 +424,15 @@ async function mockApi(page: Page) {
         issues: ['缺少可复现验收证据'],
         revision_roles: ['test_engineer'],
         summary: '测试交接需要补充证据来源与负责人。',
+        reviewer_quorum: 2,
+        reviewer_valid_count: 2,
+        reviewer_pass_count: 1,
+        reviewer_disagreement_count: 1,
+        reviewers: [
+          { role: 'test_engineer', structured: true, passed: true, score: 92, summary: '核心路径覆盖完整，但责任证据仍需复核。', issues: [] },
+          { role: 'operations_analyst', structured: true, passed: false, score: 65, summary: '回滚观察窗口缺少明确负责人。', issues: ['发布责任未闭合'] },
+          { role: 'architect', structured: false, passed: false, score: null, summary: 'Reviewer 未返回有效结构化结论，已弃权。', issues: ['结构化评审不可用'] }
+        ],
         decisions: [
           {
             title: '灰度发布策略',
@@ -1488,6 +1497,17 @@ async function mockApi(page: Page) {
             passed: true,
             issues: [],
             summary: '质量门禁已通过。',
+            reviewer_valid_count: 3,
+            reviewer_pass_count: 3,
+            reviewer_disagreement_count: 0,
+            reviewers: qualityWorkflow.state.quality_gate.reviewers.map((reviewer) => ({
+              ...reviewer,
+              structured: true,
+              passed: true,
+              score: 95,
+              summary: `${reviewer.role} 已确认修订证据满足放行条件。`,
+              issues: []
+            })),
             conflicts: [
               {
                 ...qualityWorkflow.state.quality_gate.conflicts[0],
@@ -2611,6 +2631,17 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await expect(page.getByText('2 个并行分支', { exact: true })).toBeVisible()
   await expect(page.getByText('Quality Gate 需要修订', { exact: true })).toBeVisible()
   await expect(page.getByText('缺少可复现验收证据', { exact: true })).toBeVisible()
+  const reviewerPanel = page.getByRole('region', { name: '独立 Reviewer 仲裁' })
+  await expect(reviewerPanel.getByText('1/2 通过', { exact: true })).toBeVisible()
+  await expect(reviewerPanel.getByText('quorum 2', { exact: true })).toBeVisible()
+  await expect(reviewerPanel.getByText('1 份分歧', { exact: true })).toBeVisible()
+  const operationsReviewer = reviewerPanel.getByRole('listitem').filter({ hasText: '运营 Reviewer' })
+  await expect(operationsReviewer).toContainText('建议返修')
+  await expect(operationsReviewer).toContainText('65 分')
+  await expect(operationsReviewer).toContainText('回滚观察窗口缺少明确负责人。')
+  const architectReviewer = reviewerPanel.getByRole('listitem').filter({ hasText: '架构 Reviewer' })
+  await expect(architectReviewer).toContainText('合同无效')
+  await expect(architectReviewer).toContainText('弃权')
   const ledger = page.getByRole('region', { name: '多 Agent 协作决策账本' })
   await expect(ledger.getByText('灰度发布策略', { exact: true })).toBeVisible()
   await expect(ledger.getByText('发布准入条件', { exact: true })).toBeVisible()
@@ -2624,6 +2655,9 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await revisionButton.click()
 
   await expect(page.getByText('Quality Gate 已通过', { exact: true })).toBeVisible()
+  await expect(reviewerPanel.getByText('3/3 通过', { exact: true })).toBeVisible()
+  await expect(reviewerPanel.getByText('1 份分歧', { exact: true })).toHaveCount(0)
+  await expect(reviewerPanel.getByText('支持放行', { exact: true })).toHaveCount(3)
   await expect(ledger.getByText('已解决', { exact: true })).toBeVisible()
   await expect(ledger.getByText('核心冒烟通过后启动 10% 灰度，全量回归通过后才能扩容。', { exact: true })).toBeVisible()
   await expect(page.getByText('最终报告等待人工确认', { exact: true })).toBeVisible()
@@ -2632,6 +2666,7 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
     await page.emulateMedia({ reducedMotion: 'reduce' })
     for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
       await page.setViewportSize(viewport)
+      await expect(reviewerPanel).toBeVisible()
       await expect(ledger).toBeVisible()
       expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
     }

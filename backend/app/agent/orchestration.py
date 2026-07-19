@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from statistics import median
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -18,6 +19,17 @@ ALLOWED_SPECIALIST_ROLES: tuple[SpecialistRole, ...] = (
     "knowledge_admin",
     "notification_secretary",
 )
+ReviewerPanelRole = Literal["test_engineer", "operations_analyst", "architect"]
+
+
+class ReviewerPanelQuorumError(ValueError):
+    def __init__(self, valid_count: int, quorum: int, panel_count: int) -> None:
+        self.valid_count = valid_count
+        self.quorum = quorum
+        self.panel_count = panel_count
+        super().__init__(
+            f"reviewer panel quorum unavailable: {valid_count}/{quorum} structured outputs"
+        )
 
 
 class SpecialistAssignment(BaseModel):
@@ -345,6 +357,26 @@ class CollaborationQuestion(BaseModel):
     blocking: bool = False
 
 
+class ReviewerDecision(BaseModel):
+    passed: bool
+    score: float = Field(ge=0, le=100)
+    issues: list[str] = Field(default_factory=list, max_length=20)
+    revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
+    summary: str = Field(default="", max_length=4000)
+    decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
+    conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
+    open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
+
+
+class ReviewerAssessment(BaseModel):
+    role: ReviewerPanelRole
+    structured: bool
+    passed: bool
+    score: float | None = Field(default=None, ge=0, le=100)
+    summary: str = Field(default="", max_length=4000)
+    issues: list[str] = Field(default_factory=list, max_length=20)
+
+
 class QualityGateDecision(BaseModel):
     score: float = Field(ge=0, le=100)
     passed: bool
@@ -353,17 +385,11 @@ class QualityGateDecision(BaseModel):
     revision_roles: list[SpecialistRole] = Field(default_factory=list)
     summary: str = Field(default="", max_length=4000)
     reviewer_summary: str = Field(default="", max_length=8000)
-    decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
-    conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
-    open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
-
-
-class ReviewerDecision(BaseModel):
-    passed: bool
-    score: float = Field(ge=0, le=100)
-    issues: list[str] = Field(default_factory=list, max_length=20)
-    revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
-    summary: str = Field(default="", max_length=4000)
+    reviewers: list[ReviewerAssessment] = Field(default_factory=list, max_length=3)
+    reviewer_quorum: int = Field(default=0, ge=0, le=3)
+    reviewer_valid_count: int = Field(default=0, ge=0, le=3)
+    reviewer_pass_count: int = Field(default=0, ge=0, le=3)
+    reviewer_disagreement_count: int = Field(default=0, ge=0, le=3)
     decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
     conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
     open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
@@ -546,13 +572,7 @@ def merge_reviewer_decision(
     reviewer_output: str,
     plan: MultiAgentExecutionPlan,
 ) -> QualityGateDecision:
-    reviewer: ReviewerDecision | None = None
-    for candidate in _json_candidates(reviewer_output):
-        try:
-            reviewer = ReviewerDecision.model_validate(json.loads(candidate))
-            break
-        except (json.JSONDecodeError, ValidationError):
-            continue
+    reviewer = _parse_reviewer_decision(reviewer_output)
     if reviewer is None:
         return deterministic.model_copy(
             update={"reviewer_summary": reviewer_output[:8000]}
@@ -636,6 +656,145 @@ def merge_reviewer_decision(
             "revision_roles": revision_roles,
             "summary": reviewer.summary or deterministic.summary,
             "reviewer_summary": reviewer_output[:8000],
+            "decisions": decisions,
+            "conflicts": conflicts,
+            "open_questions": open_questions,
+        }
+    )
+
+
+def _parse_reviewer_decision(reviewer_output: str) -> ReviewerDecision | None:
+    for candidate in _json_candidates(reviewer_output):
+        try:
+            return ReviewerDecision.model_validate(json.loads(candidate))
+        except (json.JSONDecodeError, ValidationError):
+            continue
+    return None
+
+
+def _unique_models(items: list[Any], limit: int = 20) -> list[Any]:
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.model_dump_json()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) == limit:
+            break
+    return unique
+
+
+def merge_reviewer_panel(
+    deterministic: QualityGateDecision,
+    reviewer_outputs: dict[ReviewerPanelRole, str],
+    plan: MultiAgentExecutionPlan,
+    *,
+    quorum: int = 2,
+) -> QualityGateDecision:
+    if not 1 <= quorum <= len(reviewer_outputs):
+        raise ValueError("reviewer quorum must fit the configured panel")
+
+    assessments: list[ReviewerAssessment] = []
+    valid_scores: list[float] = []
+    merged_reviews: list[QualityGateDecision] = []
+    summaries: list[str] = []
+    for role, output in reviewer_outputs.items():
+        reviewer = _parse_reviewer_decision(output)
+        if reviewer is None:
+            assessments.append(
+                ReviewerAssessment(
+                    role=role,
+                    structured=False,
+                    passed=False,
+                    summary="Reviewer 未返回有效结构化结论，已弃权。",
+                    issues=["结构化评审不可用"],
+                )
+            )
+            continue
+        merged = merge_reviewer_decision(deterministic, output, plan)
+        merged_reviews.append(merged)
+        valid_scores.append(reviewer.score)
+        summary = reviewer.summary or "Reviewer 未提供摘要。"
+        summaries.append(f"{role}: {summary}")
+        reviewer_blocked = any(
+            conflict.status == "OPEN" and conflict.blocking
+            for conflict in merged.conflicts
+        ) or any(question.blocking for question in merged.open_questions)
+        assessments.append(
+            ReviewerAssessment(
+                role=role,
+                structured=True,
+                passed=reviewer.passed and reviewer.score >= 80 and not reviewer_blocked,
+                score=reviewer.score,
+                summary=summary,
+                issues=merged.issues,
+            )
+        )
+
+    valid_count = len(merged_reviews)
+    if valid_count < quorum:
+        raise ReviewerPanelQuorumError(valid_count, quorum, len(reviewer_outputs))
+
+    pass_count = sum(assessment.passed for assessment in assessments)
+    conflicts = _unique_models(
+        [conflict for review in merged_reviews for conflict in review.conflicts]
+    )
+    open_questions = _unique_models(
+        [question for review in merged_reviews for question in review.open_questions]
+    )
+    decisions = _unique_models(
+        [decision for review in merged_reviews for decision in review.decisions]
+    )
+    blocking_conflicts = [
+        conflict
+        for conflict in conflicts
+        if conflict.status == "OPEN" and conflict.blocking
+    ]
+    blocking_questions = [question for question in open_questions if question.blocking]
+    score = min(deterministic.score, float(median(valid_scores)))
+    if blocking_conflicts or blocking_questions:
+        score = min(score, 79.0)
+    passed = (
+        deterministic.passed
+        and pass_count >= quorum
+        and score >= 80
+        and not blocking_conflicts
+        and not blocking_questions
+    )
+    issues = list(
+        dict.fromkeys(
+            issue
+            for review in merged_reviews
+            for issue in review.issues
+        )
+    )
+    revision_roles = list(
+        dict.fromkeys(
+            role
+            for review in merged_reviews
+            for role in review.revision_roles
+        )
+    )
+    disagreement_count = min(pass_count, valid_count - pass_count)
+    return deterministic.model_copy(
+        update={
+            "score": score,
+            "passed": passed,
+            "issues": issues,
+            "revision_roles": [] if passed else revision_roles,
+            "summary": (
+                f"评审团 {pass_count}/{valid_count} 票通过，仲裁放行。"
+                if passed
+                else f"评审团 {pass_count}/{valid_count} 票通过，未满足放行条件。"
+            ),
+            "reviewer_summary": "\n".join(summaries)[:8000],
+            "reviewers": assessments,
+            "reviewer_quorum": quorum,
+            "reviewer_valid_count": valid_count,
+            "reviewer_pass_count": pass_count,
+            "reviewer_disagreement_count": disagreement_count,
             "decisions": decisions,
             "conflicts": conflicts,
             "open_questions": open_questions,
