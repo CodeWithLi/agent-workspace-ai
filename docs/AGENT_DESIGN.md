@@ -20,6 +20,12 @@ AI 对齐室的 `TEAM` 会话按产品经理、架构师、测试工程师、运
 
 团队讨论用于方案评审，不推断或执行任何写工具。整轮使用唯一请求 ID 和一次预扣；模型失败、连接取消或上下文失效时通过 `agent_runs` 幂等退款。成功后的最终方案写入项目 Memory，供后续单人对话与工作流读取。
 
+## AI 原型协作
+
+原型生成冻结产品经理、架构师和测试工程师的 Prompt、模型、版本与并发配置。产品经理先定义目标用户、成功条件和 2-5 条可执行用户旅程；架构师只输出受 Pydantic 约束的安全 DSL，将每一步绑定到真实页面、按钮或链接及预期页面；测试工程师独立检查旅程真实性、边界状态、表单可访问性、移动端和验收风险。无效结构进入有界返修，确定性门禁会补齐缺失页面的安全体验路径，但不会执行模型生成的 HTML 或 JavaScript。
+
+新 DSL 把 `journeys` 作为必填合同，并验证步骤连续性、控件可执行性和导航目标。历史版本缺少该字段时仍可读取为空路径；重新生成或质量修复后升级为新合同。原型工作室可按结构化动作事件引导体验、突出当前控件并报告错误操作，批准后的物化流程把页面任务、单页用例和端到端旅程用例一并写入交付证据。
+
 ## 工具
 
 8 个默认角色通过 Tool Registry 使用 `context_search`、`knowledge_search`、`task_create`、`requirement_create`、`report_generate`、`notification_create`、`meeting_summary`、`architecture_generate`、`testcase_create`、`analytics_report`。

@@ -33,6 +33,17 @@ const specification: PrototypeSpecification = {
     foreground: '#111827',
     radius: 'soft'
   },
+  journeys: [{
+    id: 'view-detail',
+    name: '查看详情',
+    goal: '从开始页进入详情页',
+    steps: [{
+      screen_id: 'start',
+      component_id: 'detail-link',
+      instruction: '点击查看详情',
+      expected_screen_id: 'detail'
+    }]
+  }],
   screens: [
     {
       id: 'start',
@@ -92,11 +103,26 @@ describe('PrototypeCanvas', () => {
 
   it('emits safe in-prototype navigation and back events', async () => {
     const wrapper = mount(PrototypeCanvas, {
-      props: { spec: specification, screenId: 'start', deviceMode: 'desktop' }
+      props: {
+        spec: specification,
+        screenId: 'start',
+        deviceMode: 'desktop',
+        highlightComponentId: 'detail-link'
+      }
     })
 
-    await buttonByText(wrapper, '查看详情').trigger('click')
+    const detailLink = buttonByText(wrapper, '查看详情')
+    expect(detailLink.classes()).toContain('journey-target')
+    await detailLink.trigger('click')
     expect(wrapper.emitted('navigate')).toEqual([['detail']])
+    expect(wrapper.emitted('action')).toEqual([[
+      {
+        screen_id: 'start',
+        component_id: 'detail-link',
+        action_type: 'navigate',
+        target: 'detail'
+      }
+    ]])
 
     await wrapper.setProps({ screenId: 'detail' })
     await buttonByText(wrapper, '返回').trigger('click')

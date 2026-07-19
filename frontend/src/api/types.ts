@@ -1039,6 +1039,27 @@ export interface PrototypeScreen {
   sections: PrototypeSection[]
 }
 
+export interface PrototypeJourneyStep {
+  screen_id: string
+  component_id: string
+  instruction: string
+  expected_screen_id: string
+}
+
+export interface PrototypeJourney {
+  id: string
+  name: string
+  goal: string
+  steps: PrototypeJourneyStep[]
+}
+
+export interface PrototypeActionEvent {
+  screen_id: string
+  component_id: string
+  action_type: PrototypeAction['type']
+  target?: string | null
+}
+
 export interface PrototypeSpecification {
   product_name: string
   summary: string
@@ -1051,6 +1072,7 @@ export interface PrototypeSpecification {
     foreground: string
     radius: 'compact' | 'soft' | 'rounded'
   }
+  journeys: PrototypeJourney[]
   screens: PrototypeScreen[]
 }
 

@@ -28,6 +28,12 @@ class PrototypeAction(BaseModel):
     target: str | None = Field(default=None, max_length=100)
     message: str | None = Field(default=None, max_length=300)
 
+    @model_validator(mode="after")
+    def validate_target(self) -> "PrototypeAction":
+        if self.type == "navigate" and not self.target:
+            raise ValueError("navigate actions require a target screen")
+        return self
+
 
 class PrototypeOption(BaseModel):
     label: str = Field(min_length=1, max_length=100)
@@ -89,12 +95,34 @@ class PrototypeTheme(BaseModel):
     radius: Literal["compact", "soft", "rounded"] = "soft"
 
 
+class PrototypeJourneyStep(BaseModel):
+    screen_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+    component_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+    instruction: str = Field(min_length=1, max_length=300)
+    expected_screen_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+
+
+class PrototypeJourney(BaseModel):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+    name: str = Field(min_length=1, max_length=120)
+    goal: str = Field(min_length=1, max_length=500)
+    steps: list[PrototypeJourneyStep] = Field(min_length=1, max_length=20)
+
+
 class PrototypeSpecification(BaseModel):
     product_name: str = Field(min_length=1, max_length=120)
     summary: str = Field(min_length=1, max_length=1000)
     start_screen_id: str = Field(min_length=2, max_length=64)
     theme: PrototypeTheme = Field(default_factory=PrototypeTheme)
+    journeys: list[PrototypeJourney] = Field(max_length=20)
     screens: list[PrototypeScreen] = Field(min_length=2, max_length=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_specification_without_journeys(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "journeys" not in value:
+            return {**value, "journeys": []}
+        return value
 
     @model_validator(mode="after")
     def validate_navigation_graph(self) -> "PrototypeSpecification":
@@ -104,17 +132,59 @@ class PrototypeSpecification(BaseModel):
         if self.start_screen_id not in screen_ids:
             raise ValueError("start_screen_id must reference a screen")
         component_ids: set[str] = set()
+        components_by_screen: dict[str, dict[str, PrototypeComponent]] = {}
         for screen in self.screens:
+            screen_components: dict[str, PrototypeComponent] = {}
             for section in screen.sections:
                 for component in section.components:
                     if component.id in component_ids:
                         raise ValueError("component IDs must be unique across the prototype")
                     component_ids.add(component.id)
+                    screen_components[component.id] = component
                     if component.action and component.action.type == "navigate":
                         if component.action.target not in screen_ids:
                             raise ValueError(
                                 f"component {component.id} navigates to an unknown screen"
                             )
+            components_by_screen[screen.id] = screen_components
+
+        journey_ids = [journey.id for journey in self.journeys]
+        if len(journey_ids) != len(set(journey_ids)):
+            raise ValueError("journey IDs must be unique")
+        for journey in self.journeys:
+            previous_expected_screen: str | None = None
+            for step in journey.steps:
+                if step.screen_id not in screen_ids:
+                    raise ValueError(
+                        f"journey {journey.id} references an unknown screen {step.screen_id}"
+                    )
+                if step.expected_screen_id not in screen_ids:
+                    raise ValueError(
+                        f"journey {journey.id} expects an unknown screen {step.expected_screen_id}"
+                    )
+                if previous_expected_screen and step.screen_id != previous_expected_screen:
+                    raise ValueError(
+                        f"journey {journey.id} must continue from {previous_expected_screen}"
+                    )
+                component = components_by_screen[step.screen_id].get(step.component_id)
+                if component is None:
+                    raise ValueError(
+                        f"journey {journey.id} references unknown component {step.component_id}"
+                    )
+                if component.type not in {"button", "link"} or component.action is None:
+                    raise ValueError(
+                        f"journey {journey.id} component {step.component_id} must be an executable button or link"
+                    )
+                if component.action.type == "navigate":
+                    if step.expected_screen_id != component.action.target:
+                        raise ValueError(
+                            f"journey {journey.id} expected screen must match navigation target"
+                        )
+                elif component.action.type != "back" and step.expected_screen_id != step.screen_id:
+                    raise ValueError(
+                        f"journey {journey.id} non-navigation action must remain on its current screen"
+                    )
+                previous_expected_screen = step.expected_screen_id
         return self
 
 

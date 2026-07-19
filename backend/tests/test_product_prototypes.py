@@ -42,6 +42,7 @@ from app.prototypes.schemas import (
     PrototypeSpecification,
     PrototypeUpdateRequest,
 )
+from app.prototypes.delivery import build_prototype_test_case_blueprints
 from app.prototypes.service import (
     build_fallback_spec,
     evaluate_specification,
@@ -97,6 +98,34 @@ def unreachable_specification() -> PrototypeSpecification:
             "product_name": "Quality Gate",
             "summary": "A valid DSL with one unreachable screen.",
             "start_screen_id": "start",
+            "journeys": [
+                {
+                    "id": "start-action-check",
+                    "name": "Start action",
+                    "goal": "Exercise the start action",
+                    "steps": [
+                        {
+                            "screen_id": "start",
+                            "component_id": "start-action",
+                            "instruction": "Continue",
+                            "expected_screen_id": "start",
+                        }
+                    ],
+                },
+                {
+                    "id": "unreachable-back-check",
+                    "name": "Back from unreachable",
+                    "goal": "Exercise the unreachable screen action",
+                    "steps": [
+                        {
+                            "screen_id": "unreachable",
+                            "component_id": "unreachable-back",
+                            "instruction": "Go back",
+                            "expected_screen_id": "start",
+                        }
+                    ],
+                },
+            ],
             "screens": [
                 {
                     "id": "start",
@@ -147,6 +176,15 @@ def test_prototype_schema_rejects_unknown_navigation_target() -> None:
         PrototypeSpecification.model_validate(payload)
 
 
+def test_journeys_are_required_for_new_contract_but_legacy_specs_remain_readable() -> None:
+    spec = build_fallback_spec("Legacy", "通用工作台事项创建和详情")
+    payload = spec.model_dump(mode="json")
+    payload.pop("journeys")
+
+    assert "journeys" in PrototypeSpecification.model_json_schema()["required"]
+    assert PrototypeSpecification.model_validate(payload).journeys == []
+
+
 def test_prototype_validation_reports_actionable_schema_paths() -> None:
     spec, issues = validate_prototype_specification('{"answer":"not a prototype"}')
 
@@ -166,8 +204,49 @@ def test_fallback_auth_prototype_has_complete_reachable_flow() -> None:
         "invite",
         "invite-records",
     ]
+    assert [journey.id for journey in spec.journeys] == [
+        "new-user-onboarding",
+        "password-recovery",
+        "share-invitation",
+    ]
+    assert {
+        step.screen_id
+        for journey in spec.journeys
+        for step in journey.steps
+    } == {screen.id for screen in spec.screens}
     assert quality["passed"] is True
     assert quality["checks"][0]["passed"] is True
+
+
+def test_prototype_schema_rejects_journey_steps_without_executable_actions() -> None:
+    spec = build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接")
+    payload = spec.model_dump(mode="json")
+    payload["journeys"][0]["steps"][0]["component_id"] = "register-heading"
+
+    with pytest.raises(ValidationError, match="executable button or link"):
+        PrototypeSpecification.model_validate(payload)
+
+
+def test_prototype_schema_rejects_discontinuous_journey_steps() -> None:
+    spec = build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接")
+    payload = spec.model_dump(mode="json")
+    payload["journeys"][0]["steps"][1]["screen_id"] = "invite"
+
+    with pytest.raises(ValidationError, match="must continue from login"):
+        PrototypeSpecification.model_validate(payload)
+
+
+def test_delivery_blueprints_include_end_to_end_journeys() -> None:
+    spec = build_fallback_spec("偶像泡泡", "手机号注册登录和邀请链接")
+    cases = build_prototype_test_case_blueprints(spec)
+    journey_case = next(
+        item for item in cases if item["case_key"] == "journey:new-user-onboarding"
+    )
+
+    assert journey_case["title"] == "完成用户旅程：新用户注册并查看邀请进度"
+    assert journey_case["screen_id"] == "register"
+    assert len(journey_case["steps"]) == 3
+    assert "邀请记录" in journey_case["expected_result"]
 
 
 def test_quality_gate_rejects_high_scoring_prototype_with_failed_invariant() -> None:
@@ -197,6 +276,17 @@ def test_deterministic_structure_repair_connects_valid_custom_dsl() -> None:
     )
     assert any("提升主要操作" in item for item in promotion_repairs)
     assert evaluate_specification(promoted)["passed"] is True
+
+    without_journeys = promoted.model_copy(update={"journeys": []})
+    journey_repaired, journey_repairs = repair_specification_structure(without_journeys)
+    assert any("补齐体验路径" in item for item in journey_repairs)
+    assert {
+        screen_id
+        for journey in journey_repaired.journeys
+        for step in journey.steps
+        for screen_id in (step.screen_id, step.expected_screen_id)
+    } == {screen.id for screen in journey_repaired.screens}
+    assert evaluate_specification(journey_repaired)["passed"] is True
 
 
 def test_reviewer_score_cannot_contradict_passed_decision() -> None:

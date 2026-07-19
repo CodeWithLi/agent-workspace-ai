@@ -127,13 +127,15 @@ Prompt 调优只接受 `COMPLETED` 或 `FAILED` 运行中实际未通过、回�
 ## AI 原型工作室
 
 - `GET /prototypes`、`GET /prototypes/{prototype_id}`：查询当前用户可访问的原型及不可变版本历史。
-- `POST /prototypes/generate`：从项目、可选需求和自然语言目标生成可交互原型。
+- `POST /prototypes/generate`：从项目、可选需求和自然语言目标生成带可执行用户旅程的交互原型。
 - `POST /prototypes/{prototype_id}/regenerate`：根据修订意见创建新版本，不覆盖历史版本。
 - `POST /prototypes/{prototype_id}/versions/{version}/activate`：切换活动版本；切换到其他版本会把审批状态重置为 `DRAFT`。
 - `PATCH /prototypes/{prototype_id}`、`DELETE /prototypes/{prototype_id}`：更新状态或删除原型。
 - `GET|POST /prototypes/{prototype_id}/comments`：读取或创建当前版本的页面级评审意见。
 - `PATCH /prototypes/{prototype_id}/comments/{comment_id}`：解决或重新打开评审意见。
-- `POST /prototypes/{prototype_id}/materialize`：将已批准版本幂等转换为实现任务和结构化验收用例。
+- `POST /prototypes/{prototype_id}/materialize`：将已批准版本幂等转换为实现任务、单页验收用例和端到端旅程用例。
+
+原型 DSL 的 `journeys` 为新生成合同的必填字段。每一步引用真实 `screen_id`、可执行的按钮或链接、操作说明和预期页面；服务端拒绝未知控件、非连续步骤及与导航目标不一致的结果，质量门禁要求所有页面被步骤起点或预期到达页覆盖。历史版本没有 `journeys` 时兼容读取为空列表，重新生成时进入新合同。
 
 批准要求当前版本通过自动质量门禁且没有待处理评审意见。创建或重新打开当前版本的评审意见要求 `projects:write` 和非 viewer 项目角色；对已批准版本执行该操作会原子撤销批准并回到 `REVIEW`，归档版本禁止修改评审。`materialize` 要求客户端提供唯一 `request_id`；幂等键绑定原型及其具体版本，同一版本重复调用返回已有交付结果，不重复创建任务或用例，跨版本复用返回 `409`。
 

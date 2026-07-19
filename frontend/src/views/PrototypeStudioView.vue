@@ -169,9 +169,11 @@
                   :spec="activePrototype.current.specification"
                   :screen-id="activeScreenId"
                   :device-mode="deviceMode"
+                  :highlight-component-id="highlightedJourneyComponentId"
                   @navigate="navigateScreen"
                   @back="navigateBack"
                   @interaction="lastInteraction = $event"
+                  @action="handlePrototypeAction"
                 />
               </div>
             </div>
@@ -239,6 +241,68 @@
                   </article>
                 </div>
                 <el-empty v-else description="当前版本暂无评审评论" :image-size="56" />
+              </el-tab-pane>
+
+              <el-tab-pane :label="`路径 ${prototypeJourneys.length}`" name="journeys">
+                <div v-if="prototypeJourneys.length && activeJourney" class="journey-panel">
+                  <el-select
+                    v-model="selectedJourneyId"
+                    aria-label="选择原型体验路径"
+                    @change="selectJourney"
+                  >
+                    <el-option
+                      v-for="journey in prototypeJourneys"
+                      :key="journey.id"
+                      :label="journey.name"
+                      :value="journey.id"
+                    />
+                  </el-select>
+
+                  <section class="journey-summary" aria-label="体验路径进度">
+                    <div>
+                      <strong>{{ activeJourney.name }}</strong>
+                      <span>{{ activeJourney.goal }}</span>
+                    </div>
+                    <el-progress :percentage="journeyProgress" :show-text="false" :stroke-width="6" />
+                    <small>{{ journeyProgressLabel }}</small>
+                  </section>
+
+                  <ol class="journey-step-list" aria-label="体验路径步骤">
+                    <li
+                      v-for="(step, index) in activeJourney.steps"
+                      :key="`${activeJourney.id}-${index}`"
+                      :class="{
+                        completed: index < journeyStepIndex,
+                        current: journeyRunning && index === journeyStepIndex
+                      }"
+                      :aria-current="journeyRunning && index === journeyStepIndex ? 'step' : undefined"
+                    >
+                      <span class="journey-step-number">{{ index + 1 }}</span>
+                      <div>
+                        <strong>{{ screenName(step.screen_id) }} · {{ journeyComponentLabel(step) }}</strong>
+                        <small>{{ step.instruction }}</small>
+                      </div>
+                      <el-icon v-if="index < journeyStepIndex"><CircleCheck /></el-icon>
+                    </li>
+                  </ol>
+
+                  <div
+                    v-if="journeyFeedback"
+                    class="journey-feedback"
+                    :class="`feedback-${journeyFeedbackTone}`"
+                    :role="journeyFeedbackTone === 'error' ? 'alert' : 'status'"
+                    aria-live="polite"
+                  >{{ journeyFeedback }}</div>
+
+                  <div class="journey-actions">
+                    <el-button type="primary" :icon="VideoPlay" @click="startJourney">
+                      {{ journeyRunning ? '重新开始' : completedJourneyId === activeJourney.id ? '再次体验' : '开始体验' }}
+                    </el-button>
+                    <el-button v-if="journeyRunning" :icon="Position" @click="locateJourneyStep">定位当前步骤</el-button>
+                    <el-button v-if="journeyRunning" :icon="Close" @click="stopJourney">退出</el-button>
+                  </div>
+                </div>
+                <el-empty v-else description="当前版本尚未定义可执行体验路径" :image-size="56" />
               </el-tab-pane>
 
               <el-tab-pane label="Agent" name="agents">
@@ -371,10 +435,12 @@ import {
   Loading,
   MagicStick,
   MoreFilled,
+  Position,
   Plus,
   Refresh,
   RefreshLeft,
-  Tickets
+  Tickets,
+  VideoPlay
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import 'element-plus/es/components/message/style/css.mjs'
@@ -383,7 +449,10 @@ import type {
   ProductPrototype,
   ProductPrototypeDetail,
   Project,
+  PrototypeActionEvent,
   PrototypeGenerationJob,
+  PrototypeJourney,
+  PrototypeJourneyStep,
   PrototypeMaterialization,
   PrototypeReviewComment,
   PrototypeScreen,
@@ -428,6 +497,12 @@ const materialization = ref<PrototypeMaterialization | null>(null)
 const materializationDialog = ref(false)
 const canvasSession = ref(0)
 const lastInteraction = ref('')
+const selectedJourneyId = ref('')
+const journeyStepIndex = ref(0)
+const journeyRunning = ref(false)
+const completedJourneyId = ref('')
+const journeyFeedback = ref('')
+const journeyFeedbackTone = ref<'info' | 'success' | 'error'>('info')
 const cancellingGeneration = ref(false)
 const retryingGeneration = ref(false)
 const generationConnectionDetail = ref('')
@@ -461,6 +536,32 @@ const canSubmitCreate = computed(() => Boolean(
 const activeScreen = computed<PrototypeScreen | undefined>(() =>
   activePrototype.value?.current.specification.screens.find((screen) => screen.id === activeScreenId.value)
 )
+const prototypeJourneys = computed(() => activePrototype.value?.current.specification.journeys || [])
+const activeJourney = computed<PrototypeJourney | undefined>(() => (
+  prototypeJourneys.value.find((journey) => journey.id === selectedJourneyId.value)
+  || prototypeJourneys.value[0]
+))
+const activeJourneyStep = computed(() => (
+  journeyRunning.value ? activeJourney.value?.steps[journeyStepIndex.value] : undefined
+))
+const highlightedJourneyComponentId = computed(() => (
+  activeJourneyStep.value?.screen_id === activeScreenId.value
+    ? activeJourneyStep.value.component_id
+    : undefined
+))
+const journeyProgress = computed(() => {
+  const journey = activeJourney.value
+  if (!journey) return 0
+  if (completedJourneyId.value === journey.id) return 100
+  return Math.round(journeyStepIndex.value / journey.steps.length * 100)
+})
+const journeyProgressLabel = computed(() => {
+  const journey = activeJourney.value
+  if (!journey) return ''
+  if (completedJourneyId.value === journey.id) return `${journey.steps.length}/${journey.steps.length} 步已完成`
+  if (journeyRunning.value) return `步骤 ${journeyStepIndex.value + 1}/${journey.steps.length}`
+  return `共 ${journey.steps.length} 步`
+})
 const openReviewCount = computed(() => reviewComments.value.filter((comment) => comment.status === 'OPEN').length)
 const qualityColor = computed(() => {
   const score = activePrototype.value?.current.quality.score || 0
@@ -648,6 +749,15 @@ async function loadCatalog() {
   }
 }
 
+function resetJourneyState(detail: ProductPrototypeDetail | null = activePrototype.value) {
+  selectedJourneyId.value = detail?.current.specification.journeys?.[0]?.id || ''
+  journeyStepIndex.value = 0
+  journeyRunning.value = false
+  completedJourneyId.value = ''
+  journeyFeedback.value = ''
+  journeyFeedbackTone.value = 'info'
+}
+
 async function openPrototype(id: number, syncRoute = true) {
   if (!id) return
   loadingDetail.value = true
@@ -661,6 +771,7 @@ async function openPrototype(id: number, syncRoute = true) {
     lastInteraction.value = ''
     materialization.value = null
     canvasSession.value += 1
+    resetJourneyState(data)
     mergePrototypeSummary(data)
     await loadReviewComments(data.id, data.active_version)
     if (syncRoute && String(route.query.prototype || '') !== String(id)) {
@@ -685,7 +796,13 @@ function navigateScreen(screenId: string) {
   if (activeScreenId.value) screenHistory.value.push(activeScreenId.value)
   activeScreenId.value = screenId
   commentScreenId.value = screenId
-  lastInteraction.value = ''
+  if (journeyRunning.value && activeJourneyStep.value) {
+    lastInteraction.value = `路径步骤 ${journeyStepIndex.value + 1}：${activeJourneyStep.value.instruction}`
+  } else if (activeJourney.value && completedJourneyId.value === activeJourney.value.id) {
+    lastInteraction.value = `路径已完成：${activeJourney.value.name}`
+  } else {
+    lastInteraction.value = ''
+  }
 }
 
 function navigateBack() {
@@ -698,7 +815,94 @@ function navigateBack() {
 function resetCanvas() {
   canvasSession.value += 1
   screenHistory.value = []
+  if (journeyRunning.value && activeJourneyStep.value) {
+    activeScreenId.value = activeJourneyStep.value.screen_id
+    commentScreenId.value = activeScreenId.value
+    journeyFeedback.value = `交互状态已重置，请继续：${activeJourneyStep.value.instruction}`
+    journeyFeedbackTone.value = 'info'
+  }
   lastInteraction.value = '交互状态已重置'
+}
+
+function selectJourney(value: unknown) {
+  selectedJourneyId.value = String(value || '')
+  journeyStepIndex.value = 0
+  journeyRunning.value = false
+  completedJourneyId.value = ''
+  journeyFeedback.value = ''
+  journeyFeedbackTone.value = 'info'
+  lastInteraction.value = ''
+}
+
+function startJourney() {
+  const journey = activeJourney.value
+  if (!journey) return
+  selectedJourneyId.value = journey.id
+  journeyStepIndex.value = 0
+  journeyRunning.value = true
+  completedJourneyId.value = ''
+  journeyFeedbackTone.value = 'info'
+  journeyFeedback.value = `步骤 1：${journey.steps[0].instruction}`
+  canvasSession.value += 1
+  screenHistory.value = []
+  activeScreenId.value = journey.steps[0].screen_id
+  commentScreenId.value = activeScreenId.value
+  lastInteraction.value = `路径步骤 1：${journey.steps[0].instruction}`
+}
+
+function stopJourney() {
+  journeyRunning.value = false
+  journeyStepIndex.value = 0
+  completedJourneyId.value = ''
+  journeyFeedbackTone.value = 'info'
+  journeyFeedback.value = '已退出引导，可继续自由体验原型。'
+  lastInteraction.value = ''
+}
+
+function locateJourneyStep() {
+  const step = activeJourneyStep.value
+  if (!step) return
+  if (step.screen_id !== activeScreenId.value) navigateScreen(step.screen_id)
+  journeyFeedbackTone.value = 'info'
+  journeyFeedback.value = `已定位当前步骤：${step.instruction}`
+  lastInteraction.value = `路径步骤 ${journeyStepIndex.value + 1}：${step.instruction}`
+}
+
+function journeyComponentLabel(step: PrototypeJourneyStep) {
+  const screen = activePrototype.value?.current.specification.screens.find(
+    (item) => item.id === step.screen_id
+  )
+  const component = screen?.sections
+    .flatMap((section) => section.components)
+    .find((item) => item.id === step.component_id)
+  return component?.label || component?.text || step.component_id
+}
+
+function handlePrototypeAction(event: PrototypeActionEvent) {
+  const journey = activeJourney.value
+  const step = activeJourneyStep.value
+  if (!journey || !step) return
+  if (event.screen_id !== step.screen_id || event.component_id !== step.component_id) {
+    journeyFeedbackTone.value = 'error'
+    journeyFeedback.value = `当前需要在${screenName(step.screen_id)}触发“${journeyComponentLabel(step)}”。`
+    lastInteraction.value = `路径步骤 ${journeyStepIndex.value + 1}：${step.instruction}`
+    return
+  }
+
+  journeyStepIndex.value += 1
+  if (journeyStepIndex.value >= journey.steps.length) {
+    journeyRunning.value = false
+    completedJourneyId.value = journey.id
+    journeyFeedbackTone.value = 'success'
+    journeyFeedback.value = `路径体验完成：${journey.goal}`
+    lastInteraction.value = `路径已完成：${journey.name}`
+    return
+  }
+
+  const nextStep = journey.steps[journeyStepIndex.value]
+  journeyFeedbackTone.value = 'success'
+  journeyFeedback.value = `第 ${journeyStepIndex.value} 步已完成。下一步：${nextStep.instruction}`
+  lastInteraction.value = `路径步骤 ${journeyStepIndex.value + 1}：${nextStep.instruction}`
 }
 
 function openCreateDialog() {
@@ -824,6 +1028,7 @@ async function restoreVersion(version: number) {
     commentScreenId.value = activeScreenId.value
     screenHistory.value = []
     canvasSession.value += 1
+    resetJourneyState(data)
     materialization.value = null
     await loadReviewComments(data.id, data.active_version)
     ElMessage.success(`已恢复原型 v${version}`)
@@ -939,6 +1144,7 @@ function qualityCheckLabel(name: string) {
     navigation_integrity: '导航完整性',
     interactive_paths: '交互路径',
     screen_action_coverage: '界面操作覆盖',
+    journey_coverage: '用户旅程覆盖',
     primary_actions: '主要操作',
     visible_form_labels: '表单可访问性',
     responsive_contract: '响应式结构',
@@ -1729,6 +1935,147 @@ onBeforeUnmount(disposeGenerationStream)
   white-space: pre-wrap;
 }
 
+.journey-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.journey-panel > .el-select {
+  width: 100%;
+}
+
+.journey-panel :deep(.el-select__wrapper) {
+  min-height: 40px;
+}
+
+.journey-summary {
+  display: grid;
+  gap: 7px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.journey-summary > div {
+  display: grid;
+  gap: 3px;
+}
+
+.journey-summary strong {
+  font-size: 13px;
+}
+
+.journey-summary span,
+.journey-summary small {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.journey-summary small {
+  font-variant-numeric: tabular-nums;
+}
+
+.journey-step-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.journey-step-list li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 24px minmax(0, 1fr) 16px;
+  align-items: start;
+  gap: 8px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.journey-step-list li.current {
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-primary-soft);
+}
+
+.journey-step-number {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: #eef1f5;
+  color: var(--color-secondary-text);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.journey-step-list li.current .journey-step-number {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.journey-step-list li.completed .journey-step-number {
+  background: var(--color-success);
+  color: #fff;
+}
+
+.journey-step-list li > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.journey-step-list strong,
+.journey-step-list small {
+  overflow-wrap: anywhere;
+}
+
+.journey-step-list strong {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.journey-step-list small {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.journey-step-list .el-icon {
+  margin-top: 3px;
+  color: var(--color-success);
+}
+
+.journey-feedback {
+  padding: 9px 10px;
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-primary-soft);
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.journey-feedback.feedback-success {
+  border-left-color: var(--color-success);
+  background: #f0fdf4;
+}
+
+.journey-feedback.feedback-error {
+  border-left-color: var(--color-danger);
+  background: #fef2f2;
+}
+
+.journey-actions {
+  display: grid;
+  gap: 7px;
+}
+
+.journey-actions .el-button {
+  width: 100%;
+  min-height: 40px;
+  margin-left: 0;
+}
+
 .materialization-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2088,6 +2435,15 @@ onBeforeUnmount(disposeGenerationStream)
 
   .materialization-summary > div:last-child {
     border-bottom: 0;
+  }
+
+  .journey-actions .el-button {
+    min-height: 44px;
+  }
+
+  .journey-panel :deep(.el-select__wrapper),
+  .prototype-inspector :deep(.el-tabs__item) {
+    min-height: 44px;
   }
 }
 

@@ -341,6 +341,83 @@ def _auth_invitation_spec(product_name: str, prompt: str) -> PrototypeSpecificat
                 "foreground": "#111827",
                 "radius": "soft",
             },
+            "journeys": [
+                {
+                    "id": "new-user-onboarding",
+                    "name": "新用户注册并查看邀请进度",
+                    "goal": "完成注册与登录，进入个人中心查看完整邀请记录。",
+                    "steps": [
+                        {
+                            "screen_id": "register",
+                            "component_id": "register-submit",
+                            "instruction": "填写手机号和密码后完成注册",
+                            "expected_screen_id": "login",
+                        },
+                        {
+                            "screen_id": "login",
+                            "component_id": "login-submit",
+                            "instruction": "填写账号信息并登录",
+                            "expected_screen_id": "invite",
+                        },
+                        {
+                            "screen_id": "invite",
+                            "component_id": "invite-records-link",
+                            "instruction": "查看全部邀请记录",
+                            "expected_screen_id": "invite-records",
+                        },
+                    ],
+                },
+                {
+                    "id": "password-recovery",
+                    "name": "找回并重置密码",
+                    "goal": "从登录页进入密码重置流程，完成手机号验证后返回登录。",
+                    "steps": [
+                        {
+                            "screen_id": "login",
+                            "component_id": "login-forgot",
+                            "instruction": "进入忘记密码流程",
+                            "expected_screen_id": "reset-password",
+                        },
+                        {
+                            "screen_id": "reset-password",
+                            "component_id": "reset-next",
+                            "instruction": "填写手机号和验证码后进入下一步",
+                            "expected_screen_id": "reset-password",
+                        },
+                        {
+                            "screen_id": "reset-password",
+                            "component_id": "reset-back",
+                            "instruction": "返回登录页",
+                            "expected_screen_id": "login",
+                        },
+                    ],
+                },
+                {
+                    "id": "share-invitation",
+                    "name": "复制邀请链接并核对记录",
+                    "goal": "复制专属邀请链接，并核对邀请记录与奖励状态。",
+                    "steps": [
+                        {
+                            "screen_id": "invite",
+                            "component_id": "invite-copy",
+                            "instruction": "复制专属邀请链接",
+                            "expected_screen_id": "invite",
+                        },
+                        {
+                            "screen_id": "invite",
+                            "component_id": "invite-records-link",
+                            "instruction": "打开全部邀请记录",
+                            "expected_screen_id": "invite-records",
+                        },
+                        {
+                            "screen_id": "invite-records",
+                            "component_id": "records-back",
+                            "instruction": "返回邀请概览",
+                            "expected_screen_id": "invite",
+                        },
+                    ],
+                },
+            ],
             "screens": screens,
         }
     )
@@ -354,6 +431,39 @@ def _generic_product_spec(product_name: str, prompt: str) -> PrototypeSpecificat
             "summary": summary,
             "start_screen_id": "overview",
             "theme": {},
+            "journeys": [
+                {
+                    "id": "create-and-review-item",
+                    "name": "创建并查看事项",
+                    "goal": "从工作台创建新事项，确认结果并查看详情后返回工作台。",
+                    "steps": [
+                        {
+                            "screen_id": "overview",
+                            "component_id": "overview-create",
+                            "instruction": "从工作台创建新事项",
+                            "expected_screen_id": "create",
+                        },
+                        {
+                            "screen_id": "create",
+                            "component_id": "create-submit",
+                            "instruction": "填写必填信息并提交",
+                            "expected_screen_id": "complete",
+                        },
+                        {
+                            "screen_id": "complete",
+                            "component_id": "complete-detail",
+                            "instruction": "查看新事项详情",
+                            "expected_screen_id": "detail",
+                        },
+                        {
+                            "screen_id": "detail",
+                            "component_id": "detail-back",
+                            "instruction": "返回业务工作台",
+                            "expected_screen_id": "overview",
+                        },
+                    ],
+                }
+            ],
             "screens": [
                 {
                     "id": "overview",
@@ -633,9 +743,24 @@ def evaluate_specification(spec: PrototypeSpecification) -> dict[str, Any]:
         for target in edges[current] - reachable:
             reachable.add(target)
             frontier.append(target)
+    journey_screens = {
+        screen_id
+        for journey in spec.journeys
+        for step in journey.steps
+        for screen_id in (step.screen_id, step.expected_screen_id)
+    }
+    journey_coverage = bool(spec.journeys) and screen_ids.issubset(journey_screens)
     checks = [
         {"name": "navigation_integrity", "passed": reachable == screen_ids, "detail": f"{len(reachable)}/{len(screen_ids)} screens reachable"},
         {"name": "interactive_paths", "passed": interactive_count >= len(spec.screens), "detail": f"{interactive_count} interactive actions"},
+        {
+            "name": "journey_coverage",
+            "passed": journey_coverage,
+            "detail": (
+                f"{len(screen_ids & journey_screens)}/{len(screen_ids)} screens covered by "
+                f"{len(spec.journeys)} journeys"
+            ),
+        },
         {
             "name": "screen_action_coverage",
             "passed": not screens_without_actions,
@@ -658,6 +783,7 @@ def repair_specification_structure(
     structural_checks = {
         "navigation_integrity",
         "interactive_paths",
+        "journey_coverage",
         "screen_action_coverage",
         "primary_actions",
     }
@@ -732,6 +858,67 @@ def repair_specification_structure(
             if primary_count >= required_primary:
                 break
 
+    journeys = payload.setdefault("journeys", [])
+    covered_screens = {
+        screen_id
+        for journey in journeys
+        for step in journey.get("steps", [])
+        for screen_id in (step.get("screen_id"), step.get("expected_screen_id"))
+        if screen_id
+    }
+    journey_ids = {journey.get("id") for journey in journeys}
+    for screen in screens:
+        if screen["id"] in covered_screens:
+            continue
+        candidates = [
+            component
+            for section in screen["sections"]
+            for component in section["components"]
+            if component.get("type") in {"button", "link"} and component.get("action")
+        ]
+        if not candidates:
+            continue
+        component = next(
+            (
+                item
+                for item in candidates
+                if (item.get("action") or {}).get("type") == "navigate"
+            ),
+            candidates[0],
+        )
+        action = component["action"]
+        expected_screen_id = (
+            action.get("target")
+            if action.get("type") == "navigate"
+            else spec.start_screen_id
+            if action.get("type") == "back"
+            else screen["id"]
+        )
+        base_id = f"journey-{screen['id']}"[:64]
+        journey_id = base_id
+        suffix = 2
+        while journey_id in journey_ids:
+            journey_id = f"{base_id[:61]}-{suffix}"
+            suffix += 1
+        journeys.append(
+            {
+                "id": journey_id,
+                "name": f"体验{screen['name']}",
+                "goal": f"验证{screen['name']}的主要操作可以完成并产生预期结果。",
+                "steps": [
+                    {
+                        "screen_id": screen["id"],
+                        "component_id": component["id"],
+                        "instruction": f"触发“{component.get('label') or component.get('text') or component['id']}”",
+                        "expected_screen_id": expected_screen_id,
+                    }
+                ],
+            }
+        )
+        journey_ids.add(journey_id)
+        covered_screens.update({screen["id"], expected_screen_id})
+        repairs.append(f"{screen['name']}: 补齐体验路径 {journey_id}")
+
     repaired = PrototypeSpecification.model_validate(payload)
     return repaired, repairs
 
@@ -794,7 +981,8 @@ async def review_prototype_specification(
     review_prompt = (
         "你是原型质量门禁判定 Agent。本步骤不是编写测试策略或测试用例；"
         "禁止输出 test_strategy、functional_test_cases 等额外结构。"
-        "检查用户路径、边界状态、表单可访问性、移动端可用性和验收风险。"
+        "检查 journeys 是否代表真实用户目标、每一步是否可执行，以及边界状态、表单可访问性、"
+        "移动端可用性和验收风险。"
         "只输出一个 JSON 对象且只能包含四个字段："
         "{\"passed\":boolean,\"score\":0-100,\"issues\":[string],\"summary\":string}。"
         f"存在任何阻塞验收的问题或分数低于 {PROTOTYPE_REVIEW_MIN_SCORE} 时 passed 必须为 false。"
@@ -891,7 +1079,8 @@ async def generate_prototype_artifact(
             role=AgentRole.product_manager,
             agent_snapshot=agents.get(AgentRole.product_manager.value),
             fallback_prompt=(
-                "你正在生成交互原型。先定义目标用户、核心路径、界面清单、每个界面的成功条件。"
+                "你正在生成交互原型。先定义目标用户、2-5 条可执行用户旅程、界面清单、"
+                "每个界面的成功条件。每条旅程必须说明用户目标和按顺序触发的具体操作。"
                 "不要声称已实现代码。"
             ),
             content=json.dumps(generation_context, ensure_ascii=False),
@@ -906,7 +1095,14 @@ async def generate_prototype_artifact(
         "component_types": ["heading", "text", "input", "textarea", "select", "button", "link", "stepper", "stats", "callout", "table", "tabs", "list", "divider"],
         "action_types": ["navigate", "toast", "submit", "copy", "advance_step", "back"],
         "layouts": ["auth", "app", "dashboard", "form", "list"],
-        "rules": ["return one JSON object only", "all IDs lowercase and unique", "all form controls have labels", "navigate targets must exist", "2-12 screens"],
+        "rules": [
+            "return one JSON object only",
+            "all IDs lowercase and unique",
+            "all form controls have labels",
+            "navigate targets must exist",
+            "journeys reference executable button or link actions and cover every screen",
+            "2-20 screens",
+        ],
     }
     architect_output = str(state.get("architect_output") or "")
     architect_trace: dict[str, Any] | None = None
@@ -919,7 +1115,7 @@ async def generate_prototype_artifact(
             fallback_prompt=(
                 "你是交互原型 DSL 编译器。把产品方案转换为安全的结构化原型，只输出一个满足用户消息中"
                 " json_schema 的 JSON 对象。顶层必须且只能使用 product_name、summary、start_screen_id、"
-                "theme、screens；不要回显 context、product_brief、schema_guide，不输出 HTML、JavaScript、"
+                "theme、journeys、screens；不要回显 context、product_brief、schema_guide，不输出 HTML、JavaScript、"
                 "Markdown 或解释。"
             ),
             content=json.dumps(
@@ -1049,7 +1245,7 @@ async def generate_prototype_artifact(
             fallback_prompt=(
                 "你是交互架构返修 Agent。根据确定性门禁和测试 Agent 反馈修复原型。"
                 "保留已正确的产品需求，返回完整且可独立校验的原型 DSL JSON；"
-                "顶层必须且只能使用 product_name、summary、start_screen_id、theme、screens；"
+                "顶层必须且只能使用 product_name、summary、start_screen_id、theme、journeys、screens；"
                 "严格满足用户消息中的 json_schema，不要输出 answer、context、HTML、JavaScript、"
                 "Markdown 或解释。"
             ),

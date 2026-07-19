@@ -57,6 +57,37 @@ function prototypeSpecification() {
       foreground: '#111827',
       radius: 'soft'
     },
+    journeys: [
+      {
+        id: 'new-user-onboarding',
+        name: '新用户注册并查看邀请进度',
+        goal: '完成注册与登录，进入个人中心查看完整邀请记录。',
+        steps: [
+          { screen_id: 'register', component_id: 'register-submit', instruction: '填写手机号和密码后完成注册', expected_screen_id: 'login' },
+          { screen_id: 'login', component_id: 'login-submit', instruction: '填写账号信息并登录', expected_screen_id: 'invite' },
+          { screen_id: 'invite', component_id: 'invite-records', instruction: '查看全部邀请记录', expected_screen_id: 'invite-records' }
+        ]
+      },
+      {
+        id: 'password-recovery',
+        name: '找回并重置密码',
+        goal: '从登录页进入密码重置流程。',
+        steps: [
+          { screen_id: 'login', component_id: 'login-forgot', instruction: '进入忘记密码流程', expected_screen_id: 'reset-password' },
+          { screen_id: 'reset-password', component_id: 'reset-next', instruction: '填写手机号和验证码后进入下一步', expected_screen_id: 'reset-password' }
+        ]
+      },
+      {
+        id: 'share-invitation',
+        name: '复制邀请链接并核对记录',
+        goal: '复制专属邀请链接，并核对邀请记录。',
+        steps: [
+          { screen_id: 'invite', component_id: 'invite-copy', instruction: '复制专属邀请链接', expected_screen_id: 'invite' },
+          { screen_id: 'invite', component_id: 'invite-records', instruction: '打开全部邀请记录', expected_screen_id: 'invite-records' },
+          { screen_id: 'invite-records', component_id: 'records-back', instruction: '返回邀请概览', expected_screen_id: 'invite' }
+        ]
+      }
+    ],
     screens: [
       {
         id: 'register', name: '注册页', description: '新用户通过手机号、邀请码和密码完成注册。', layout: 'auth',
@@ -137,6 +168,7 @@ function prototypeVersion(version: number) {
       checks: [
         { name: 'navigation_integrity', passed: true, detail: '5/5 screens reachable' },
         { name: 'interactive_paths', passed: true, detail: '8 interactive actions' },
+        { name: 'journey_coverage', passed: true, detail: '5/5 screens covered by 3 journeys' },
         { name: 'primary_actions', passed: true, detail: '4 primary actions' },
         { name: 'visible_form_labels', passed: true, detail: '6 labeled form controls' },
         { name: 'responsive_contract', passed: true, detail: 'structured sections support desktop and mobile renderers' }
@@ -2995,7 +3027,7 @@ test('reviews, replans and approves an execution plan before specialist dispatch
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
 })
 
-test('uses the five-screen interactive prototype on desktop and mobile preview', async ({ page }) => {
+test('uses the five-screen interactive prototype on desktop and mobile preview', async ({ page }, testInfo) => {
   await page.goto('/prototypes?prototype=41')
 
   await expect(page.getByRole('heading', { name: 'AI 原型工作室' })).toBeVisible()
@@ -3016,6 +3048,39 @@ test('uses the five-screen interactive prototype on desktop and mobile preview',
   await expect(page.getByText('AI产品经理', { exact: true })).toBeVisible()
   await expect(page.getByText('AI架构师', { exact: true })).toBeVisible()
   await expect(page.getByText('AI测试工程师', { exact: true })).toBeVisible()
+
+  await page.getByRole('tab', { name: '路径 3', exact: true }).click()
+  await expect(page.getByLabel('体验路径进度').getByText('新用户注册并查看邀请进度', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '开始体验', exact: true }).click()
+  await expect(page.getByText('步骤 1/3', { exact: true })).toBeVisible()
+  await expect(page.locator('.journey-target')).toHaveText('完成注册')
+  await page.getByLabel('手机号').fill('13800138000')
+  await page.getByLabel('设置密码').fill('prototype-pass')
+  await page.getByRole('button', { name: '完成注册', exact: true }).click()
+  await expect(page.getByText('步骤 2/3', { exact: true })).toBeVisible()
+  await expect(page.locator('.journey-target')).toHaveText('登录')
+  await page.getByRole('button', { name: '忘记密码？', exact: true }).click()
+  await expect(page.locator('.journey-feedback')).toContainText('当前需要在登录页触发“登录”')
+  await expect(page.locator('.prototype-runtime').getByRole('heading', { name: '重置密码', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '定位当前步骤', exact: true }).click()
+  await expect(page.locator('.prototype-runtime').getByText('账号登录', { exact: true })).toBeVisible()
+  await page.getByLabel('手机号').fill('13800138000')
+  await page.getByLabel('密码').fill('prototype-pass')
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(page.getByText('步骤 3/3', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '查看全部邀请记录', exact: true }).click()
+  await expect(page.locator('.journey-feedback')).toContainText('路径体验完成')
+  await expect(page.getByText('3/3 步已完成', { exact: true })).toBeVisible()
+
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+      await page.setViewportSize(viewport)
+      await expect(page.locator('.prototype-runtime')).toBeVisible()
+      await expect(page.locator('.journey-panel')).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
+    }
+  }
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)

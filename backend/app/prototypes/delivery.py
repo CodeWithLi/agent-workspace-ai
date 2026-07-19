@@ -99,4 +99,25 @@ def build_prototype_test_case_blueprints(
                     "priority": "MEDIUM",
                 }
             )
+    for journey in specification.journeys:
+        first_step = journey.steps[0]
+        final_screen = screen_names[journey.steps[-1].expected_screen_id]
+        cases.append(
+            {
+                "screen_id": first_step.screen_id,
+                "case_key": f"journey:{journey.id}",
+                "title": f"完成用户旅程：{journey.name}",
+                "preconditions": (
+                    f"已打开{screen_names[first_step.screen_id]}，并准备好完成旅程所需的测试数据。"
+                ),
+                "steps": [
+                    f"在{screen_names[step.screen_id]}：{step.instruction}"
+                    for step in journey.steps
+                ],
+                "expected_result": (
+                    f"完成“{journey.goal}”，全部步骤按顺序通过，最终到达{final_screen}。"
+                ),
+                "priority": "HIGH",
+            }
+        )
     return cases

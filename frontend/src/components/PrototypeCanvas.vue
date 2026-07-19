@@ -64,7 +64,7 @@
             <button
               v-else-if="component.type === 'button'"
               class="runtime-button"
-              :class="`button-${component.variant}`"
+              :class="[`button-${component.variant}`, { 'journey-target': component.id === highlightComponentId }]"
               :disabled="component.disabled"
               @click="handleAction(component)"
             >{{ component.label || component.text }}</button>
@@ -72,6 +72,7 @@
             <button
               v-else-if="component.type === 'link'"
               class="runtime-link"
+              :class="{ 'journey-target': component.id === highlightComponentId }"
               :disabled="component.disabled"
               @click="handleAction(component)"
             >{{ component.label || component.text }}</button>
@@ -130,18 +131,20 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import type { PrototypeComponentSpec, PrototypeScreen, PrototypeSpecification } from '../api/types'
+import type { PrototypeActionEvent, PrototypeComponentSpec, PrototypeScreen, PrototypeSpecification } from '../api/types'
 
 const props = defineProps<{
   spec: PrototypeSpecification
   screenId: string
   deviceMode: 'desktop' | 'mobile'
+  highlightComponentId?: string
 }>()
 
 const emit = defineEmits<{
   navigate: [screenId: string]
   back: []
   interaction: [message: string]
+  action: [event: PrototypeActionEvent]
 }>()
 
 const inputValues = reactive<Record<string, string>>({})
@@ -195,21 +198,34 @@ function validateCurrentScreen() {
   return valid
 }
 
+function emitAction(component: PrototypeComponentSpec) {
+  if (!component.action) return
+  emit('action', {
+    screen_id: screen.value.id,
+    component_id: component.id,
+    action_type: component.action.type,
+    target: component.action.target
+  })
+}
+
 async function handleAction(component: PrototypeComponentSpec) {
   const action = component.action
   if (!action) return
   if (action.type === 'navigate' && action.target) {
     if (component.type === 'button' && !validateCurrentScreen()) return
+    emitAction(component)
     if (action.message) showToast(action.message)
     emit('navigate', action.target)
     return
   }
   if (action.type === 'back') {
+    emitAction(component)
     emit('back')
     return
   }
   if (action.type === 'advance_step') {
     if (!validateCurrentScreen()) return
+    emitAction(component)
     const stepper = screen.value.sections.flatMap((section) => section.components).find((item) => item.type === 'stepper')
     if (stepper) {
       const current = stepActive(stepper)
@@ -224,10 +240,12 @@ async function handleAction(component: PrototypeComponentSpec) {
     } catch {
       // Clipboard access can be unavailable in embedded previews; feedback still confirms the intended interaction.
     }
+    emitAction(component)
     showToast(action.message || '内容已复制')
     return
   }
   if (action.type === 'submit' && !validateCurrentScreen()) return
+  emitAction(component)
   showToast(action.message || (action.type === 'submit' ? '提交成功' : '操作已完成'))
 }
 
@@ -322,6 +340,7 @@ onBeforeUnmount(() => window.clearTimeout(toastTimer))
 .runtime-link { justify-self: center; padding: 0 8px; border: 0; background: transparent; color: var(--prototype-accent); text-decoration: underline; text-underline-offset: 3px; }
 .runtime-button:disabled,
 .runtime-link:disabled { opacity: 0.5; cursor: not-allowed; }
+.journey-target { outline: 3px solid var(--prototype-accent); outline-offset: 4px; scroll-margin: 24px; }
 
 .runtime-stepper { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-bottom: 8px; }
 .runtime-stepper > div { position: relative; display: grid; justify-items: center; gap: 7px; color: #94a3b8; font-size: 12px; text-align: center; }
