@@ -1444,6 +1444,24 @@ class CollaborationQuestion(BaseModel):
     blocking: bool = False
 
 
+class ReviewerCriterionVerdict(BaseModel):
+    criterion_id: AcceptanceCriterionId
+    verdict: Literal["PASS", "FAIL", "ABSTAIN"]
+    confidence: float = Field(ge=0, le=1)
+    rationale: str = Field(min_length=4, max_length=2000)
+    revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_verdict(self) -> "ReviewerCriterionVerdict":
+        if len(self.revision_roles) != len(set(self.revision_roles)):
+            raise ValueError("criterion verdict revision roles must be unique")
+        if self.verdict == "FAIL" and not self.revision_roles:
+            raise ValueError("failed criterion verdicts require revision roles")
+        if self.verdict != "FAIL" and self.revision_roles:
+            raise ValueError("only failed criterion verdicts may request revision roles")
+        return self
+
+
 class ReviewerDecision(BaseModel):
     passed: bool
     score: float = Field(ge=0, le=100)
@@ -1453,6 +1471,17 @@ class ReviewerDecision(BaseModel):
     decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
     conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
     open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
+    criterion_verdicts: list[ReviewerCriterionVerdict] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+
+    @model_validator(mode="after")
+    def validate_criterion_verdicts(self) -> "ReviewerDecision":
+        criterion_ids = [item.criterion_id for item in self.criterion_verdicts]
+        if len(criterion_ids) != len(set(criterion_ids)):
+            raise ValueError("reviewer criterion verdicts must be unique")
+        return self
 
 
 class ReviewerAssessment(BaseModel):
@@ -1462,6 +1491,27 @@ class ReviewerAssessment(BaseModel):
     score: float | None = Field(default=None, ge=0, le=100)
     summary: str = Field(default="", max_length=4000)
     issues: list[str] = Field(default_factory=list, max_length=20)
+    criterion_verdicts: list[ReviewerCriterionVerdict] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+
+
+class CriterionReviewerVote(ReviewerCriterionVerdict):
+    reviewer_role: ReviewerPanelRole
+
+
+class CriterionGateAssessment(BaseModel):
+    criterion_id: AcceptanceCriterionId
+    description: str = Field(default="", max_length=500)
+    priority: Literal["MUST", "SHOULD", "COULD"] | None = None
+    owner_roles: list[SpecialistRole] = Field(min_length=1, max_length=4)
+    reviewer_votes: list[CriterionReviewerVote] = Field(default_factory=list, max_length=3)
+    quorum: int = Field(ge=1, le=3)
+    pass_count: int = Field(ge=0, le=3)
+    fail_count: int = Field(ge=0, le=3)
+    abstain_count: int = Field(ge=0, le=3)
+    passed: bool
 
 
 class QualityGateDecision(BaseModel):
@@ -1477,6 +1527,12 @@ class QualityGateDecision(BaseModel):
     reviewer_valid_count: int = Field(default=0, ge=0, le=3)
     reviewer_pass_count: int = Field(default=0, ge=0, le=3)
     reviewer_disagreement_count: int = Field(default=0, ge=0, le=3)
+    criterion_assessments: list[CriterionGateAssessment] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    criterion_pass_count: int = Field(default=0, ge=0, le=10)
+    criterion_fail_count: int = Field(default=0, ge=0, le=10)
     decisions: list[CollaborationDecision] = Field(default_factory=list, max_length=20)
     conflicts: list[CollaborationConflict] = Field(default_factory=list, max_length=20)
     open_questions: list[CollaborationQuestion] = Field(default_factory=list, max_length=20)
@@ -2068,7 +2124,7 @@ def merge_reviewer_decision(
     reviewer_output: str,
     plan: MultiAgentExecutionPlan,
 ) -> QualityGateDecision:
-    reviewer = _parse_reviewer_decision(reviewer_output)
+    reviewer = _parse_reviewer_decision(reviewer_output, plan)
     if reviewer is None:
         return deterministic.model_copy(
             update={"reviewer_summary": reviewer_output[:8000]}
@@ -2159,10 +2215,47 @@ def merge_reviewer_decision(
     )
 
 
-def _parse_reviewer_decision(reviewer_output: str) -> ReviewerDecision | None:
+def _criterion_owners(
+    plan: MultiAgentExecutionPlan,
+) -> dict[str, list[SpecialistRole]]:
+    owners: dict[str, list[SpecialistRole]] = {}
+    for assignment in plan.assignments:
+        for criterion_id in assignment.criterion_ids:
+            owners.setdefault(criterion_id, []).append(assignment.role)
+    return owners
+
+
+def _reviewer_criterion_contract_valid(
+    reviewer: ReviewerDecision,
+    plan: MultiAgentExecutionPlan,
+) -> bool:
+    owners = _criterion_owners(plan)
+    if not owners:
+        return not reviewer.criterion_verdicts
+    verdicts = {
+        verdict.criterion_id: verdict for verdict in reviewer.criterion_verdicts
+    }
+    if set(verdicts) != set(owners):
+        return False
+    return all(
+        set(verdict.revision_roles).issubset(owners[criterion_id])
+        for criterion_id, verdict in verdicts.items()
+    )
+
+
+def _parse_reviewer_decision(
+    reviewer_output: str,
+    plan: MultiAgentExecutionPlan | None = None,
+) -> ReviewerDecision | None:
     for candidate in _json_candidates(reviewer_output):
         try:
-            return ReviewerDecision.model_validate(json.loads(candidate))
+            reviewer = ReviewerDecision.model_validate(json.loads(candidate))
+            if plan is not None and not _reviewer_criterion_contract_valid(
+                reviewer,
+                plan,
+            ):
+                continue
+            return reviewer
         except (json.JSONDecodeError, ValidationError):
             continue
     return None
@@ -2188,6 +2281,7 @@ def merge_reviewer_panel(
     plan: MultiAgentExecutionPlan,
     *,
     quorum: int = 2,
+    criterion_context: list[HandoffEvidenceCriterion] | None = None,
 ) -> QualityGateDecision:
     if not 1 <= quorum <= len(reviewer_outputs):
         raise ValueError("reviewer quorum must fit the configured panel")
@@ -2195,9 +2289,10 @@ def merge_reviewer_panel(
     assessments: list[ReviewerAssessment] = []
     valid_scores: list[float] = []
     merged_reviews: list[QualityGateDecision] = []
+    valid_reviewers: list[tuple[ReviewerPanelRole, ReviewerDecision]] = []
     summaries: list[str] = []
     for role, output in reviewer_outputs.items():
-        reviewer = _parse_reviewer_decision(output)
+        reviewer = _parse_reviewer_decision(output, plan)
         if reviewer is None:
             assessments.append(
                 ReviewerAssessment(
@@ -2211,6 +2306,7 @@ def merge_reviewer_panel(
             continue
         merged = merge_reviewer_decision(deterministic, output, plan)
         merged_reviews.append(merged)
+        valid_reviewers.append((role, reviewer))
         valid_scores.append(reviewer.score)
         summary = reviewer.summary or "Reviewer 未提供摘要。"
         summaries.append(f"{role}: {summary}")
@@ -2226,12 +2322,49 @@ def merge_reviewer_panel(
                 score=reviewer.score,
                 summary=summary,
                 issues=merged.issues,
+                criterion_verdicts=reviewer.criterion_verdicts,
             )
         )
 
     valid_count = len(merged_reviews)
     if valid_count < quorum:
         raise ReviewerPanelQuorumError(valid_count, quorum, len(reviewer_outputs))
+
+    criterion_context_by_id = {
+        item.criterion_id: item for item in (criterion_context or [])
+    }
+    criterion_assessments: list[CriterionGateAssessment] = []
+    for criterion_id, owner_roles in _criterion_owners(plan).items():
+        votes = []
+        for reviewer_role, reviewer in valid_reviewers:
+            verdict = next(
+                item
+                for item in reviewer.criterion_verdicts
+                if item.criterion_id == criterion_id
+            )
+            votes.append(
+                CriterionReviewerVote(
+                    reviewer_role=reviewer_role,
+                    **verdict.model_dump(mode="json"),
+                )
+            )
+        pass_count_for_criterion = sum(vote.verdict == "PASS" for vote in votes)
+        fail_count_for_criterion = sum(vote.verdict == "FAIL" for vote in votes)
+        criterion = criterion_context_by_id.get(criterion_id)
+        criterion_assessments.append(
+            CriterionGateAssessment(
+                criterion_id=criterion_id,
+                description=criterion.description if criterion is not None else "",
+                priority=criterion.priority if criterion is not None else None,
+                owner_roles=owner_roles,
+                reviewer_votes=votes,
+                quorum=quorum,
+                pass_count=pass_count_for_criterion,
+                fail_count=fail_count_for_criterion,
+                abstain_count=sum(vote.verdict == "ABSTAIN" for vote in votes),
+                passed=pass_count_for_criterion >= quorum,
+            )
+        )
 
     pass_count = sum(assessment.passed for assessment in assessments)
     conflicts = _unique_models(
@@ -2249,8 +2382,11 @@ def merge_reviewer_panel(
         if conflict.status == "OPEN" and conflict.blocking
     ]
     blocking_questions = [question for question in open_questions if question.blocking]
+    failed_criteria = [
+        assessment for assessment in criterion_assessments if not assessment.passed
+    ]
     score = min(deterministic.score, float(median(valid_scores)))
-    if blocking_conflicts or blocking_questions:
+    if blocking_conflicts or blocking_questions or failed_criteria:
         score = min(score, 79.0)
     passed = (
         deterministic.passed
@@ -2258,12 +2394,21 @@ def merge_reviewer_panel(
         and score >= 80
         and not blocking_conflicts
         and not blocking_questions
+        and not failed_criteria
     )
     issues = list(
         dict.fromkeys(
-            issue
-            for review in merged_reviews
-            for issue in review.issues
+            [
+                *(
+                    issue
+                    for review in merged_reviews
+                    for issue in review.issues
+                ),
+                *(
+                    f"验收标准未达到逐项评审 quorum：{assessment.criterion_id}"
+                    for assessment in failed_criteria
+                ),
+            ]
         )
     )
     revision_roles = list(
@@ -2273,7 +2418,24 @@ def merge_reviewer_panel(
             for role in review.revision_roles
         )
     )
+    for assessment in failed_criteria:
+        requested_roles = [
+            role
+            for vote in assessment.reviewer_votes
+            if vote.verdict == "FAIL"
+            for role in vote.revision_roles
+        ]
+        revision_roles.extend(requested_roles or assessment.owner_roles)
+    revision_roles = list(dict.fromkeys(revision_roles))
     disagreement_count = min(pass_count, valid_count - pass_count)
+    criterion_pass_count = sum(
+        assessment.passed for assessment in criterion_assessments
+    )
+    criterion_summary = (
+        f"逐项验收 {criterion_pass_count}/{len(criterion_assessments)} 通过，"
+        if criterion_assessments
+        else ""
+    )
     return deterministic.model_copy(
         update={
             "score": score,
@@ -2281,9 +2443,11 @@ def merge_reviewer_panel(
             "issues": issues,
             "revision_roles": [] if passed else revision_roles,
             "summary": (
-                f"评审团 {pass_count}/{valid_count} 票通过，仲裁放行。"
+                f"评审团 {pass_count}/{valid_count} 票通过，"
+                f"{criterion_summary}仲裁放行。"
                 if passed
-                else f"评审团 {pass_count}/{valid_count} 票通过，未满足放行条件。"
+                else f"评审团 {pass_count}/{valid_count} 票通过，"
+                f"{criterion_summary}未满足放行条件。"
             ),
             "reviewer_summary": "\n".join(summaries)[:8000],
             "reviewers": assessments,
@@ -2291,6 +2455,9 @@ def merge_reviewer_panel(
             "reviewer_valid_count": valid_count,
             "reviewer_pass_count": pass_count,
             "reviewer_disagreement_count": disagreement_count,
+            "criterion_assessments": criterion_assessments,
+            "criterion_pass_count": criterion_pass_count,
+            "criterion_fail_count": len(failed_criteria),
             "decisions": decisions,
             "conflicts": conflicts,
             "open_questions": open_questions,

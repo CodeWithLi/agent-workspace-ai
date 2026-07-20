@@ -1668,3 +1668,124 @@ def test_reviewer_panel_blocks_any_open_blocker_and_requires_quorum() -> None:
     assert blocked.revision_roles == ["operations_analyst"]
     assert blocked.open_questions[0].blocking is True
     assert blocked.reviewer_pass_count == 2
+
+
+def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None:
+    plan = build_fallback_plan(
+        "设计可灰度发布并可回滚的项目交付流程",
+        criterion_ids=["AC-01", "AC-02"],
+    )
+    handoffs = [
+        AgentHandoff(
+            role=assignment.role,
+            objective=assignment.objective,
+            deliverable=assignment.deliverable,
+            content=(
+                "明确范围、关键决策、失败边界、验收证据、责任角色和复现步骤。"
+                "发布、监控、回滚与证据归档均具备可审计约束。" * 2
+            ),
+            revision_round=0,
+        )
+        for assignment in plan.assignments
+    ]
+    deterministic = evaluate_handoffs(plan, handoffs)
+    owners = {
+        criterion_id: [
+            assignment.role
+            for assignment in plan.assignments
+            if criterion_id in assignment.criterion_ids
+        ]
+        for criterion_id in ("AC-01", "AC-02")
+    }
+
+    def reviewer_output(ac02_verdict: str) -> str:
+        verdicts = []
+        for criterion_id, verdict in (
+            ("AC-01", "PASS"),
+            ("AC-02", ac02_verdict),
+        ):
+            verdicts.append(
+                {
+                    "criterion_id": criterion_id,
+                    "verdict": verdict,
+                    "confidence": 0.9,
+                    "rationale": f"{criterion_id} 的验收证据已按独立焦点完成复核。",
+                    "revision_roles": owners[criterion_id] if verdict == "FAIL" else [],
+                }
+            )
+        return json.dumps(
+            {
+                "passed": True,
+                "score": 94,
+                "issues": [],
+                "revision_roles": [],
+                "summary": "整体交付证据达到评审门槛。",
+                "decisions": [],
+                "conflicts": [],
+                "open_questions": [],
+                "criterion_verdicts": verdicts,
+            },
+            ensure_ascii=False,
+        )
+
+    criterion_context = [
+        HandoffEvidenceCriterion(
+            criterion_id=criterion_id,
+            description=f"{criterion_id} 必须具有独立可复核的验收结果",
+            evidence="自动化记录与运行快照",
+            priority="MUST",
+        )
+        for criterion_id in ("AC-01", "AC-02")
+    ]
+    blocked = merge_reviewer_panel(
+        deterministic,
+        {
+            "test_engineer": reviewer_output("PASS"),
+            "operations_analyst": reviewer_output("FAIL"),
+            "architect": reviewer_output("ABSTAIN"),
+        },
+        plan,
+        criterion_context=criterion_context,
+    )
+
+    assert blocked.reviewer_pass_count == 3
+    assert blocked.passed is False
+    assert blocked.score == 79
+    assert blocked.criterion_pass_count == 1
+    assert blocked.criterion_fail_count == 1
+    assert [item.passed for item in blocked.criterion_assessments] == [True, False]
+    assert blocked.criterion_assessments[1].pass_count == 1
+    assert blocked.criterion_assessments[1].fail_count == 1
+    assert blocked.criterion_assessments[1].abstain_count == 1
+    assert blocked.criterion_assessments[1].description.startswith("AC-02")
+    assert set(blocked.revision_roles) == set(owners["AC-02"])
+    assert any("AC-02" in issue for issue in blocked.issues)
+
+    passed = merge_reviewer_panel(
+        deterministic,
+        {
+            "test_engineer": reviewer_output("PASS"),
+            "operations_analyst": reviewer_output("FAIL"),
+            "architect": reviewer_output("PASS"),
+        },
+        plan,
+        criterion_context=criterion_context,
+    )
+
+    assert passed.passed is True
+    assert passed.criterion_pass_count == 2
+    assert passed.criterion_fail_count == 0
+    assert passed.revision_roles == []
+
+    missing_criterion = json.loads(reviewer_output("PASS"))
+    missing_criterion["criterion_verdicts"] = missing_criterion["criterion_verdicts"][:1]
+    with pytest.raises(ReviewerPanelQuorumError):
+        merge_reviewer_panel(
+            deterministic,
+            {
+                "test_engineer": reviewer_output("PASS"),
+                "operations_analyst": json.dumps(missing_criterion),
+                "architect": "not-json",
+            },
+            plan,
+        )

@@ -79,6 +79,22 @@ def structured_handoff_response(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def structured_reviewer_response(user_prompt: str, payload: dict) -> str:
+    context = json.loads(user_prompt)
+    verdict = "PASS" if payload["passed"] else "FAIL"
+    payload["criterion_verdicts"] = [
+        {
+            "criterion_id": criterion["criterion_id"],
+            "verdict": verdict,
+            "confidence": min(1, max(0, payload["score"] / 100)),
+            "rationale": "该验收标准已按 Reviewer 独立关注域完成逐项复核。",
+            "revision_roles": criterion["owner_roles"] if verdict == "FAIL" else [],
+        }
+        for criterion in context.get("review_criteria", [])
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) -> None:
     user = User(email="boundary-pause@example.com", name="Boundary Pause", password_hash="hash")
     db.add(user)
@@ -204,7 +220,8 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
         if "交接质量评审 Agent" in system_prompt:
             if json.loads(user_prompt)["reviewer_role"] == "architect":
                 raise TimeoutError("architect reviewer unavailable")
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 95,
@@ -215,7 +232,6 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
                     "conflicts": [],
                     "open_questions": [],
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n已确认。"
@@ -339,7 +355,8 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
             role = context["assignment"]["role"]
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 96,
@@ -347,7 +364,6 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                     "revision_roles": [],
                     "summary": "专业交接达到发布门禁。",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n执行计划已经人工批准。"
@@ -578,7 +594,8 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
             role = context["assignment"]["role"]
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 95,
@@ -586,7 +603,6 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
                     "revision_roles": [],
                     "summary": "质量门禁通过。",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n执行者质疑已经人工计划批准。"
@@ -774,7 +790,8 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
             role = context["assignment"]["role"]
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 96,
@@ -782,7 +799,6 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
                     "revision_roles": [],
                     "summary": "专业交接达到发布门禁。",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n自动协商后的执行计划已完成。"
@@ -909,7 +925,8 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
             active_roles.remove(role)
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 96,
@@ -917,7 +934,6 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
                     "revision_roles": [],
                     "summary": "依赖交接达到发布门禁。",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n依赖波次执行完成。"
@@ -1046,6 +1062,20 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
     assert quality_payload["grounded_handoff_count"] == 4
     assert quality_payload["criterion_reference_count"] == 2
     assert quality_payload["source_reference_count"] == 5
+    assert quality_payload["criterion_gate_count"] == 2
+    assert quality_payload["criterion_gate_pass_count"] == 2
+    assert quality_payload["criterion_gate_fail_count"] == 0
+    assert state["quality_gate"]["criterion_pass_count"] == 2
+    assert state["quality_gate"]["criterion_fail_count"] == 0
+    assert [
+        assessment["criterion_id"]
+        for assessment in state["quality_gate"]["criterion_assessments"]
+    ] == ["AC-01", "AC-02"]
+    assert all(
+        assessment["pass_count"] == 3
+        and len(assessment["reviewer_votes"]) == 3
+        for assessment in state["quality_gate"]["criterion_assessments"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1122,7 +1152,8 @@ async def test_specialist_wave_checkpoint_survives_operator_recovery_without_rep
                 raise RuntimeError("transient test specialist failure")
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 96,
@@ -1130,7 +1161,6 @@ async def test_specialist_wave_checkpoint_survives_operator_recovery_without_rep
                     "revision_roles": [],
                     "summary": "恢复后的依赖交接达到门禁。",
                 },
-                ensure_ascii=False,
             )
         return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
 
@@ -1261,7 +1291,8 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
                 raise LLMRetryableError("transient provider failure")
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 97,
@@ -1269,7 +1300,6 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
                     "revision_roles": [],
                     "summary": "局部重试后的交接通过门禁。",
                 },
-                ensure_ascii=False,
             )
         return "输出包含明确目标、范围、依赖、风险、验收标准和可追溯证据。" * 4
 
@@ -1332,7 +1362,8 @@ async def test_deterministic_branch_failure_pauses_for_targeted_operator_recover
                 raise ValueError("测试环境配置缺少验收凭据")
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 95,
@@ -1340,7 +1371,6 @@ async def test_deterministic_branch_failure_pauses_for_targeted_operator_recover
                     "revision_roles": [],
                     "summary": "质量门禁通过",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n失败分支已定向恢复，成功分支未重复执行。"
@@ -1427,7 +1457,8 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
             max_parallel_reviewers = max(max_parallel_reviewers, active_reviewers)
             try:
                 await asyncio.sleep(0.01)
-                return json.dumps(
+                return structured_reviewer_response(
+                    _user_prompt,
                     {
                         "passed": passed,
                         "score": 95 if passed else 55,
@@ -1458,7 +1489,6 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
                         ],
                         "open_questions": [],
                     },
-                    ensure_ascii=False,
                 )
             finally:
                 active_reviewers -= 1
@@ -1679,7 +1709,8 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         calls.append((system_prompt, user_prompt))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 95,
@@ -1690,7 +1721,6 @@ async def test_workflow_handoffs_real_artifacts_and_freezes_agent_configuration(
                     "conflicts": [],
                     "open_questions": [],
                 },
-                ensure_ascii=False,
             )
         if "产品经理" in system_prompt:
             return "PRODUCT-ARTIFACT"

@@ -523,8 +523,8 @@ async function mockApi(page: Page) {
         objective: '交付可验收并可灰度发布的协作能力',
         rationale: '质量和运营风险需要独立并行评审',
         assignments: [
-          { role: 'test_engineer', objective: '审查边界场景和验收证据', deliverable: '测试与验收清单' },
-          { role: 'operations_analyst', objective: '审查灰度发布和故障恢复', deliverable: '发布运行手册' }
+          { role: 'test_engineer', objective: '审查边界场景和验收证据', deliverable: '测试与验收清单', criterion_ids: ['AC-01'] },
+          { role: 'operations_analyst', objective: '审查灰度发布和故障恢复', deliverable: '发布运行手册', criterion_ids: ['AC-02'] }
         ],
         success_criteria: ['核心路径可验收', '失败过程可回滚']
       },
@@ -542,6 +542,40 @@ async function mockApi(page: Page) {
         reviewer_valid_count: 2,
         reviewer_pass_count: 1,
         reviewer_disagreement_count: 1,
+        criterion_pass_count: 1,
+        criterion_fail_count: 1,
+        criterion_assessments: [
+          {
+            criterion_id: 'AC-01',
+            description: '核心协作路径具有可复现验收证据',
+            priority: 'MUST',
+            owner_roles: ['test_engineer'],
+            quorum: 2,
+            pass_count: 1,
+            fail_count: 1,
+            abstain_count: 0,
+            passed: false,
+            reviewer_votes: [
+              { reviewer_role: 'test_engineer', criterion_id: 'AC-01', verdict: 'PASS', confidence: 0.92, rationale: '核心路径覆盖完整且可以复现。', revision_roles: [] },
+              { reviewer_role: 'operations_analyst', criterion_id: 'AC-01', verdict: 'FAIL', confidence: 0.88, rationale: '证据仍缺少明确归档责任人。', revision_roles: ['test_engineer'] }
+            ]
+          },
+          {
+            criterion_id: 'AC-02',
+            description: '失败过程具备告警阈值和确定性回滚路径',
+            priority: 'MUST',
+            owner_roles: ['operations_analyst'],
+            quorum: 2,
+            pass_count: 2,
+            fail_count: 0,
+            abstain_count: 0,
+            passed: true,
+            reviewer_votes: [
+              { reviewer_role: 'test_engineer', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.9, rationale: '回滚步骤与验收边界一致。', revision_roles: [] },
+              { reviewer_role: 'operations_analyst', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.94, rationale: '告警阈值、值班责任和恢复窗口完整。', revision_roles: [] }
+            ]
+          }
+        ],
         reviewers: [
           { role: 'test_engineer', structured: true, passed: true, score: 92, summary: '核心路径覆盖完整，但责任证据仍需复核。', issues: [] },
           { role: 'operations_analyst', structured: true, passed: false, score: 65, summary: '回滚观察窗口缺少明确负责人。', issues: ['发布责任未闭合'] },
@@ -1666,6 +1700,23 @@ async function mockApi(page: Page) {
             reviewer_valid_count: 3,
             reviewer_pass_count: 3,
             reviewer_disagreement_count: 0,
+            criterion_pass_count: 2,
+            criterion_fail_count: 0,
+            criterion_assessments: qualityWorkflow.state.quality_gate.criterion_assessments.map((criterion) => ({
+              ...criterion,
+              pass_count: 3,
+              fail_count: 0,
+              abstain_count: 0,
+              passed: true,
+              reviewer_votes: ['test_engineer', 'operations_analyst', 'architect'].map((reviewerRole) => ({
+                reviewer_role: reviewerRole,
+                criterion_id: criterion.criterion_id,
+                verdict: 'PASS',
+                confidence: 0.95,
+                rationale: '修订后的证据已满足逐项放行条件。',
+                revision_roles: []
+              }))
+            })),
             reviewers: qualityWorkflow.state.quality_gate.reviewers.map((reviewer) => ({
               ...reviewer,
               structured: true,
@@ -2897,6 +2948,15 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await expect(page.getByText('2 个并行分支', { exact: true })).toBeVisible()
   await expect(page.getByText('Quality Gate 需要修订', { exact: true })).toBeVisible()
   await expect(page.getByText('缺少可复现验收证据', { exact: true })).toBeVisible()
+  const criterionGate = page.getByRole('region', { name: '逐项验收仲裁' })
+  await expect(criterionGate.getByText('1/2 通过', { exact: true })).toBeVisible()
+  await expect(criterionGate.getByText('每项 quorum 2', { exact: true })).toBeVisible()
+  const failedCriterion = criterionGate.getByRole('listitem').filter({ hasText: 'AC-01' }).first()
+  await expect(failedCriterion).toContainText('需返修')
+  await expect(failedCriterion).toContainText('1/2 票通过')
+  await failedCriterion.getByText('查看 Reviewer 逐项票据', { exact: true }).click()
+  await expect(failedCriterion.getByText('证据仍缺少明确归档责任人。', { exact: true })).toBeVisible()
+  await expect(failedCriterion.getByText('返修 测试工程师', { exact: false })).toBeVisible()
   const reviewerPanel = page.getByRole('region', { name: '独立 Reviewer 仲裁' })
   await expect(reviewerPanel.getByText('1/2 通过', { exact: true })).toBeVisible()
   await expect(reviewerPanel.getByText('quorum 2', { exact: true })).toBeVisible()
@@ -2932,6 +2992,8 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await revisionButton.click()
 
   await expect(page.getByText('Quality Gate 已通过', { exact: true })).toBeVisible()
+  await expect(criterionGate.getByText('2/2 通过', { exact: true })).toBeVisible()
+  await expect(criterionGate.getByText('需返修', { exact: true })).toHaveCount(0)
   await expect(reviewerPanel.getByText('3/3 通过', { exact: true })).toBeVisible()
   await expect(reviewerPanel.getByText('1 份分歧', { exact: true })).toHaveCount(0)
   await expect(reviewerPanel.getByText('支持放行', { exact: true })).toHaveCount(3)
@@ -2943,6 +3005,7 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
     await page.emulateMedia({ reducedMotion: 'reduce' })
     for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
       await page.setViewportSize(viewport)
+      await expect(criterionGate).toBeVisible()
       await expect(reviewerPanel).toBeVisible()
       await expect(ledger).toBeVisible()
       expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)

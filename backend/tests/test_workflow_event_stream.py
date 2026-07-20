@@ -157,6 +157,9 @@ def test_grounded_handoff_event_exposes_only_safe_reference_counts() -> None:
             "grounded_handoff_count": 4,
             "criterion_reference_count": 2,
             "source_reference_count": 5,
+            "criterion_gate_count": 2,
+            "criterion_gate_pass_count": 1,
+            "criterion_gate_fail_count": 1,
             "criterion_ids": ["AC-01", "AC-02"],
             "source_refs": ["artifact:PRD"],
             "evidence_context_fingerprint": "a" * 64,
@@ -168,6 +171,9 @@ def test_grounded_handoff_event_exposes_only_safe_reference_counts() -> None:
         "grounded_handoff_count": 4,
         "criterion_reference_count": 2,
         "source_reference_count": 5,
+        "criterion_gate_count": 2,
+        "criterion_gate_pass_count": 1,
+        "criterion_gate_fail_count": 1,
     }
 
 

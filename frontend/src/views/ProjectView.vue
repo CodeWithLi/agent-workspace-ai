@@ -642,6 +642,55 @@
           <p>{{ qualityGate.summary }}</p>
           <ul v-if="qualityGate.issues.length"><li v-for="issue in qualityGate.issues" :key="issue">{{ issue }}</li></ul>
         </div>
+        <section v-if="qualityCriterionAssessments.length" class="criterion-gate" aria-label="逐项验收仲裁">
+          <header class="criterion-gate-heading">
+            <div>
+              <strong>逐项验收仲裁</strong>
+              <span>每项 AC 独立达到 Reviewer quorum 后才可放行</span>
+            </div>
+            <div class="criterion-gate-counts" aria-label="逐项验收摘要">
+              <el-tag :type="qualityGate?.criterion_fail_count ? 'danger' : 'success'">
+                {{ qualityGate?.criterion_pass_count || 0 }}/{{ qualityCriterionAssessments.length }} 通过
+              </el-tag>
+              <el-tag type="info">每项 quorum {{ qualityGate?.reviewer_quorum || 0 }}</el-tag>
+            </div>
+          </header>
+          <ol class="criterion-gate-list">
+            <li v-for="criterion in qualityCriterionAssessments" :key="criterion.criterion_id" :class="{ failed: !criterion.passed }">
+              <header>
+                <div>
+                  <strong>{{ criterion.criterion_id }}</strong>
+                  <span v-if="criterion.description">{{ criterion.description }}</span>
+                </div>
+                <el-tag size="small" :type="criterion.passed ? 'success' : 'danger'">
+                  {{ criterion.passed ? '已通过' : '需返修' }}
+                </el-tag>
+              </header>
+              <p>
+                {{ criterion.pass_count }}/{{ criterion.reviewer_votes.length }} 票通过
+                · 责任 {{ criterion.owner_roles.map(specialistRoleLabel).join('、') }}
+                <span v-if="criterion.fail_count"> · {{ criterion.fail_count }} 票不通过</span>
+                <span v-if="criterion.abstain_count"> · {{ criterion.abstain_count }} 票弃权</span>
+              </p>
+              <details class="criterion-vote-details">
+                <summary>查看 Reviewer 逐项票据</summary>
+                <ul>
+                  <li v-for="vote in criterion.reviewer_votes" :key="vote.reviewer_role">
+                    <header>
+                      <strong>{{ reviewerRoleLabel(vote.reviewer_role) }}</strong>
+                      <el-tag size="small" :type="criterionVerdictType(vote.verdict)">{{ criterionVerdictLabel(vote.verdict) }}</el-tag>
+                    </header>
+                    <p>{{ vote.rationale }}</p>
+                    <small>
+                      置信 {{ Math.round(vote.confidence * 100) }}%
+                      <span v-if="vote.revision_roles.length"> · 返修 {{ vote.revision_roles.map(specialistRoleLabel).join('、') }}</span>
+                    </small>
+                  </li>
+                </ul>
+              </details>
+            </li>
+          </ol>
+        </section>
         <section v-if="qualityReviewers.length" class="reviewer-panel" aria-label="独立 Reviewer 仲裁">
           <header class="reviewer-panel-heading">
             <div>
@@ -1146,6 +1195,9 @@ interface WorkflowQualityGate {
   reviewer_valid_count?: number
   reviewer_pass_count?: number
   reviewer_disagreement_count?: number
+  criterion_assessments?: WorkflowCriterionGateAssessment[]
+  criterion_pass_count?: number
+  criterion_fail_count?: number
   decisions?: WorkflowCollaborationDecision[]
   conflicts?: WorkflowCollaborationConflict[]
   open_questions?: WorkflowCollaborationQuestion[]
@@ -1158,6 +1210,31 @@ interface WorkflowReviewerAssessment {
   score: number | null
   summary: string
   issues: string[]
+}
+
+interface WorkflowCriterionVerdict {
+  criterion_id: string
+  verdict: 'PASS' | 'FAIL' | 'ABSTAIN'
+  confidence: number
+  rationale: string
+  revision_roles: string[]
+}
+
+interface WorkflowCriterionReviewerVote extends WorkflowCriterionVerdict {
+  reviewer_role: 'test_engineer' | 'operations_analyst' | 'architect'
+}
+
+interface WorkflowCriterionGateAssessment {
+  criterion_id: string
+  description: string
+  priority: 'MUST' | 'SHOULD' | 'COULD' | null
+  owner_roles: string[]
+  reviewer_votes: WorkflowCriterionReviewerVote[]
+  quorum: number
+  pass_count: number
+  fail_count: number
+  abstain_count: number
+  passed: boolean
 }
 
 type BranchRuntimeStatus = 'waiting' | 'running' | 'retrying' | 'completed' | 'restored' | 'failed' | 'paused' | 'cancelling' | 'cancelled'
@@ -1689,6 +1766,11 @@ const qualityGate = computed<WorkflowQualityGate | null>(() => {
   return gate && typeof gate.score === 'number' ? gate as WorkflowQualityGate : null
 })
 const qualityReviewers = computed(() => Array.isArray(qualityGate.value?.reviewers) ? qualityGate.value.reviewers : [])
+const qualityCriterionAssessments = computed(() => (
+  Array.isArray(qualityGate.value?.criterion_assessments)
+    ? qualityGate.value.criterion_assessments
+    : []
+))
 const qualityDecisions = computed(() => Array.isArray(qualityGate.value?.decisions) ? qualityGate.value.decisions : [])
 const qualityConflicts = computed(() => Array.isArray(qualityGate.value?.conflicts) ? qualityGate.value.conflicts : [])
 const qualityOpenQuestions = computed(() => Array.isArray(qualityGate.value?.open_questions) ? qualityGate.value.open_questions : [])
@@ -1915,6 +1997,14 @@ function reviewerStatusType(reviewer: WorkflowReviewerAssessment) {
 
 function reviewerStatusIcon(reviewer: WorkflowReviewerAssessment) {
   return reviewer.structured && reviewer.passed ? CircleCheck : CircleClose
+}
+
+function criterionVerdictLabel(verdict: WorkflowCriterionVerdict['verdict']) {
+  return { PASS: '通过', FAIL: '不通过', ABSTAIN: '弃权' }[verdict]
+}
+
+function criterionVerdictType(verdict: WorkflowCriterionVerdict['verdict']) {
+  return verdict === 'PASS' ? 'success' : verdict === 'FAIL' ? 'danger' : 'info'
 }
 
 function handoffFor(role: string) {
@@ -3694,6 +3784,142 @@ onBeforeUnmount(disposeWorkflowEventStream)
 .quality-gate-summary.failed {
   border-left-color: var(--color-warning);
   background: #fffbeb;
+}
+
+.criterion-gate {
+  margin-top: 12px;
+  border-block: 1px solid var(--color-border);
+}
+
+.criterion-gate-heading {
+  display: flex;
+  min-height: 44px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  background: #f6f8fa;
+}
+
+.criterion-gate-heading > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.criterion-gate-heading strong {
+  color: var(--color-foreground);
+  font-size: 13px;
+}
+
+.criterion-gate-heading span {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.criterion-gate-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.criterion-gate-list,
+.criterion-vote-details ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.criterion-gate-list > li {
+  padding: 10px 12px;
+}
+
+.criterion-gate-list > li + li {
+  border-top: 1px solid var(--color-border);
+}
+
+.criterion-gate-list > li.failed {
+  box-shadow: inset 3px 0 0 var(--color-danger);
+}
+
+.criterion-gate-list > li > header,
+.criterion-vote-details li > header {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px 12px;
+}
+
+.criterion-gate-list > li > header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.criterion-gate-list > li > header strong {
+  color: var(--color-foreground);
+  font-size: 12px;
+}
+
+.criterion-gate-list > li > header span,
+.criterion-gate-list > li > p,
+.criterion-vote-details p,
+.criterion-vote-details small {
+  color: var(--color-secondary-text);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.criterion-gate-list > li > p {
+  margin: 6px 0 0;
+}
+
+.criterion-vote-details {
+  margin-top: 6px;
+}
+
+.criterion-vote-details > summary {
+  min-height: 44px;
+  padding-block: 12px;
+  cursor: pointer;
+  color: var(--color-primary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.criterion-vote-details ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.criterion-vote-details li {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.criterion-vote-details li strong {
+  color: var(--color-foreground);
+  font-size: 11px;
+}
+
+.criterion-vote-details p {
+  margin: 0;
+}
+
+.criterion-vote-details small {
+  color: var(--color-muted-text);
 }
 
 .reviewer-panel {

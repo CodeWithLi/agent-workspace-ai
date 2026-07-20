@@ -58,6 +58,22 @@ def structured_handoff_response(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def structured_reviewer_response(user_prompt: str, payload: dict) -> str:
+    context = json.loads(user_prompt)
+    verdict = "PASS" if payload["passed"] else "FAIL"
+    payload["criterion_verdicts"] = [
+        {
+            "criterion_id": criterion["criterion_id"],
+            "verdict": verdict,
+            "confidence": min(1, max(0, payload["score"] / 100)),
+            "rationale": "该验收标准已按 Reviewer 独立关注域完成逐项复核。",
+            "revision_roles": criterion["owner_roles"] if verdict == "FAIL" else [],
+        }
+        for criterion in context.get("review_criteria", [])
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def execution_plan() -> dict:
     return {
         "objective": "形成可验证、可恢复的会员平台交付计划",
@@ -206,7 +222,8 @@ async def test_requirement_challenges_are_revised_re_reviewed_and_forwarded(
             role = context["assignment"]["role"]
             return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                user_prompt,
                 {
                     "passed": True,
                     "score": 96,
@@ -214,7 +231,6 @@ async def test_requirement_challenges_are_revised_re_reviewed_and_forwarded(
                     "revision_roles": [],
                     "summary": "专业交接达到发布门禁。",
                 },
-                ensure_ascii=False,
             )
         if "报告生成器" in system_prompt:
             return "# 最终报告\n\n需求共识与执行证据均已闭环。"

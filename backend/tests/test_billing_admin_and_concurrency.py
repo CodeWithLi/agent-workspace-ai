@@ -40,6 +40,22 @@ def http_request(path: str = "/") -> Request:
     )
 
 
+def structured_reviewer_response(user_prompt: str, payload: dict) -> str:
+    context = json.loads(user_prompt)
+    verdict = "PASS" if payload["passed"] else "FAIL"
+    payload["criterion_verdicts"] = [
+        {
+            "criterion_id": criterion["criterion_id"],
+            "verdict": verdict,
+            "confidence": min(1, max(0, payload["score"] / 100)),
+            "rationale": "该验收标准已按 Reviewer 独立关注域完成逐项复核。",
+            "revision_roles": criterion["owner_roles"] if verdict == "FAIL" else [],
+        }
+        for criterion in context.get("review_criteria", [])
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def test_token_debit_is_idempotent_and_refundable(db: Session) -> None:
     user = User(email="billing@example.com", name="Billing", password_hash="hash", ai_token_balance=100)
     db.add(user)
@@ -294,10 +310,12 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
                             "acceptance_criteria": "All core cases pass and evidence is reviewable.",
                         }
                     ],
-                }
+                },
+                ensure_ascii=False,
             )
         if "交接质量评审 Agent" in system_prompt:
-            return json.dumps(
+            return structured_reviewer_response(
+                _user_prompt,
                 {
                     "passed": True,
                     "score": 95,
@@ -308,7 +326,6 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
                     "conflicts": [],
                     "open_questions": [],
                 },
-                ensure_ascii=False,
             )
         return (
             "# Agent output\n\n"

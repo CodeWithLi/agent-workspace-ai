@@ -1796,6 +1796,53 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             plan_version=max(1, int(state.get("plan_version", 0))),
             evidence_contexts=evidence_contexts,
         )
+        criterion_owners: dict[str, list[str]] = {}
+        for assignment in plan.assignments:
+            for criterion_id in assignment.criterion_ids:
+                criterion_owners.setdefault(criterion_id, []).append(assignment.role)
+        criterion_context: list[HandoffEvidenceCriterion] = []
+        try:
+            requirement_contract = RequirementContract.model_validate(
+                state.get("requirements", {}).get("contract")
+            )
+            criteria_by_id = {
+                item.criterion_id: item
+                for item in requirement_contract.acceptance_criteria
+            }
+            criterion_context = [
+                HandoffEvidenceCriterion.model_validate(
+                    criteria_by_id[criterion_id].model_dump(mode="json")
+                )
+                for criterion_id in criterion_owners
+                if criterion_id in criteria_by_id
+            ]
+        except (ValidationError, AttributeError):
+            criterion_context = []
+        criterion_context_by_id = {
+            item.criterion_id: item for item in criterion_context
+        }
+        review_criteria = [
+            {
+                "criterion_id": criterion_id,
+                "description": (
+                    criterion_context_by_id[criterion_id].description
+                    if criterion_id in criterion_context_by_id
+                    else ""
+                ),
+                "evidence": (
+                    criterion_context_by_id[criterion_id].evidence
+                    if criterion_id in criterion_context_by_id
+                    else ""
+                ),
+                "priority": (
+                    criterion_context_by_id[criterion_id].priority
+                    if criterion_id in criterion_context_by_id
+                    else None
+                ),
+                "owner_roles": owner_roles,
+            }
+            for criterion_id, owner_roles in criterion_owners.items()
+        ]
         reviewer_specs = (
             (AgentRole.test_engineer, "质量、安全、边界场景与可复现验收证据"),
             (AgentRole.operations_analyst, "可观测性、灰度发布、故障恢复与运营责任"),
@@ -1807,10 +1854,14 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 role,
                 (
                     "你是独立交接质量评审 Agent。只输出 JSON，字段为 passed、score、issues、"
-                    "revision_roles、summary、decisions、conflicts、open_questions。"
+                    "revision_roles、summary、decisions、conflicts、open_questions、criterion_verdicts。"
                     "decisions 每项包含 title、outcome、rationale、source_roles、confidence；"
                     "conflicts 每项包含 topic、positions（role 与 position）、status（OPEN 或 RESOLVED）、"
                     "resolution、blocking、revision_roles；open_questions 每项包含 question、owner_role、blocking。"
+                    "criterion_verdicts 必须对 review_criteria 中每个 AC 恰好返回一项，字段为 criterion_id、"
+                    "verdict（PASS、FAIL 或 ABSTAIN）、confidence、rationale、revision_roles。"
+                    "FAIL 必须从该 AC 的 owner_roles 中指定至少一个返修角色；PASS/ABSTAIN 不得指定返修角色。"
+                    "passed 与逐项 verdict 会被服务端独立归约，整体高分不能替代任一 AC 的逐项结论。"
                     f"你的独立评审焦点是：{focus}。"
                     "不得读取其他 Reviewer 的结论。阻塞冲突未解决或阻塞问题未闭合时必须判定不通过，"
                     "并指明需要返修的已分配角色。"
@@ -1822,6 +1873,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "execution_plan": plan.model_dump(mode="json"),
                         "handoffs": [handoff.model_dump(mode="json") for handoff in handoffs],
                         "deterministic_gate": deterministic.model_dump(mode="json"),
+                        "review_criteria": review_criteria,
                     }),
                     ensure_ascii=False,
                 ),
@@ -1853,6 +1905,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 )
             },
             plan,
+            criterion_context=criterion_context,
         )
         revision_round = int(state.get("revision_round", 0))
         if decision.passed:
@@ -1892,6 +1945,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     for item in handoff.evidence
                     for criterion_id in item.criterion_ids
                 }),
+                "criterion_gate_count": len(decision.criterion_assessments),
+                "criterion_gate_pass_count": decision.criterion_pass_count,
+                "criterion_gate_fail_count": decision.criterion_fail_count,
                 "source_reference_count": len({
                     source_ref
                     for handoff in handoffs

@@ -44,6 +44,10 @@ _Avoid_: Citation text, URL, unverified source
 A recorded decision that evaluates Handoffs against deterministic checks and specialist review before delivery may proceed.
 _Avoid_: Test output, approval
 
+**Criterion Gate**:
+The per-`AC-xx` quorum inside a Quality Gate. Every configured Reviewer must return one independent verdict for every current Acceptance Criterion, and each criterion must receive the configured number of `PASS` votes before delivery can proceed.
+_Avoid_: Overall score, Handoff evidence count
+
 **Revision Round**:
 One bounded attempt to improve failed Handoffs using the issues recorded by a Quality Gate.
 _Avoid_: Retry, rerun
