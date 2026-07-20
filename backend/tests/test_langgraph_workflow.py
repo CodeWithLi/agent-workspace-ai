@@ -81,14 +81,26 @@ def structured_handoff_response(
 
 def structured_reviewer_response(user_prompt: str, payload: dict) -> str:
     context = json.loads(user_prompt)
-    verdict = "PASS" if payload["passed"] else "FAIL"
     payload["criterion_verdicts"] = [
         {
             "criterion_id": criterion["criterion_id"],
-            "verdict": verdict,
+            "verdict": (
+                "PASS"
+                if payload["passed"] and criterion.get("evidence_refs")
+                else "FAIL"
+                if criterion.get("evidence_refs")
+                else "ABSTAIN"
+            ),
             "confidence": min(1, max(0, payload["score"] / 100)),
             "rationale": "该验收标准已按 Reviewer 独立关注域完成逐项复核。",
-            "revision_roles": criterion["owner_roles"] if verdict == "FAIL" else [],
+            "revision_roles": (
+                criterion["owner_roles"]
+                if not payload["passed"] and criterion.get("evidence_refs")
+                else []
+            ),
+            "evidence_refs": [
+                reference["ref"] for reference in criterion.get("evidence_refs", [])
+            ],
         }
         for criterion in context.get("review_criteria", [])
     ]
@@ -1076,6 +1088,19 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         and len(assessment["reviewer_votes"]) == 3
         for assessment in state["quality_gate"]["criterion_assessments"]
     )
+    known_review_evidence_refs = {
+        f"handoff:{role}@{handoff['output_fingerprint']}#evidence:1"
+        for role, handoff in handoffs_by_role.items()
+    }
+    assert all(
+        vote["evidence_refs"]
+        and set(vote["evidence_refs"]).issubset(known_review_evidence_refs)
+        for assessment in state["quality_gate"]["criterion_assessments"]
+        for vote in assessment["reviewer_votes"]
+    )
+    assert quality_payload["criterion_vote_count"] == 6
+    assert quality_payload["criterion_attested_vote_count"] == 6
+    assert quality_payload["criterion_vote_evidence_reference_count"] == 12
 
 
 @pytest.mark.asyncio

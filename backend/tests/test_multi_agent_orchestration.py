@@ -10,6 +10,7 @@ from app.agent.orchestration import (
     HandoffEvidenceCriterion,
     HandoffEvidenceSource,
     MultiAgentExecutionPlan,
+    ReviewerEvidenceReference,
     ReviewerPanelQuorumError,
     SpecialistTeamUnavailableError,
     arbitrate_execution_plan_candidates,
@@ -1697,6 +1698,26 @@ def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None
         ]
         for criterion_id in ("AC-01", "AC-02")
     }
+    review_evidence = []
+    evidence_ref_by_criterion = {}
+    for index, criterion_id in enumerate(("AC-01", "AC-02"), start=1):
+        role = owners[criterion_id][0]
+        output_fingerprint = f"{index}" * 64
+        evidence_ref = (
+            f"handoff:{role}@{output_fingerprint}#evidence:{index}"
+        )
+        evidence_ref_by_criterion[criterion_id] = evidence_ref
+        review_evidence.append(
+            ReviewerEvidenceReference(
+                ref=evidence_ref,
+                role=role,
+                evidence_index=index,
+                claim=f"{criterion_id} 已形成可复核验收证据",
+                criterion_ids=[criterion_id],
+                source_refs=["artifact:PRD"],
+                handoff_output_fingerprint=output_fingerprint,
+            )
+        )
 
     def reviewer_output(ac02_verdict: str) -> str:
         verdicts = []
@@ -1711,6 +1732,11 @@ def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None
                     "confidence": 0.9,
                     "rationale": f"{criterion_id} 的验收证据已按独立焦点完成复核。",
                     "revision_roles": owners[criterion_id] if verdict == "FAIL" else [],
+                    "evidence_refs": (
+                        []
+                        if verdict == "ABSTAIN"
+                        else [evidence_ref_by_criterion[criterion_id]]
+                    ),
                 }
             )
         return json.dumps(
@@ -1746,6 +1772,7 @@ def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None
         },
         plan,
         criterion_context=criterion_context,
+        review_evidence=review_evidence,
     )
 
     assert blocked.reviewer_pass_count == 3
@@ -1770,6 +1797,7 @@ def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None
         },
         plan,
         criterion_context=criterion_context,
+        review_evidence=review_evidence,
     )
 
     assert passed.passed is True
@@ -1788,4 +1816,21 @@ def test_reviewer_panel_requires_quorum_for_every_acceptance_criterion() -> None
                 "architect": "not-json",
             },
             plan,
+            review_evidence=review_evidence,
+        )
+
+    unknown_evidence = json.loads(reviewer_output("PASS"))
+    unknown_evidence["criterion_verdicts"][0]["evidence_refs"] = [
+        f"handoff:{owners['AC-01'][0]}@{'f' * 64}#evidence:1"
+    ]
+    with pytest.raises(ReviewerPanelQuorumError):
+        merge_reviewer_panel(
+            deterministic,
+            {
+                "test_engineer": reviewer_output("PASS"),
+                "operations_analyst": json.dumps(unknown_evidence),
+                "architect": "not-json",
+            },
+            plan,
+            review_evidence=review_evidence,
         )

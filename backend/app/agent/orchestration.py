@@ -1444,21 +1444,92 @@ class CollaborationQuestion(BaseModel):
     blocking: bool = False
 
 
+ReviewerEvidenceRef = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^handoff:(?:test_engineer|operations_analyst|knowledge_admin|"
+            r"notification_secretary)@[0-9a-f]{64}#evidence:[1-8]$"
+        )
+    ),
+]
+
+
+class ReviewerEvidenceReference(BaseModel):
+    ref: ReviewerEvidenceRef
+    role: SpecialistRole
+    evidence_index: int = Field(ge=1, le=8)
+    claim: str = Field(min_length=4, max_length=2000)
+    criterion_ids: list[AcceptanceCriterionId] = Field(min_length=1, max_length=10)
+    source_refs: list[EvidenceSourceRef] = Field(min_length=1, max_length=6)
+    handoff_output_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "ReviewerEvidenceReference":
+        expected = (
+            f"handoff:{self.role}@{self.handoff_output_fingerprint}"
+            f"#evidence:{self.evidence_index}"
+        )
+        if self.ref != expected:
+            raise ValueError("reviewer evidence reference does not match its handoff")
+        if len(self.criterion_ids) != len(set(self.criterion_ids)):
+            raise ValueError("reviewer evidence criterion ids must be unique")
+        if len(self.source_refs) != len(set(self.source_refs)):
+            raise ValueError("reviewer evidence source references must be unique")
+        return self
+
+
+def build_reviewer_evidence_references(
+    handoffs: list[AgentHandoff],
+) -> list[ReviewerEvidenceReference]:
+    references: list[ReviewerEvidenceReference] = []
+    for handoff in handoffs:
+        if (
+            handoff.contract_version < 3
+            or not handoff.structured
+            or not handoff.output_fingerprint
+        ):
+            continue
+        for evidence_index, evidence in enumerate(handoff.evidence, start=1):
+            references.append(
+                ReviewerEvidenceReference(
+                    ref=(
+                        f"handoff:{handoff.role}@{handoff.output_fingerprint}"
+                        f"#evidence:{evidence_index}"
+                    ),
+                    role=handoff.role,
+                    evidence_index=evidence_index,
+                    claim=evidence.claim,
+                    criterion_ids=evidence.criterion_ids,
+                    source_refs=evidence.source_refs,
+                    handoff_output_fingerprint=handoff.output_fingerprint,
+                )
+            )
+    return references
+
+
 class ReviewerCriterionVerdict(BaseModel):
     criterion_id: AcceptanceCriterionId
     verdict: Literal["PASS", "FAIL", "ABSTAIN"]
     confidence: float = Field(ge=0, le=1)
     rationale: str = Field(min_length=4, max_length=2000)
     revision_roles: list[SpecialistRole] = Field(default_factory=list, max_length=4)
+    evidence_refs: list[ReviewerEvidenceRef] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_verdict(self) -> "ReviewerCriterionVerdict":
         if len(self.revision_roles) != len(set(self.revision_roles)):
             raise ValueError("criterion verdict revision roles must be unique")
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("criterion verdict evidence references must be unique")
         if self.verdict == "FAIL" and not self.revision_roles:
             raise ValueError("failed criterion verdicts require revision roles")
         if self.verdict != "FAIL" and self.revision_roles:
             raise ValueError("only failed criterion verdicts may request revision roles")
+        if self.verdict == "ABSTAIN" and self.evidence_refs:
+            raise ValueError("abstaining criterion verdicts cannot cite evidence")
+        if self.verdict != "ABSTAIN" and not self.evidence_refs:
+            raise ValueError("pass/fail criterion verdicts must cite handoff evidence")
         return self
 
 
@@ -2123,8 +2194,13 @@ def merge_reviewer_decision(
     deterministic: QualityGateDecision,
     reviewer_output: str,
     plan: MultiAgentExecutionPlan,
+    review_evidence: list[ReviewerEvidenceReference] | None = None,
 ) -> QualityGateDecision:
-    reviewer = _parse_reviewer_decision(reviewer_output, plan)
+    reviewer = _parse_reviewer_decision(
+        reviewer_output,
+        plan,
+        review_evidence,
+    )
     if reviewer is None:
         return deterministic.model_copy(
             update={"reviewer_summary": reviewer_output[:8000]}
@@ -2228,6 +2304,7 @@ def _criterion_owners(
 def _reviewer_criterion_contract_valid(
     reviewer: ReviewerDecision,
     plan: MultiAgentExecutionPlan,
+    review_evidence: list[ReviewerEvidenceReference] | None = None,
 ) -> bool:
     owners = _criterion_owners(plan)
     if not owners:
@@ -2237,8 +2314,17 @@ def _reviewer_criterion_contract_valid(
     }
     if set(verdicts) != set(owners):
         return False
+    evidence_by_ref = {
+        reference.ref: reference for reference in (review_evidence or [])
+    }
     return all(
         set(verdict.revision_roles).issubset(owners[criterion_id])
+        and all(
+            evidence_ref in evidence_by_ref
+            and criterion_id in evidence_by_ref[evidence_ref].criterion_ids
+            and evidence_by_ref[evidence_ref].role in owners[criterion_id]
+            for evidence_ref in verdict.evidence_refs
+        )
         for criterion_id, verdict in verdicts.items()
     )
 
@@ -2246,6 +2332,7 @@ def _reviewer_criterion_contract_valid(
 def _parse_reviewer_decision(
     reviewer_output: str,
     plan: MultiAgentExecutionPlan | None = None,
+    review_evidence: list[ReviewerEvidenceReference] | None = None,
 ) -> ReviewerDecision | None:
     for candidate in _json_candidates(reviewer_output):
         try:
@@ -2253,6 +2340,7 @@ def _parse_reviewer_decision(
             if plan is not None and not _reviewer_criterion_contract_valid(
                 reviewer,
                 plan,
+                review_evidence,
             ):
                 continue
             return reviewer
@@ -2282,6 +2370,7 @@ def merge_reviewer_panel(
     *,
     quorum: int = 2,
     criterion_context: list[HandoffEvidenceCriterion] | None = None,
+    review_evidence: list[ReviewerEvidenceReference] | None = None,
 ) -> QualityGateDecision:
     if not 1 <= quorum <= len(reviewer_outputs):
         raise ValueError("reviewer quorum must fit the configured panel")
@@ -2292,7 +2381,11 @@ def merge_reviewer_panel(
     valid_reviewers: list[tuple[ReviewerPanelRole, ReviewerDecision]] = []
     summaries: list[str] = []
     for role, output in reviewer_outputs.items():
-        reviewer = _parse_reviewer_decision(output, plan)
+        reviewer = _parse_reviewer_decision(
+            output,
+            plan,
+            review_evidence,
+        )
         if reviewer is None:
             assessments.append(
                 ReviewerAssessment(
@@ -2304,7 +2397,12 @@ def merge_reviewer_panel(
                 )
             )
             continue
-        merged = merge_reviewer_decision(deterministic, output, plan)
+        merged = merge_reviewer_decision(
+            deterministic,
+            output,
+            plan,
+            review_evidence,
+        )
         merged_reviews.append(merged)
         valid_reviewers.append((role, reviewer))
         valid_scores.append(reviewer.score)

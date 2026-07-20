@@ -685,6 +685,12 @@
                       置信 {{ Math.round(vote.confidence * 100) }}%
                       <span v-if="vote.revision_roles.length"> · 返修 {{ vote.revision_roles.map(specialistRoleLabel).join('、') }}</span>
                     </small>
+                    <div v-if="vote.evidence_refs.length" class="criterion-vote-evidence" aria-label="Reviewer 票据依据">
+                      <span>依据</span>
+                      <code v-for="evidenceRef in vote.evidence_refs" :key="evidenceRef" :title="evidenceRef">
+                        {{ reviewerEvidenceRefLabel(evidenceRef) }}
+                      </code>
+                    </div>
                   </li>
                 </ul>
               </details>
@@ -1218,6 +1224,7 @@ interface WorkflowCriterionVerdict {
   confidence: number
   rationale: string
   revision_roles: string[]
+  evidence_refs: string[]
 }
 
 interface WorkflowCriterionReviewerVote extends WorkflowCriterionVerdict {
@@ -2005,6 +2012,12 @@ function criterionVerdictLabel(verdict: WorkflowCriterionVerdict['verdict']) {
 
 function criterionVerdictType(verdict: WorkflowCriterionVerdict['verdict']) {
   return verdict === 'PASS' ? 'success' : verdict === 'FAIL' ? 'danger' : 'info'
+}
+
+function reviewerEvidenceRefLabel(evidenceRef: string) {
+  const match = evidenceRef.match(/^handoff:([^@]+)@([0-9a-f]{64})#evidence:([1-8])$/)
+  if (!match) return evidenceRef
+  return `${specialistRoleLabel(match[1])} Handoff · 证据 ${match[3]} · ${match[2].slice(0, 10)}`
 }
 
 function handoffFor(role: string) {
@@ -3920,6 +3933,34 @@ onBeforeUnmount(disposeWorkflowEventStream)
 
 .criterion-vote-details small {
   color: var(--color-muted-text);
+}
+
+.criterion-vote-evidence {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 7px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.criterion-vote-evidence > span {
+  color: var(--color-muted-text);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.criterion-vote-evidence code {
+  max-width: 100%;
+  padding: 1px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: #f6f8fa;
+  color: var(--color-secondary-text);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 .reviewer-panel {

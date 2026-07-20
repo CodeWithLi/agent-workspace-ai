@@ -48,6 +48,10 @@ _Avoid_: Test output, approval
 The per-`AC-xx` quorum inside a Quality Gate. Every configured Reviewer must return one independent verdict for every current Acceptance Criterion, and each criterion must receive the configured number of `PASS` votes before delivery can proceed.
 _Avoid_: Overall score, Handoff evidence count
 
+**Reviewer Evidence Attestation**:
+A non-abstaining Criterion Gate vote bound to one or more exact Handoff evidence entries by specialist role, sealed output SHA-256 and evidence ordinal.
+_Avoid_: Rationale, role-only reference, unverified evidence label
+
 **Revision Round**:
 One bounded attempt to improve failed Handoffs using the issues recorded by a Quality Gate.
 _Avoid_: Retry, rerun

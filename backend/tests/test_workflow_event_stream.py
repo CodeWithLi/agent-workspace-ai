@@ -160,6 +160,9 @@ def test_grounded_handoff_event_exposes_only_safe_reference_counts() -> None:
             "criterion_gate_count": 2,
             "criterion_gate_pass_count": 1,
             "criterion_gate_fail_count": 1,
+            "criterion_vote_count": 6,
+            "criterion_attested_vote_count": 5,
+            "criterion_vote_evidence_reference_count": 8,
             "criterion_ids": ["AC-01", "AC-02"],
             "source_refs": ["artifact:PRD"],
             "evidence_context_fingerprint": "a" * 64,
@@ -174,6 +177,9 @@ def test_grounded_handoff_event_exposes_only_safe_reference_counts() -> None:
         "criterion_gate_count": 2,
         "criterion_gate_pass_count": 1,
         "criterion_gate_fail_count": 1,
+        "criterion_vote_count": 6,
+        "criterion_attested_vote_count": 5,
+        "criterion_vote_evidence_reference_count": 8,
     }
 
 

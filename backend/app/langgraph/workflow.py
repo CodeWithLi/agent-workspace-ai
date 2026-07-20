@@ -29,6 +29,7 @@ from app.agent.orchestration import (
     attach_execution_plan_commitments,
     build_execution_waves,
     build_fallback_plan,
+    build_reviewer_evidence_references,
     build_specialist_capability_catalog,
     build_task_blueprints,
     default_specialist_capability_catalog,
@@ -1796,6 +1797,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             plan_version=max(1, int(state.get("plan_version", 0))),
             evidence_contexts=evidence_contexts,
         )
+        review_evidence = build_reviewer_evidence_references(handoffs)
         criterion_owners: dict[str, list[str]] = {}
         for assignment in plan.assignments:
             for criterion_id in assignment.criterion_ids:
@@ -1840,6 +1842,12 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     else None
                 ),
                 "owner_roles": owner_roles,
+                "evidence_refs": [
+                    reference.model_dump(mode="json")
+                    for reference in review_evidence
+                    if criterion_id in reference.criterion_ids
+                    and reference.role in owner_roles
+                ],
             }
             for criterion_id, owner_roles in criterion_owners.items()
         ]
@@ -1859,8 +1867,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "conflicts 每项包含 topic、positions（role 与 position）、status（OPEN 或 RESOLVED）、"
                     "resolution、blocking、revision_roles；open_questions 每项包含 question、owner_role、blocking。"
                     "criterion_verdicts 必须对 review_criteria 中每个 AC 恰好返回一项，字段为 criterion_id、"
-                    "verdict（PASS、FAIL 或 ABSTAIN）、confidence、rationale、revision_roles。"
+                    "verdict（PASS、FAIL 或 ABSTAIN）、confidence、rationale、revision_roles、evidence_refs。"
                     "FAIL 必须从该 AC 的 owner_roles 中指定至少一个返修角色；PASS/ABSTAIN 不得指定返修角色。"
+                    "PASS/FAIL 必须从该 AC 的 evidence_refs.ref 中引用至少一条具体 Handoff evidence；"
+                    "ABSTAIN 的 evidence_refs 必须为空。不得自行拼接、缩短或改写引用。"
                     "passed 与逐项 verdict 会被服务端独立归约，整体高分不能替代任一 AC 的逐项结论。"
                     f"你的独立评审焦点是：{focus}。"
                     "不得读取其他 Reviewer 的结论。阻塞冲突未解决或阻塞问题未闭合时必须判定不通过，"
@@ -1906,6 +1916,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
             },
             plan,
             criterion_context=criterion_context,
+            review_evidence=review_evidence,
         )
         revision_round = int(state.get("revision_round", 0))
         if decision.passed:
@@ -1948,6 +1959,20 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "criterion_gate_count": len(decision.criterion_assessments),
                 "criterion_gate_pass_count": decision.criterion_pass_count,
                 "criterion_gate_fail_count": decision.criterion_fail_count,
+                "criterion_vote_count": sum(
+                    len(assessment.reviewer_votes)
+                    for assessment in decision.criterion_assessments
+                ),
+                "criterion_attested_vote_count": sum(
+                    vote.verdict != "ABSTAIN"
+                    for assessment in decision.criterion_assessments
+                    for vote in assessment.reviewer_votes
+                ),
+                "criterion_vote_evidence_reference_count": sum(
+                    len(vote.evidence_refs)
+                    for assessment in decision.criterion_assessments
+                    for vote in assessment.reviewer_votes
+                ),
                 "source_reference_count": len({
                     source_ref
                     for handoff in handoffs

@@ -60,14 +60,26 @@ def structured_handoff_response(
 
 def structured_reviewer_response(user_prompt: str, payload: dict) -> str:
     context = json.loads(user_prompt)
-    verdict = "PASS" if payload["passed"] else "FAIL"
     payload["criterion_verdicts"] = [
         {
             "criterion_id": criterion["criterion_id"],
-            "verdict": verdict,
+            "verdict": (
+                "PASS"
+                if payload["passed"] and criterion.get("evidence_refs")
+                else "FAIL"
+                if criterion.get("evidence_refs")
+                else "ABSTAIN"
+            ),
             "confidence": min(1, max(0, payload["score"] / 100)),
             "rationale": "该验收标准已按 Reviewer 独立关注域完成逐项复核。",
-            "revision_roles": criterion["owner_roles"] if verdict == "FAIL" else [],
+            "revision_roles": (
+                criterion["owner_roles"]
+                if not payload["passed"] and criterion.get("evidence_refs")
+                else []
+            ),
+            "evidence_refs": [
+                reference["ref"] for reference in criterion.get("evidence_refs", [])
+            ],
         }
         for criterion in context.get("review_criteria", [])
     ]

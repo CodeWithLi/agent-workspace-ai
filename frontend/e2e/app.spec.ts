@@ -556,8 +556,8 @@ async function mockApi(page: Page) {
             abstain_count: 0,
             passed: false,
             reviewer_votes: [
-              { reviewer_role: 'test_engineer', criterion_id: 'AC-01', verdict: 'PASS', confidence: 0.92, rationale: '核心路径覆盖完整且可以复现。', revision_roles: [] },
-              { reviewer_role: 'operations_analyst', criterion_id: 'AC-01', verdict: 'FAIL', confidence: 0.88, rationale: '证据仍缺少明确归档责任人。', revision_roles: ['test_engineer'] }
+              { reviewer_role: 'test_engineer', criterion_id: 'AC-01', verdict: 'PASS', confidence: 0.92, rationale: '核心路径覆盖完整且可以复现。', revision_roles: [], evidence_refs: [`handoff:test_engineer@${'a'.repeat(64)}#evidence:1`] },
+              { reviewer_role: 'operations_analyst', criterion_id: 'AC-01', verdict: 'FAIL', confidence: 0.88, rationale: '证据仍缺少明确归档责任人。', revision_roles: ['test_engineer'], evidence_refs: [`handoff:test_engineer@${'a'.repeat(64)}#evidence:1`] }
             ]
           },
           {
@@ -571,8 +571,8 @@ async function mockApi(page: Page) {
             abstain_count: 0,
             passed: true,
             reviewer_votes: [
-              { reviewer_role: 'test_engineer', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.9, rationale: '回滚步骤与验收边界一致。', revision_roles: [] },
-              { reviewer_role: 'operations_analyst', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.94, rationale: '告警阈值、值班责任和恢复窗口完整。', revision_roles: [] }
+              { reviewer_role: 'test_engineer', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.9, rationale: '回滚步骤与验收边界一致。', revision_roles: [], evidence_refs: [`handoff:operations_analyst@${'b'.repeat(64)}#evidence:1`] },
+              { reviewer_role: 'operations_analyst', criterion_id: 'AC-02', verdict: 'PASS', confidence: 0.94, rationale: '告警阈值、值班责任和恢复窗口完整。', revision_roles: [], evidence_refs: [`handoff:operations_analyst@${'b'.repeat(64)}#evidence:1`] }
             ]
           }
         ],
@@ -1714,7 +1714,8 @@ async function mockApi(page: Page) {
                 verdict: 'PASS',
                 confidence: 0.95,
                 rationale: '修订后的证据已满足逐项放行条件。',
-                revision_roles: []
+                revision_roles: [],
+                evidence_refs: criterion.reviewer_votes[0].evidence_refs
               }))
             })),
             reviewers: qualityWorkflow.state.quality_gate.reviewers.map((reviewer) => ({
@@ -2957,6 +2958,7 @@ test('shows dynamic specialist handoffs and submits quality revision feedback', 
   await failedCriterion.getByText('查看 Reviewer 逐项票据', { exact: true }).click()
   await expect(failedCriterion.getByText('证据仍缺少明确归档责任人。', { exact: true })).toBeVisible()
   await expect(failedCriterion.getByText('返修 测试工程师', { exact: false })).toBeVisible()
+  await expect(failedCriterion.getByText('测试工程师 Handoff · 证据 1 · aaaaaaaaaa', { exact: true }).first()).toBeVisible()
   const reviewerPanel = page.getByRole('region', { name: '独立 Reviewer 仲裁' })
   await expect(reviewerPanel.getByText('1/2 通过', { exact: true })).toBeVisible()
   await expect(reviewerPanel.getByText('quorum 2', { exact: true })).toBeVisible()
