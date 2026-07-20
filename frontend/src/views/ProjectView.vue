@@ -575,6 +575,24 @@
                           </dd>
                         </div>
                       </dl>
+                      <section
+                        v-if="evidence.citations?.length"
+                        class="handoff-citations"
+                        aria-label="已核验原文引用"
+                      >
+                        <header>
+                          <el-icon aria-hidden="true"><CircleCheck /></el-icon>
+                          <span>已核验原文</span>
+                          <small>{{ evidence.citations.length }} 条</small>
+                        </header>
+                        <blockquote
+                          v-for="citation in evidence.citations"
+                          :key="`${citation.source_ref}:${citation.quote}`"
+                        >
+                          <cite>{{ handoffSourceRefLabel(citation.source_ref) }}</cite>
+                          <p>{{ citation.quote }}</p>
+                        </blockquote>
+                      </section>
                     </li>
                   </ol>
                 </details>
@@ -1133,6 +1151,12 @@ interface WorkflowHandoffEvidence {
   verification: string
   criterion_ids?: string[]
   source_refs?: string[]
+  citations?: WorkflowHandoffCitation[]
+}
+
+interface WorkflowHandoffCitation {
+  source_ref: string
+  quote: string
 }
 
 interface WorkflowHandoffRisk {
@@ -3739,6 +3763,56 @@ onBeforeUnmount(disposeWorkflowEventStream)
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
   font-size: 11px;
   overflow-wrap: anywhere;
+}
+
+.handoff-citations {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-subtle);
+}
+
+.handoff-citations > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-success);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.handoff-citations > header small {
+  margin-left: auto;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.handoff-citations blockquote {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-success);
+  background: var(--color-surface);
+}
+
+.handoff-citations cite {
+  display: block;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.handoff-citations p {
+  margin: 4px 0 0;
+  color: var(--color-secondary-text);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .handoff-contract-list .handoff-blocking {

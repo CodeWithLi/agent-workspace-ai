@@ -947,10 +947,36 @@ class HandoffEvidenceContext(BaseModel):
         return _stable_fingerprint(self.model_dump(mode="json"))
 
 
+class HandoffEvidenceMaterial(BaseModel):
+    ref: EvidenceSourceRef
+    label: str = Field(min_length=2, max_length=200)
+    content: str = Field(min_length=1, max_length=24000)
+    source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    material_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_material(self) -> "HandoffEvidenceMaterial":
+        expected = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        if self.material_fingerprint != expected:
+            raise ValueError("handoff evidence material fingerprint does not match content")
+        return self
+
+
 class HandoffDecision(BaseModel):
     title: str = Field(min_length=2, max_length=160)
     outcome: str = Field(min_length=4, max_length=2000)
     rationale: str = Field(min_length=4, max_length=2000)
+
+
+class HandoffEvidenceCitation(BaseModel):
+    source_ref: EvidenceSourceRef
+    quote: str = Field(min_length=12, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_quote(self) -> "HandoffEvidenceCitation":
+        if len(re.sub(r"\s+", " ", self.quote).strip()) < 12:
+            raise ValueError("handoff evidence citations require a substantive quote")
+        return self
 
 
 class HandoffEvidence(BaseModel):
@@ -959,6 +985,7 @@ class HandoffEvidence(BaseModel):
     verification: str = Field(min_length=4, max_length=2000)
     criterion_ids: list[AcceptanceCriterionId] = Field(default_factory=list, max_length=10)
     source_refs: list[EvidenceSourceRef] = Field(default_factory=list, max_length=6)
+    citations: list[HandoffEvidenceCitation] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_grounding_references(self) -> "HandoffEvidence":
@@ -966,7 +993,50 @@ class HandoffEvidence(BaseModel):
             raise ValueError("handoff evidence criterion ids must be unique")
         if len(self.source_refs) != len(set(self.source_refs)):
             raise ValueError("handoff evidence source references must be unique")
+        citation_keys = [
+            (item.source_ref, re.sub(r"\s+", " ", item.quote).strip())
+            for item in self.citations
+        ]
+        if len(citation_keys) != len(set(citation_keys)):
+            raise ValueError("handoff evidence citations must be unique")
         return self
+
+
+def _evidence_material_index(
+    context: HandoffEvidenceContext,
+    materials: list[HandoffEvidenceMaterial],
+) -> dict[str, HandoffEvidenceMaterial] | None:
+    materials_by_ref = {item.ref: item for item in materials}
+    if len(materials_by_ref) != len(materials) or set(materials_by_ref) != context.source_refs:
+        return None
+    for source in context.sources:
+        material = materials_by_ref[source.ref]
+        if (
+            material.label != source.label
+            or material.source_fingerprint != source.fingerprint
+        ):
+            return None
+    return materials_by_ref
+
+
+def _evidence_citations_match_materials(
+    evidence: list[HandoffEvidence],
+    materials_by_ref: dict[str, HandoffEvidenceMaterial],
+) -> bool:
+    normalized_materials = {
+        ref: re.sub(r"\s+", " ", material.content).strip()
+        for ref, material in materials_by_ref.items()
+    }
+    return all(
+        item.citations
+        and {citation.source_ref for citation in item.citations} == set(item.source_refs)
+        and all(
+            re.sub(r"\s+", " ", citation.quote).strip()
+            in normalized_materials.get(citation.source_ref, "")
+            for citation in item.citations
+        )
+        for item in evidence
+    )
 
 
 class HandoffRisk(BaseModel):
@@ -988,7 +1058,7 @@ class HandoffAction(BaseModel):
 
 
 class SpecialistHandoffPayload(BaseModel):
-    contract_version: Literal[2, 3] = 2
+    contract_version: Literal[2, 3, 4] = 2
     structured: bool
     content: str = Field(min_length=1, max_length=24000)
     summary: str = Field(default="", max_length=2000)
@@ -1032,6 +1102,18 @@ class SpecialistHandoffPayload(BaseModel):
             raise ValueError(
                 "v3 handoffs require criterion and source references for every evidence item"
             )
+        cited_evidence = any(item.citations for item in self.evidence)
+        if self.contract_version < 4 and cited_evidence:
+            raise ValueError("pre-v4 handoffs cannot contain source citations")
+        if self.contract_version >= 4 and self.structured and any(
+            not item.citations
+            or {citation.source_ref for citation in item.citations}
+            != set(item.source_refs)
+            for item in self.evidence
+        ):
+            raise ValueError(
+                "v4 handoffs require verified citations for every evidence source"
+            )
         if self.structured and len(
             json.dumps(self.contract_data(), ensure_ascii=False)
         ) > HANDOFF_CONTRACT_JSON_LIMIT:
@@ -1048,7 +1130,7 @@ class AgentHandoff(BaseModel):
     deliverable: str = Field(min_length=2, max_length=200)
     content: str = Field(min_length=1, max_length=24000)
     revision_round: int = Field(default=0, ge=0, le=20)
-    contract_version: int = Field(default=1, ge=1, le=3)
+    contract_version: int = Field(default=1, ge=1, le=4)
     structured: bool = False
     summary: str = Field(default="", max_length=2000)
     decisions: list[HandoffDecision] = Field(default_factory=list, max_length=8)
@@ -1108,6 +1190,18 @@ class AgentHandoff(BaseModel):
         ):
             raise ValueError(
                 "v3 handoffs require criterion and source references for every evidence item"
+            )
+        cited_evidence = any(item.citations for item in self.evidence)
+        if self.contract_version < 4 and cited_evidence:
+            raise ValueError("pre-v4 handoffs cannot contain source citations")
+        if self.contract_version >= 4 and self.structured and any(
+            not item.citations
+            or {citation.source_ref for citation in item.citations}
+            != set(item.source_refs)
+            for item in self.evidence
+        ):
+            raise ValueError(
+                "v4 handoffs require verified citations for every evidence source"
             )
         if self.structured and len(
             json.dumps(self.contract_data(), ensure_ascii=False)
@@ -1212,7 +1306,9 @@ def _handoff_input_fingerprint(
     return _stable_fingerprint(
         {
             "contract": (
-                "agent-handoff-input-v2"
+                "agent-handoff-input-v3"
+                if contract_version >= 4
+                else "agent-handoff-input-v2"
                 if contract_version >= 3
                 else "agent-handoff-input-v1"
             ),
@@ -1243,7 +1339,9 @@ def _handoff_output_fingerprint(
     return _stable_fingerprint(
         {
             "contract": (
-                "agent-handoff-output-v3"
+                "agent-handoff-output-v4"
+                if contract_version >= 4
+                else "agent-handoff-output-v3"
                 if contract_version >= 3
                 else "agent-handoff-output-v2"
                 if contract_version >= 2
@@ -1650,6 +1748,8 @@ def _render_specialist_handoff(response: _SpecialistHandoffResponse) -> str:
             lines.append(f"  - 验收标准：{', '.join(item.criterion_ids)}")
         if item.source_refs:
             lines.append(f"  - 受控引用：{', '.join(item.source_refs)}")
+        for citation in item.citations:
+            lines.append(f"  - 原文 [{citation.source_ref}]：{citation.quote}")
     lines.extend(["", "## 风险与缓解"])
     for item in response.risks:
         lines.extend(
@@ -1686,8 +1786,21 @@ def parse_specialist_handoff(
     allowed_roles: set[SpecialistRole] | None = None,
     *,
     evidence_context: HandoffEvidenceContext | None = None,
+    evidence_materials: list[HandoffEvidenceMaterial] | None = None,
 ) -> SpecialistHandoffPayload:
     permitted_roles = allowed_roles or {role}
+    contract_version = (
+        4
+        if evidence_context is not None and evidence_materials is not None
+        else 3
+        if evidence_context is not None
+        else 2
+    )
+    materials_by_ref = (
+        _evidence_material_index(evidence_context, evidence_materials)
+        if evidence_context is not None and evidence_materials is not None
+        else None
+    )
     for candidate in _json_candidates(text):
         try:
             response = _SpecialistHandoffResponse.model_validate(json.loads(candidate))
@@ -1718,8 +1831,16 @@ def parse_specialist_handoff(
                     )
                 ):
                     continue
+            if contract_version >= 4 and (
+                materials_by_ref is None
+                or not _evidence_citations_match_materials(
+                    response.evidence,
+                    materials_by_ref,
+                )
+            ):
+                continue
             return SpecialistHandoffPayload(
-                contract_version=3 if evidence_context is not None else 2,
+                contract_version=contract_version,
                 structured=True,
                 content=_render_specialist_handoff(response),
                 **response.model_dump(mode="json"),
@@ -1727,7 +1848,7 @@ def parse_specialist_handoff(
         except (json.JSONDecodeError, ValidationError, ValueError):
             continue
     return SpecialistHandoffPayload(
-        contract_version=3 if evidence_context is not None else 2,
+        contract_version=contract_version,
         structured=False,
         content=(
             text.strip()[:24000]
@@ -2015,6 +2136,9 @@ def evaluate_handoffs(
     *,
     plan_version: int | None = None,
     evidence_contexts: dict[SpecialistRole, HandoffEvidenceContext] | None = None,
+    evidence_materials: dict[
+        SpecialistRole, list[HandoffEvidenceMaterial]
+    ] | None = None,
 ) -> QualityGateDecision:
     expected_roles = [assignment.role for assignment in plan.assignments]
     handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
@@ -2069,6 +2193,14 @@ def evaluate_handoffs(
             for item in handoff.evidence
             for source_ref in item.source_refs
         }
+        materials_by_ref = (
+            _evidence_material_index(context, evidence_materials[role])
+            if handoff.contract_version >= 4
+            and context is not None
+            and evidence_materials is not None
+            and role in evidence_materials
+            else None
+        )
         if (
             context is None
             or not handoff.structured
@@ -2078,6 +2210,16 @@ def evaluate_handoffs(
             or any(
                 not item.criterion_ids or not item.source_refs
                 for item in handoff.evidence
+            )
+            or (
+                handoff.contract_version >= 4
+                and (
+                    materials_by_ref is None
+                    or not _evidence_citations_match_materials(
+                        handoff.evidence,
+                        materials_by_ref,
+                    )
+                )
             )
         ):
             invalid_evidence_roles.append(role)

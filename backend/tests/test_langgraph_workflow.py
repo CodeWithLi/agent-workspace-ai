@@ -27,6 +27,7 @@ from app.services.workflows import process_workflow
 def structured_handoff_response(
     role: str,
     evidence_context: dict | None = None,
+    evidence_materials: list[dict] | None = None,
 ) -> str:
     payload = {
             "summary": (
@@ -75,6 +76,14 @@ def structured_handoff_response(
         ]
         payload["evidence"][0]["source_refs"] = [
             item["ref"] for item in evidence_context["sources"]
+        ]
+    if evidence_materials is not None:
+        payload["evidence"][0]["citations"] = [
+            {
+                "source_ref": item["ref"],
+                "quote": item["content"][:200],
+            }
+            for item in evidence_materials
         ]
     return json.dumps(payload, ensure_ascii=False)
 
@@ -228,7 +237,11 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
         if "专业交接 Agent" in system_prompt:
             context = json.loads(user_prompt)
             role = context["assignment"]["role"]
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             if json.loads(user_prompt)["reviewer_role"] == "architect":
                 raise TimeoutError("architect reviewer unavailable")
@@ -365,7 +378,11 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
         if "专业交接 Agent" in system_prompt:
             context = json.loads(user_prompt)
             role = context["assignment"]["role"]
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -604,7 +621,11 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
         if "专业交接 Agent" in system_prompt:
             context = json.loads(user_prompt)
             role = context["assignment"]["role"]
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -800,7 +821,11 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
         if "专业交接 Agent" in system_prompt:
             context = json.loads(user_prompt)
             role = context["assignment"]["role"]
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -935,7 +960,11 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
             max_parallel = max(max_parallel, len(active_roles))
             await asyncio.sleep(0.01)
             active_roles.remove(role)
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -977,7 +1006,7 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         handoff["role"]: handoff for handoff in state["specialist_handoffs"]
     }
     assert all(handoff["plan_version"] == 1 for handoff in handoffs_by_role.values())
-    assert all(handoff["contract_version"] == 3 for handoff in handoffs_by_role.values())
+    assert all(handoff["contract_version"] == 4 for handoff in handoffs_by_role.values())
     assert all(handoff["structured"] is True for handoff in handoffs_by_role.values())
     assert all(
         len(handoff["evidence_context_fingerprint"]) == 64
@@ -1006,8 +1035,19 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
             "artifact:SYSTEM_DESIGN",
             *expected_upstream_refs[role],
         }
+        assert {item["source_ref"] for item in evidence["citations"]} == set(
+            evidence["source_refs"]
+        )
+        material_by_ref = {
+            item["ref"]: item["content"]
+            for item in specialist_contexts[role]["evidence_materials"]
+        }
+        assert all(
+            citation["quote"] in material_by_ref[citation["source_ref"]]
+            for citation in evidence["citations"]
+        )
     test_upstream = specialist_contexts["test_engineer"]["upstream_handoffs"][0]
-    assert test_upstream["contract_version"] == 3
+    assert test_upstream["contract_version"] == 4
     assert test_upstream["summary"] == handoffs_by_role["knowledge_admin"]["summary"]
     assert test_upstream["evidence"] == handoffs_by_role["knowledge_admin"]["evidence"]
     assert "content" not in test_upstream
@@ -1049,13 +1089,14 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         for event in branch_completed_events
     )
     branch_payloads = [json.loads(event.payload_json) for event in branch_completed_events]
-    assert all(payload["contract_version"] == 3 for payload in branch_payloads)
+    assert all(payload["contract_version"] == 4 for payload in branch_payloads)
     assert all(payload["structured"] is True for payload in branch_payloads)
     assert all(payload["decision_count"] == 1 for payload in branch_payloads)
     assert all(payload["evidence_count"] == 1 for payload in branch_payloads)
     assert all(payload["grounded_evidence_count"] == 1 for payload in branch_payloads)
     assert all(payload["criterion_reference_count"] == 1 for payload in branch_payloads)
     assert sorted(payload["source_reference_count"] for payload in branch_payloads) == [2, 2, 3, 4]
+    assert sorted(payload["verified_citation_count"] for payload in branch_payloads) == [2, 2, 3, 4]
     assert all(payload["risk_count"] == 1 for payload in branch_payloads)
     assert all(payload["open_question_count"] == 1 for payload in branch_payloads)
     assert all(payload["next_action_count"] == 1 for payload in branch_payloads)
@@ -1072,8 +1113,10 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
     assert quality_event is not None
     quality_payload = json.loads(quality_event.payload_json)
     assert quality_payload["grounded_handoff_count"] == 4
+    assert quality_payload["cited_handoff_count"] == 4
     assert quality_payload["criterion_reference_count"] == 2
     assert quality_payload["source_reference_count"] == 5
+    assert quality_payload["verified_citation_count"] == 11
     assert quality_payload["criterion_gate_count"] == 2
     assert quality_payload["criterion_gate_pass_count"] == 2
     assert quality_payload["criterion_gate_fail_count"] == 0
@@ -1175,7 +1218,11 @@ async def test_specialist_wave_checkpoint_survives_operator_recovery_without_rep
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise RuntimeError("transient test specialist failure")
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -1314,7 +1361,11 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "knowledge_admin" and specialist_calls[role] == 1:
                 raise LLMRetryableError("transient provider failure")
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -1385,7 +1436,11 @@ async def test_deterministic_branch_failure_pauses_for_targeted_operator_recover
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise ValueError("测试环境配置缺少验收凭据")
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,
@@ -1524,7 +1579,11 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
                 await asyncio.sleep(0.01)
                 context = json.loads(_user_prompt)
                 role = context["assignment"]["role"]
-                return structured_handoff_response(role, context.get("evidence_context"))
+                return structured_handoff_response(
+                    role,
+                    context.get("evidence_context"),
+                    context.get("evidence_materials"),
+                )
             finally:
                 active_branches -= 1
         if "报告生成器" in system_prompt:

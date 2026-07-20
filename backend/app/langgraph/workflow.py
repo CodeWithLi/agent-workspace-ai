@@ -20,6 +20,7 @@ from app.agent.orchestration import (
     ExecutionPlanCandidate,
     HandoffEvidenceContext,
     HandoffEvidenceCriterion,
+    HandoffEvidenceMaterial,
     HandoffEvidenceSource,
     MultiAgentExecutionPlan,
     SpecialistAssignment,
@@ -489,6 +490,48 @@ def handoff_evidence_context(
     if not sources:
         return None
     return HandoffEvidenceContext(criteria=criteria, sources=sources)
+
+
+def handoff_evidence_materials(
+    state: WorkspaceGraphState,
+    context: HandoffEvidenceContext,
+    upstream_handoffs: dict[str, AgentHandoff],
+) -> list[HandoffEvidenceMaterial]:
+    materials: list[HandoffEvidenceMaterial] = []
+    for source in context.sources:
+        if source.ref.startswith("artifact:"):
+            content = document_content(
+                state,
+                source.ref.removeprefix("artifact:"),
+                limit=24000,
+            )
+        else:
+            role = source.ref.removeprefix("handoff:")
+            upstream = upstream_handoffs.get(role)
+            content = (
+                json.dumps(
+                    upstream.downstream_context(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if upstream is not None
+                else ""
+            )
+        if not content:
+            return []
+        materials.append(
+            HandoffEvidenceMaterial(
+                ref=source.ref,
+                label=source.label,
+                content=content,
+                source_fingerprint=source.fingerprint,
+                material_fingerprint=hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+            )
+        )
+    return materials
 
 
 def record_workflow_event(
@@ -1412,11 +1455,22 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 assignment,
                 upstream_handoff_models,
             )
+            evidence_materials = (
+                handoff_evidence_materials(
+                    state,
+                    evidence_context,
+                    upstream_handoff_models,
+                )
+                if evidence_context is not None
+                else None
+            )
             evidence_contract = (
                 "evidence 每项还必须包含 criterion_ids 和 source_refs；criterion_ids 必须完整覆盖"
                 " assignment.criterion_ids，source_refs 只能取 evidence_context.sources.ref。"
-                "不得把说明文字、URL 或不存在的产物冒充受控引用。"
-                if evidence_context is not None
+                "每项还必须包含 citations（source_ref、quote），为每个 source_ref 提供至少一条"
+                "来自 evidence_materials 对应 content 的 12-1000 字逐字原文；不得改写、拼接或"
+                "把说明文字、URL、不存在的产物冒充受控引用。"
+                if evidence_materials is not None
                 else "当前为历史计划兼容模式，evidence 只包含 claim、source、verification。"
             )
             raw_handoff = await invoke_agent(
@@ -1425,7 +1479,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "你是专业交接 Agent。围绕分配目标输出可供其他 Agent 直接使用的专业 Handoff。"
                     "只返回 JSON 对象，不要 Markdown。字段必须为："
                     "summary（完整摘要）；decisions（title、outcome、rationale）；"
-                    "evidence（claim、source、verification）；"
+                    "evidence（claim、source、verification、criterion_ids、source_refs、citations）；"
                     "risks（risk、mitigation、owner_role）；"
                     "open_questions（question、owner_role、blocking，可为空数组）；"
                     "next_actions（action、owner_role、acceptance_criteria）。"
@@ -1445,6 +1499,14 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                             if evidence_context is not None
                             else None
                         ),
+                        "evidence_materials": (
+                            [
+                                item.model_dump(mode="json")
+                                for item in evidence_materials
+                            ]
+                            if evidence_materials is not None
+                            else None
+                        ),
                         "upstream_handoffs": upstream_handoffs,
                         "revision_feedback": revision_feedback,
                         "previous_handoff": (
@@ -1460,6 +1522,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 assignment.role,
                 {item.role for item in plan.assignments},
                 evidence_context=evidence_context,
+                evidence_materials=evidence_materials,
             )
             return seal_handoff(
                 plan,
@@ -1613,6 +1676,9 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                                 for item in handoff.evidence
                                 for source_ref in item.source_refs
                             }),
+                            "verified_citation_count": sum(
+                                len(item.citations) for item in handoff.evidence
+                            ),
                             "risk_count": len(handoff.risks),
                             "open_question_count": len(handoff.open_questions),
                             "next_action_count": len(handoff.next_actions),
@@ -1778,6 +1844,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         handoffs = [AgentHandoff.model_validate(item) for item in state.get("specialist_handoffs", [])]
         handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
         evidence_contexts = {}
+        evidence_materials = {}
         for wave in build_execution_waves(plan):
             for assignment in wave:
                 context = handoff_evidence_context(
@@ -1791,11 +1858,21 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 )
                 if context is not None:
                     evidence_contexts[assignment.role] = context
+                    evidence_materials[assignment.role] = handoff_evidence_materials(
+                        state,
+                        context,
+                        {
+                            role: handoffs_by_role[role]
+                            for role in assignment.depends_on
+                            if role in handoffs_by_role
+                        },
+                    )
         deterministic = evaluate_handoffs(
             plan,
             handoffs,
             plan_version=max(1, int(state.get("plan_version", 0))),
             evidence_contexts=evidence_contexts,
+            evidence_materials=evidence_materials,
         )
         review_evidence = build_reviewer_evidence_references(handoffs)
         criterion_owners: dict[str, list[str]] = {}
@@ -1950,6 +2027,10 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     handoff.contract_version >= 3 and handoff.structured
                     for handoff in handoffs
                 ),
+                "cited_handoff_count": sum(
+                    handoff.contract_version >= 4 and handoff.structured
+                    for handoff in handoffs
+                ),
                 "criterion_reference_count": len({
                     criterion_id
                     for handoff in handoffs
@@ -1979,6 +2060,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     for item in handoff.evidence
                     for source_ref in item.source_refs
                 }),
+                "verified_citation_count": sum(
+                    len(item.citations)
+                    for handoff in handoffs
+                    for item in handoff.evidence
+                ),
                 "reviewer_count": len(decision.reviewers),
                 "reviewer_valid_count": decision.reviewer_valid_count,
                 "reviewer_quorum": decision.reviewer_quorum,

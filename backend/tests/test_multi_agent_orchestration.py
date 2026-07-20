@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -8,6 +9,7 @@ from app.agent.orchestration import (
     ExecutionPlanCandidate,
     HandoffEvidenceContext,
     HandoffEvidenceCriterion,
+    HandoffEvidenceMaterial,
     HandoffEvidenceSource,
     MultiAgentExecutionPlan,
     ReviewerEvidenceReference,
@@ -1205,6 +1207,145 @@ def test_handoff_v3_grounds_evidence_in_owned_criteria_and_current_sources() -> 
     assert set(stale.revision_roles) == {"operations_analyst", "test_engineer"}
     assert invalid_reference.contract_version == 3
     assert invalid_reference.structured is False
+
+
+def test_handoff_v4_verifies_exact_quotes_against_authoritative_materials() -> None:
+    plan = MultiAgentExecutionPlan.model_validate(
+        {
+            "objective": "形成逐条引用原始材料并可由质量门复验的交付方案",
+            "rationale": "运营和测试分别负责一项验收标准，所有证据必须逐字引用受控来源。",
+            "assignments": [
+                {
+                    "role": "operations_analyst",
+                    "objective": "验证发布恢复边界和责任归属",
+                    "deliverable": "发布恢复证据",
+                    "criterion_ids": ["AC-02"],
+                },
+                {
+                    "role": "test_engineer",
+                    "objective": "验证核心用户路径和证据可复现性",
+                    "deliverable": "核心路径证据",
+                    "criterion_ids": ["AC-01"],
+                },
+            ],
+            "success_criteria": ["AC-01 可复现", "AC-02 可恢复"],
+        }
+    )
+    source_content = (
+        "系统必须保留可复现的核心路径验收记录，并在发布失败后十分钟内完成回滚。"
+    )
+    source_fingerprint = hashlib.sha256(source_content.encode("utf-8")).hexdigest()
+    handoffs = []
+    contexts = {}
+    materials_by_role = {}
+    for assignment in plan.assignments:
+        context = HandoffEvidenceContext(
+            criteria=[
+                HandoffEvidenceCriterion(
+                    criterion_id=assignment.criterion_ids[0],
+                    description="交付结果必须具有明确且可复现的验收依据",
+                    evidence="受控文档原文和自动化验收记录",
+                    priority="MUST",
+                )
+            ],
+            sources=[
+                HandoffEvidenceSource(
+                    ref="artifact:PRD",
+                    source_type="artifact",
+                    label="产品需求文档",
+                    fingerprint=source_fingerprint,
+                )
+            ],
+        )
+        material = HandoffEvidenceMaterial(
+            ref="artifact:PRD",
+            label="产品需求文档",
+            content=source_content,
+            source_fingerprint=source_fingerprint,
+            material_fingerprint=source_fingerprint,
+        )
+        response = json.loads(
+            grounded_handoff_response(
+                assignment.role,
+                assignment.criterion_ids,
+                ["artifact:PRD"],
+            )
+        )
+        response["evidence"][0]["citations"] = [
+            {"source_ref": "artifact:PRD", "quote": source_content}
+        ]
+        payload = parse_specialist_handoff(
+            json.dumps(response, ensure_ascii=False),
+            assignment.role,
+            {item.role for item in plan.assignments},
+            evidence_context=context,
+            evidence_materials=[material],
+        )
+        handoffs.append(
+            seal_handoff(
+                plan,
+                assignment,
+                payload.content,
+                plan_version=5,
+                revision_round=0,
+                upstream_handoffs={},
+                contract=payload,
+                evidence_context=context,
+            )
+        )
+        contexts[assignment.role] = context
+        materials_by_role[assignment.role] = [material]
+
+    valid = evaluate_handoffs(
+        plan,
+        handoffs,
+        plan_version=5,
+        evidence_contexts=contexts,
+        evidence_materials=materials_by_role,
+    )
+    tampered_response = json.loads(
+        grounded_handoff_response(
+            "test_engineer",
+            ["AC-01"],
+            ["artifact:PRD"],
+        )
+    )
+    tampered_response["evidence"][0]["citations"] = [
+        {"source_ref": "artifact:PRD", "quote": "这段原文并不存在于任何受控需求材料之中。"}
+    ]
+    rejected = parse_specialist_handoff(
+        json.dumps(tampered_response, ensure_ascii=False),
+        "test_engineer",
+        {item.role for item in plan.assignments},
+        evidence_context=contexts["test_engineer"],
+        evidence_materials=materials_by_role["test_engineer"],
+    )
+    replacement_content = "这是另一份不包含已封存引用的权威材料，因此必须触发重新评审。"
+    changed_material = materials_by_role["test_engineer"][0].model_copy(
+        update={
+            "content": replacement_content,
+            "material_fingerprint": hashlib.sha256(
+                replacement_content.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    stale = evaluate_handoffs(
+        plan,
+        handoffs,
+        plan_version=5,
+        evidence_contexts=contexts,
+        evidence_materials={
+            **materials_by_role,
+            "test_engineer": [changed_material],
+        },
+    )
+
+    assert all(handoff.contract_version == 4 for handoff in handoffs)
+    assert valid.passed is True
+    assert rejected.contract_version == 4
+    assert rejected.structured is False
+    assert stale.passed is False
+    assert stale.revision_roles == ["test_engineer"]
 
 
 def test_handoff_v2_quality_gate_rejects_unstructured_or_tampered_contracts() -> None:

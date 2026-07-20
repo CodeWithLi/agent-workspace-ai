@@ -12,6 +12,7 @@ from app.models import Project, Task, User, WorkflowEvent, WorkflowStatus
 def structured_handoff_response(
     role: str,
     evidence_context: dict | None = None,
+    evidence_materials: list[dict] | None = None,
 ) -> str:
     payload = {
             "summary": (
@@ -54,6 +55,14 @@ def structured_handoff_response(
         ]
         payload["evidence"][0]["source_refs"] = [
             item["ref"] for item in evidence_context["sources"]
+        ]
+    if evidence_materials is not None:
+        payload["evidence"][0]["citations"] = [
+            {
+                "source_ref": item["ref"],
+                "quote": item["content"][:200],
+            }
+            for item in evidence_materials
         ]
     return json.dumps(payload, ensure_ascii=False)
 
@@ -232,7 +241,11 @@ async def test_requirement_challenges_are_revised_re_reviewed_and_forwarded(
         if "专业交接 Agent" in system_prompt:
             context = json.loads(user_prompt)
             role = context["assignment"]["role"]
-            return structured_handoff_response(role, context.get("evidence_context"))
+            return structured_handoff_response(
+                role,
+                context.get("evidence_context"),
+                context.get("evidence_materials"),
+            )
         if "交接质量评审 Agent" in system_prompt:
             return structured_reviewer_response(
                 user_prompt,

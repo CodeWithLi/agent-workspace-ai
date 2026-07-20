@@ -2706,7 +2706,7 @@ test('restores live specialist retry states and opens completed handoffs', async
           deliverable: '发布运行手册',
           content: '## 摘要\n已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。',
           revision_round: 0,
-          contract_version: 3,
+          contract_version: 4,
           structured: true,
           summary: '已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。',
           decisions: [
@@ -2722,7 +2722,17 @@ test('restores live specialist retry states and opens completed handoffs', async
               source: '灰度演练记录与监控快照',
               verification: '重新执行灰度演练并核对成功标准。',
               criterion_ids: ['AC-02'],
-              source_refs: ['artifact:PRD', 'artifact:SYSTEM_DESIGN']
+              source_refs: ['artifact:PRD', 'artifact:SYSTEM_DESIGN'],
+              citations: [
+                {
+                  source_ref: 'artifact:PRD',
+                  quote: '系统必须保留可复现的核心发布路径验收记录。'
+                },
+                {
+                  source_ref: 'artifact:SYSTEM_DESIGN',
+                  quote: '达到告警阈值时停止扩容，并在十分钟内完成回滚。'
+                }
+              ]
             }
           ],
           risks: [
@@ -2770,7 +2780,7 @@ test('restores live specialist retry states and opens completed handoffs', async
     { id: 1, workflow_id: 150, node: 'specialists', event_type: 'WAVE_STARTED', message: 'wave started', payload: { wave: 1, roles: ['operations_analyst', 'test_engineer'] }, created_at: '2026-07-19T10:00:02Z' },
     { id: 2, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'operations started', payload: { role: 'operations_analyst', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
     { id: 3, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_STARTED', message: 'test started', payload: { role: 'test_engineer', branch_attempt: 1 }, created_at: '2026-07-19T10:00:03Z' },
-    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1, contract_version: 3, structured: true, decision_count: 1, evidence_count: 1, grounded_evidence_count: 1, criterion_reference_count: 1, source_reference_count: 2, risk_count: 1, open_question_count: 1, next_action_count: 1, lineage_sealed: true, upstream_count: 0, plan_version: 2 }, created_at: '2026-07-19T10:00:07Z' },
+    { id: 4, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_COMPLETED', message: 'operations completed', payload: { role: 'operations_analyst', branch_attempt: 1, contract_version: 4, structured: true, decision_count: 1, evidence_count: 1, grounded_evidence_count: 1, criterion_reference_count: 1, source_reference_count: 2, verified_citation_count: 2, risk_count: 1, open_question_count: 1, next_action_count: 1, lineage_sealed: true, upstream_count: 0, plan_version: 2 }, created_at: '2026-07-19T10:00:07Z' },
     { id: 5, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_FAILED', message: 'test failed', payload: { role: 'test_engineer', branch_attempt: 1, retryable: true, will_retry: true }, created_at: '2026-07-19T10:00:07Z' },
     { id: 6, workflow_id: 150, node: 'specialists', event_type: 'BRANCH_RETRY_SCHEDULED', message: 'test retry scheduled', payload: { role: 'test_engineer', branch_attempt: 1, next_branch_attempt: 2, retry_delay_seconds: 1 }, created_at: '2026-07-19T10:00:08Z' }
   ]
@@ -2799,7 +2809,7 @@ test('restores live specialist retry states and opens completed handoffs', async
   await expect(lineage.getByText('证据 cccccccccc', { exact: true })).toBeVisible()
   await expect(lineage.getByText('aaaaaaaaaa → bbbbbbbbbb', { exact: true })).toBeVisible()
   const contract = page.getByRole('region', { name: '运营分析师结构化 Handoff 合同' })
-  await expect(contract.getByText('结构化合同 v3', { exact: true })).toBeVisible()
+  await expect(contract.getByText('结构化合同 v4', { exact: true })).toBeVisible()
   await expect(contract.getByText('已确认发布窗口、监控阈值、失败信号和回滚责任，可供下游直接执行。', { exact: true })).toBeVisible()
   await expect(contract.locator('.handoff-contract-counts > div').filter({ hasText: '决策' })).toHaveText('决策1')
   await contract.locator('summary').filter({ hasText: '关键决策' }).click()
@@ -2810,6 +2820,10 @@ test('restores live specialist retry states and opens completed handoffs', async
   await expect(contract.getByText('AC-02', { exact: true })).toBeVisible()
   await expect(contract.getByText('产品需求文档（PRD）', { exact: true })).toBeVisible()
   await expect(contract.getByText('系统设计', { exact: true })).toBeVisible()
+  const citations = contract.getByRole('region', { name: '已核验原文引用' })
+  await expect(citations.getByText('已核验原文', { exact: true })).toBeVisible()
+  await expect(citations.getByText('系统必须保留可复现的核心发布路径验收记录。', { exact: true })).toBeVisible()
+  await expect(citations.getByText('达到告警阈值时停止扩容，并在十分钟内完成回滚。', { exact: true })).toBeVisible()
   await contract.locator('summary').filter({ hasText: '风险与缓解' }).click()
   await expect(contract.getByText('达到告警阈值时停止扩容并回滚。', { exact: true })).toBeVisible()
   await contract.locator('summary').filter({ hasText: '开放问题' }).click()

@@ -296,6 +296,15 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
                 evidence["source_refs"] = [
                     item["ref"] for item in evidence_context["sources"]
                 ]
+            evidence_materials = context.get("evidence_materials")
+            if evidence_materials is not None:
+                evidence["citations"] = [
+                    {
+                        "source_ref": item["ref"],
+                        "quote": item["content"][:200],
+                    }
+                    for item in evidence_materials
+                ]
             return json.dumps(
                 {
                     "summary": "The specialist completed a verifiable handoff with explicit ownership and recovery criteria.",
