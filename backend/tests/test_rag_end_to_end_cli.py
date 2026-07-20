@@ -67,6 +67,13 @@ def test_evaluation_config_fingerprint_ignores_strategy_but_locks_model_stack() 
 
     assert baseline == candidate
     assert len(baseline["sha256"]) == 64
+    assert baseline["runtime"]["python"]
+    assert set(baseline["runtime"]["packages"]) == {
+        "chonkie",
+        "llama-cpp-python",
+        "sentence-transformers",
+        "torch",
+    }
     assert changed_model["sha256"] != baseline["sha256"]
 
 

@@ -9,9 +9,11 @@ from app.langgraph.workflow import run_workspace_graph
 from app.models import Project, Task, User, WorkflowEvent, WorkflowStatus
 
 
-def structured_handoff_response(role: str) -> str:
-    return json.dumps(
-        {
+def structured_handoff_response(
+    role: str,
+    evidence_context: dict | None = None,
+) -> str:
+    payload = {
             "summary": (
                 "The specialist completed a verifiable handoff with explicit scope, "
                 "ownership, evidence, risk controls, and recovery criteria."
@@ -45,9 +47,15 @@ def structured_handoff_response(role: str) -> str:
                     "acceptance_criteria": "All core cases pass and the evidence is independently reviewable.",
                 }
             ],
-        },
-        ensure_ascii=False,
-    )
+        }
+    if evidence_context:
+        payload["evidence"][0]["criterion_ids"] = [
+            item["criterion_id"] for item in evidence_context["criteria"]
+        ]
+        payload["evidence"][0]["source_refs"] = [
+            item["ref"] for item in evidence_context["sources"]
+        ]
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def execution_plan() -> dict:
@@ -59,11 +67,13 @@ def execution_plan() -> dict:
                 "role": "test_engineer",
                 "objective": "验证会员核心路径、边界状态和验收证据",
                 "deliverable": "可复现测试与验收清单",
+                "criterion_ids": ["AC-01"],
             },
             {
                 "role": "operations_analyst",
                 "objective": "验证监控、灰度发布和故障恢复边界",
                 "deliverable": "发布与回滚运行手册",
+                "criterion_ids": ["AC-02"],
             },
         ],
         "success_criteria": [
@@ -192,8 +202,9 @@ async def test_requirement_challenges_are_revised_re_reviewed_and_forwarded(
         if "独立执行计划仲裁 Agent" in system_prompt:
             return arbiter_decision()
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
-            return structured_handoff_response(role)
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {

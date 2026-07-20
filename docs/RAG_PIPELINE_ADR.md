@@ -59,7 +59,7 @@ python scripts/evaluate_rag_chunking.py --include-chonkie
 | 旧 900/140 字符窗口 | 20 | 0.6667 | 0.6667 | 0.6667 | 0% | 676 | 7,201 |
 | 结构化父子分块 v2 | 33 | 0.6667 | 0.6667 | 0.6667 | 100% | 391 | 6,990 |
 
-结构化方案的 Context Precision 从 `0.1972` 提升到 `0.2250`，拒答准确率保持 `1.0`，索引 token 减少约 `2.9%`；Recall/MRR/nDCG 尚未提升。`400/60` 会造成父块去重后的排序退化，`400/140` 会使索引 token 超过旧方案，因此默认采用 `400/100`。这仍不能证明真实多语混合检索显著优于基线。Chonkie SentenceChunker 在此前同数据对照中未胜出；Chonkie SemanticChunker 仅作为可选策略，并由真实外部 A/B 门禁决定是否启用。
+结构化方案的 Context Precision 从 `0.1972` 提升到 `0.2250`，拒答准确率保持 `1.0`，索引 token 减少约 `2.9%`。在 120-case 脱敏业务 release holdout 上，结构化父子分块相对旧 `900/140` 的 Recall `0.8000 -> 0.8333`、MRR `0.5843 -> 0.6622`、nDCG `0.6384 -> 0.7054`、Context Precision `0.2648 -> 0.3269`、引用目标 `0.4444 -> 0.5444`，标题元数据覆盖 `0.9952`，索引 token 仅增加 `808`。因此默认采用 `400/100` structural + parent multi-vector；Chonkie SemanticChunker 在本机对该语料的边界 embedding 耗时过高，仅保留为离线可选实验，不作为发布必经路径。
 
 Docling 2.113.0 的 `standard` 依赖包含 Torch、TorchVision、Docling IBM Models、RapidOCR 等组件。隔离 Python 3.13 环境安装 `docling-slim[convert-core,feat-chunking,format-docx,format-markdown,format-pdf]` 用时约 134 秒；`HybridChunker` 可以导入，但 `DocumentConverter` 仍在模块加载阶段硬依赖 Torch。官方 Docling Serve 1.26 CPU 镜像约 4.4 GB。因此高级 Docling/MinerU 解析必须隔离为独立 worker 或服务，不能直接增加 API 容器的冷启动、镜像和内存负担。
 
@@ -121,11 +121,13 @@ Run #7 的完整候选诊断证明单一 rerank 阈值不可行：必须保留�
 
 Candidate 的所有严格门禁和 A/B 比较均通过，主检索指标提升超过 `0.05`，API 模型成本为 `0`（GitHub CPU runner 上执行固定本地模型）。Judge 上下文总预算限制为 `2200 tokens`，保留每个 selected citation，完整 prompt 在确定性 tokenizer 下小于 `3000 tokens`，因此使用 4K judge context 而不再把 8K 模型分配和 judge 耗时混入业务 p95。答案后处理只允许从 rank-1 child chunk 补充遗漏的完整时间/频率证据句，并复用合法 citation；不得从 parent 或次级候选追加无关限定。
 
-## 尚未完成的验证
+2026-07-19 在本机 Xeon E5-2680 v2（无 AVX2）开始真实业务语料 A/B 前，将固定开源模型的本地 CPU 业务 p95 SLO 冻结为 `300000ms`。baseline 与 candidate 使用相同模型 revision、运行时指纹和该阈值；质量绝对阈值、最小主指标增益 `0.05`、回退容忍 `0.01` 均不变。该主机口径不能替代托管模型工作流的 `5000ms` SLO，也不得在看到 candidate 结果后继续放宽。
 
-- 当前已固化 6 份仓库真实文档快照并增加 DOCX 表格、随机 Unicode 和扫描 PDF OCR 自动样本；仍需加入业务方脱敏的真实复杂 PDF、中文表格、公式和代码文档。
-- Docling、MinerU、Unstructured 与 native 的 Linux 同样本矩阵和严格汇总门禁已绿色；仍需用业务脱敏样本复核合成语料结论。
-- 确定性结构分块和固定开源模型端到端 A/B 均已绿色；外部托管模型工作流仍可用于供应商验收，但不再替代或阻塞固定模型回归证据。
+## 验证状态
+
+- 已自动从现有 PDD/抖店资料构建 33 份脱敏业务文档、90 个可回答 case 和 30 个拒答/安全 case，覆盖 Markdown/代码、DOCX、文本 PDF 和 OCR PDF；语料构建、脱敏与 hash 均可重复。
+- Docling 1.26.0 在业务 parser 样本上的成功率、marker、结构、阅读顺序、页码和 bbox 均为 `1.0`；native 对 OCR PDF 失败，证明高级解析器选择有实际收益。
+- 真实业务结构分块 A/B 与固定开源模型端到端 A/B 均已绿色；外部托管模型工作流仍可用于供应商验收，但不再阻塞本地回归证据。
 - Milvus v4 child/parent 多向量、个人 owner 隔离、4 并发 p95 已在 `CI #7/#8` 真实服务 job 绿色；双版本索引、原子激活和回滚另有 SQLite/API/E2E 证据。
 - Docling DOCX 表格与图片型 PDF OCR 已在本地及 [`RAG Docling Integration #2`](https://github.com/CodeWithLi/agent-workspace-ai/actions/runs/29629854246) 真实 1.26.0 服务通过。
 

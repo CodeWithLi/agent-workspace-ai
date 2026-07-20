@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -6,6 +7,7 @@ from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,7 +18,11 @@ from app.agent.concurrency import AgentBusyError, acquire_agent_slot
 from app.agent.orchestration import (
     AgentHandoff,
     ExecutionPlanCandidate,
+    HandoffEvidenceContext,
+    HandoffEvidenceCriterion,
+    HandoffEvidenceSource,
     MultiAgentExecutionPlan,
+    SpecialistAssignment,
     SpecialistCapabilityProfile,
     arbitrate_execution_plan_candidates,
     assess_execution_plan_candidate,
@@ -37,6 +43,7 @@ from app.agent.orchestration import (
     parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
+    validate_execution_plan_criteria,
 )
 from app.agent.requirements import (
     REQUIREMENT_REVIEW_ROLES,
@@ -187,7 +194,11 @@ def validate_execution_plan_for_dispatch(
         specialist_capability_catalog(state),
         required,
     )
-    return validated.model_dump(mode="json")
+    criterion_ids = set(requirement_criterion_ids(state))
+    return validate_execution_plan_criteria(
+        validated,
+        criterion_ids,
+    ).model_dump(mode="json")
 
 
 def initial_state(
@@ -411,6 +422,72 @@ def document_content(state: WorkspaceGraphState, document_type: str, limit: int 
         if document.get("type") == document_type and isinstance(document.get("content"), str):
             return document["content"][:limit]
     return ""
+
+
+def requirement_criterion_ids(state: dict[str, Any]) -> list[str]:
+    try:
+        contract = RequirementContract.model_validate(
+            state.get("requirements", {}).get("contract")
+        )
+    except (ValidationError, AttributeError):
+        return []
+    return [item.criterion_id for item in contract.acceptance_criteria]
+
+
+def handoff_evidence_context(
+    state: WorkspaceGraphState,
+    assignment: SpecialistAssignment,
+    upstream_handoffs: dict[str, AgentHandoff],
+) -> HandoffEvidenceContext | None:
+    if not assignment.criterion_ids:
+        return None
+    try:
+        contract = RequirementContract.model_validate(
+            state.get("requirements", {}).get("contract")
+        )
+    except (ValidationError, AttributeError):
+        return None
+    criteria_by_id = {
+        item.criterion_id: item for item in contract.acceptance_criteria
+    }
+    if set(assignment.criterion_ids) - set(criteria_by_id):
+        return None
+    criteria = [
+        HandoffEvidenceCriterion.model_validate(
+            criteria_by_id[criterion_id].model_dump(mode="json")
+        )
+        for criterion_id in assignment.criterion_ids
+    ]
+    sources: list[HandoffEvidenceSource] = []
+    for document_type, label in (
+        ("PRD", "产品需求文档"),
+        ("SYSTEM_DESIGN", "系统设计"),
+    ):
+        content = document_content(state, document_type, limit=24000)
+        if content:
+            sources.append(
+                HandoffEvidenceSource(
+                    ref=f"artifact:{document_type}",
+                    source_type="artifact",
+                    label=label,
+                    fingerprint=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                )
+            )
+    for role in assignment.depends_on:
+        upstream = upstream_handoffs.get(role)
+        if upstream is None or not upstream.output_fingerprint:
+            continue
+        sources.append(
+            HandoffEvidenceSource(
+                ref=f"handoff:{role}",
+                source_type="upstream_handoff",
+                label=upstream.deliverable,
+                fingerprint=upstream.output_fingerprint,
+            )
+        )
+    if not sources:
+        return None
+    return HandoffEvidenceContext(criteria=criteria, sources=sources)
 
 
 def record_workflow_event(
@@ -784,6 +861,8 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         begin_node(db, workflow, "planning", expected_lease_token)
         revision_feedback = state.get("plan_revision_feedback", "").strip()
         capability_catalog = specialist_capability_catalog(state)
+        criterion_ids = requirement_criterion_ids(state)
+        criterion_id_set = set(criterion_ids)
         eligible_specialists = ensure_specialist_team_ready(capability_catalog)
         ensure_specialist_capabilities_available(
             capability_catalog,
@@ -798,13 +877,14 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         planner_prompt = (
             "你是多 Agent 动态编排器。根据项目目标选择 2 到 4 个专业分支，只输出 JSON。"
             "字段必须为 objective、rationale、assignments、success_criteria；每个 assignment 包含 "
-            "role、objective、deliverable、depends_on、required_capabilities、selection_reason。"
+            "role、objective、deliverable、depends_on、required_capabilities、selection_reason、criterion_ids。"
             "depends_on 是同一计划内前置角色数组，无依赖时为空数组。"
             f"role 仅允许本次冻结目录中的合格角色：{eligible_roles}。"
             "required_capabilities 必须是对应角色 capabilities 的非空子集；selection_reason 必须说明"
             "任务所需能力为何与该角色的冻结能力、工具和知识权限匹配，不得虚构能力。"
             "依赖必须无环；同一波的无依赖角色并行执行，后续角色消费直接上游 Handoff。"
-            "requirements.contract 中每个 AC 编号都必须被任务目标或 success_criteria 明确覆盖；"
+            "criterion_ids 只能引用 requirements.contract 中的 AC 编号，每个分支至少负责一项；"
+            "全部分支的 criterion_ids 并集必须覆盖每个 AC，允许跨专业共同负责；"
             "requirements.consensus 中未闭环的 Reviewer 质疑不得被静默忽略。"
             "存在人工重新规划意见时，必须逐项回应并实质修订原计划。"
             "本次只从输入指定的 planning_perspective 独立规划，不得假设或引用其他候选方案。"
@@ -846,6 +926,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     planner_output,
                     state["user_input"],
                     capability_catalog,
+                    criterion_ids=criterion_id_set,
                 )
             except Exception as exc:
                 logger.warning(
@@ -873,7 +954,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
 
         generated_candidates = bool(candidates)
         if not candidates:
-            fallback_plan = build_fallback_plan(state["user_input"], capability_catalog)
+            fallback_plan = build_fallback_plan(
+                state["user_input"],
+                capability_catalog,
+                criterion_ids=criterion_ids,
+            )
             candidates = [
                 assess_execution_plan_candidate(
                     "deterministic_fallback",
@@ -1015,10 +1100,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     (
                         "你是自动协商修复 Agent。只允许进行一次修复，只输出完整执行计划 JSON，字段为 "
                         "objective、rationale、assignments、success_criteria；每个 assignment 包含 role、"
-                        "objective、deliverable、depends_on、required_capabilities、selection_reason。"
+                        "objective、deliverable、depends_on、required_capabilities、selection_reason、criterion_ids。"
                         "必须逐项闭环输入中的专业执行者质疑，并生成与 source_plan 结构实质不同的计划；"
                         "只能使用 eligible_specialists 中冻结的角色、能力、工具和知识权限，不得虚构输入、"
-                        "权限或上游产物。依赖必须无环，成功标准必须可验证。"
+                        "权限或上游产物。criterion_ids 必须逐项覆盖 requirements.contract 的全部 AC；"
+                        "依赖必须无环，成功标准必须可验证。"
                     ),
                     json.dumps(
                         agent_context(state, {
@@ -1042,6 +1128,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     repair_output,
                     state["user_input"],
                     capability_catalog,
+                    criterion_ids=criterion_id_set,
                 )
                 repaired_candidate = (
                     assess_execution_plan_candidate(
@@ -1319,6 +1406,18 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 }
                 for role in assignment.depends_on
             ]
+            evidence_context = handoff_evidence_context(
+                state,
+                assignment,
+                upstream_handoff_models,
+            )
+            evidence_contract = (
+                "evidence 每项还必须包含 criterion_ids 和 source_refs；criterion_ids 必须完整覆盖"
+                " assignment.criterion_ids，source_refs 只能取 evidence_context.sources.ref。"
+                "不得把说明文字、URL 或不存在的产物冒充受控引用。"
+                if evidence_context is not None
+                else "当前为历史计划兼容模式，evidence 只包含 claim、source、verification。"
+            )
             raw_handoff = await invoke_agent(
                 AgentRole(assignment.role),
                 (
@@ -1331,6 +1430,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                     "next_actions（action、owner_role、acceptance_criteria）。"
                     "decisions、evidence、risks、next_actions 均至少一项且最多八项；"
                     "owner_role 只能来自当前执行计划角色。"
+                    f"{evidence_contract}"
                 ),
                 json.dumps(
                     agent_context(state, {
@@ -1339,6 +1439,11 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                         "success_criteria": plan.success_criteria,
                         "requirements": without_analysis(state["requirements"]),
                         "architecture": state["architecture"],
+                        "evidence_context": (
+                            evidence_context.model_dump(mode="json")
+                            if evidence_context is not None
+                            else None
+                        ),
                         "upstream_handoffs": upstream_handoffs,
                         "revision_feedback": revision_feedback,
                         "previous_handoff": (
@@ -1353,6 +1458,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 raw_handoff,
                 assignment.role,
                 {item.role for item in plan.assignments},
+                evidence_context=evidence_context,
             )
             return seal_handoff(
                 plan,
@@ -1362,6 +1468,7 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 revision_round=revision_round,
                 upstream_handoffs=upstream_handoff_models,
                 contract=contract,
+                evidence_context=evidence_context,
             )
 
         for wave_number, wave in enumerate(execution_waves, start=1):
@@ -1491,6 +1598,20 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                             "structured": handoff.structured,
                             "decision_count": len(handoff.decisions),
                             "evidence_count": len(handoff.evidence),
+                            "grounded_evidence_count": sum(
+                                bool(item.criterion_ids and item.source_refs)
+                                for item in handoff.evidence
+                            ),
+                            "criterion_reference_count": len({
+                                criterion_id
+                                for item in handoff.evidence
+                                for criterion_id in item.criterion_ids
+                            }),
+                            "source_reference_count": len({
+                                source_ref
+                                for item in handoff.evidence
+                                for source_ref in item.source_refs
+                            }),
                             "risk_count": len(handoff.risks),
                             "open_question_count": len(handoff.open_questions),
                             "next_action_count": len(handoff.next_actions),
@@ -1654,10 +1775,26 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
         begin_node(db, workflow, "quality_gate", expected_lease_token)
         plan = MultiAgentExecutionPlan.model_validate(state["execution_plan"])
         handoffs = [AgentHandoff.model_validate(item) for item in state.get("specialist_handoffs", [])]
+        handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
+        evidence_contexts = {}
+        for wave in build_execution_waves(plan):
+            for assignment in wave:
+                context = handoff_evidence_context(
+                    state,
+                    assignment,
+                    {
+                        role: handoffs_by_role[role]
+                        for role in assignment.depends_on
+                        if role in handoffs_by_role
+                    },
+                )
+                if context is not None:
+                    evidence_contexts[assignment.role] = context
         deterministic = evaluate_handoffs(
             plan,
             handoffs,
             plan_version=max(1, int(state.get("plan_version", 0))),
+            evidence_contexts=evidence_contexts,
         )
         reviewer_specs = (
             (AgentRole.test_engineer, "质量、安全、边界场景与可复现验收证据"),
@@ -1745,6 +1882,22 @@ def build_workspace_graph(db: Session, workflow: WorkflowRun):
                 "next_node": next_node,
                 "decision_count": len(decision.decisions),
                 "conflict_count": len(decision.conflicts),
+                "grounded_handoff_count": sum(
+                    handoff.contract_version >= 3 and handoff.structured
+                    for handoff in handoffs
+                ),
+                "criterion_reference_count": len({
+                    criterion_id
+                    for handoff in handoffs
+                    for item in handoff.evidence
+                    for criterion_id in item.criterion_ids
+                }),
+                "source_reference_count": len({
+                    source_ref
+                    for handoff in handoffs
+                    for item in handoff.evidence
+                    for source_ref in item.source_refs
+                }),
                 "reviewer_count": len(decision.reviewers),
                 "reviewer_valid_count": decision.reviewer_valid_count,
                 "reviewer_quorum": decision.reviewer_quorum,

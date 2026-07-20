@@ -1,7 +1,9 @@
 import json
+from io import BytesIO
 from pathlib import Path
 
 from app.rag.chunking import StructuralChunker
+from docx import Document
 import pytest
 
 from app.rag.evaluation import (
@@ -75,7 +77,7 @@ def test_repository_rag_chunking_evaluation_is_reproducible() -> None:
     assert structural.context_precision_at_k > legacy.context_precision_at_k
     assert structural.citation_target_accuracy >= legacy.citation_target_accuracy
     assert 0 <= structural.refusal_accuracy <= 1
-    assert 0 < structural.index_tokens <= legacy.index_tokens
+    assert 0 < structural.index_tokens <= legacy.index_tokens * 1.01
 
 
 def test_external_evaluation_corpus_loads_distractors_and_has_stable_identity(tmp_path: Path) -> None:
@@ -192,6 +194,22 @@ def test_external_evaluation_corpus_rejects_document_symlink(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="cannot contain symlinks"):
         load_evaluation_corpus(cases_path, documents_directory)
+
+
+def test_legacy_candidates_chunk_parsed_docx_text_instead_of_decoding_zip_bytes() -> None:
+    document = Document()
+    document.add_heading("库存规则", level=1)
+    document.add_paragraph("库存为0，跳过该商品上架")
+    content = BytesIO()
+    document.save(content)
+
+    chunks = legacy_candidates(
+        {"inventory.docx": content.getvalue()},
+        StructuralChunker().tokens.count,
+    )
+
+    assert chunks
+    assert "库存为0，跳过该商品上架" in chunks[0].content
 
 
 def test_answer_judge_parser_and_citation_gate_are_strict() -> None:

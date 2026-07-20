@@ -6,6 +6,9 @@ from pydantic import ValidationError
 from app.agent.orchestration import (
     AgentHandoff,
     ExecutionPlanCandidate,
+    HandoffEvidenceContext,
+    HandoffEvidenceCriterion,
+    HandoffEvidenceSource,
     MultiAgentExecutionPlan,
     ReviewerPanelQuorumError,
     SpecialistTeamUnavailableError,
@@ -26,6 +29,7 @@ from app.agent.orchestration import (
     parse_specialist_plan_commitment,
     seal_handoff,
     validate_execution_plan_capabilities,
+    validate_execution_plan_criteria,
 )
 from app.agent.team_performance import RolePerformanceEvidence, TeamPerformanceProfile
 
@@ -97,6 +101,72 @@ def test_execution_plan_parser_accepts_valid_json_and_falls_back_safely() -> Non
         "operations_analyst",
     ]
     assert [item.role for item in fallback.assignments][:2] == ["test_engineer", "operations_analyst"]
+
+
+def test_execution_plan_requires_explicit_acceptance_criterion_ownership() -> None:
+    plan_data = {
+        "objective": "交付每项验收标准都有明确责任分支的会员平台",
+        "rationale": "测试负责行为验收，运营负责发布恢复证据。",
+        "assignments": [
+            {
+                "role": "test_engineer",
+                "objective": "验证核心用户路径与边界状态",
+                "deliverable": "核心路径验收记录",
+                "criterion_ids": ["AC-01"],
+            },
+            {
+                "role": "operations_analyst",
+                "objective": "验证灰度发布与故障恢复",
+                "deliverable": "发布恢复演练记录",
+                "criterion_ids": ["AC-02"],
+            },
+        ],
+        "success_criteria": ["AC-01 具有可复现证据", "AC-02 具有回滚演练记录"],
+    }
+    expected_ids = {"AC-01", "AC-02"}
+
+    parsed = parse_execution_plan_candidate(
+        json.dumps(plan_data, ensure_ascii=False),
+        "交付可验收且可回滚的会员平台",
+        criterion_ids=expected_ids,
+    )
+    missing = parse_execution_plan_candidate(
+        json.dumps(
+            {
+                **plan_data,
+                "assignments": [
+                    plan_data["assignments"][0],
+                    {**plan_data["assignments"][1], "criterion_ids": ["AC-01"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        "交付可验收且可回滚的会员平台",
+        criterion_ids=expected_ids,
+    )
+    unknown = MultiAgentExecutionPlan.model_validate(
+        {
+            **plan_data,
+            "assignments": [
+                plan_data["assignments"][0],
+                {**plan_data["assignments"][1], "criterion_ids": ["AC-99"]},
+            ],
+        }
+    )
+    fallback = build_fallback_plan(
+        "交付可验收且可回滚的会员平台",
+        criterion_ids=["AC-01", "AC-02", "AC-03"],
+    )
+
+    assert parsed is not None
+    assert {item for assignment in parsed.assignments for item in assignment.criterion_ids} == expected_ids
+    assert missing is None
+    with pytest.raises(ValueError, match="unknown acceptance criteria"):
+        validate_execution_plan_criteria(unknown, expected_ids)
+    assert all(assignment.criterion_ids for assignment in fallback.assignments)
+    assert {
+        item for assignment in fallback.assignments for item in assignment.criterion_ids
+    } == {"AC-01", "AC-02", "AC-03"}
 
 
 def test_execution_plan_candidates_are_strictly_parsed_scored_and_fingerprinted() -> None:
@@ -932,6 +1002,17 @@ def specialist_handoff_response(role: str) -> str:
     )
 
 
+def grounded_handoff_response(
+    role: str,
+    criterion_ids: list[str],
+    source_refs: list[str],
+) -> str:
+    payload = json.loads(specialist_handoff_response(role))
+    payload["evidence"][0]["criterion_ids"] = criterion_ids
+    payload["evidence"][0]["source_refs"] = source_refs
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def test_specialist_handoff_parser_builds_a_bounded_v2_contract() -> None:
     payload = parse_specialist_handoff(
         specialist_handoff_response("test_engineer"),
@@ -959,6 +1040,170 @@ def test_specialist_handoff_parser_builds_a_bounded_v2_contract() -> None:
     assert invalid.decisions == []
     assert invalid.content.startswith("这是一段很长")
     assert invalid.model_dump()["content"].startswith("这是一段很长")
+
+
+def test_handoff_v3_grounds_evidence_in_owned_criteria_and_current_sources() -> None:
+    plan = MultiAgentExecutionPlan.model_validate(
+        {
+            "objective": "形成验收标准与真实来源双向可追溯的发布方案",
+            "rationale": "运营先定义恢复控制，测试再引用上游结果完成核心验收。",
+            "assignments": [
+                {
+                    "role": "operations_analyst",
+                    "objective": "验证灰度发布、监控和回滚标准",
+                    "deliverable": "发布恢复证据",
+                    "criterion_ids": ["AC-02"],
+                },
+                {
+                    "role": "test_engineer",
+                    "objective": "基于发布控制验证核心用户路径",
+                    "deliverable": "核心路径验收证据",
+                    "depends_on": ["operations_analyst"],
+                    "criterion_ids": ["AC-01"],
+                },
+            ],
+            "success_criteria": ["AC-01 可复现", "AC-02 可回滚"],
+        }
+    )
+    operations_assignment, test_assignment = plan.assignments
+    operations_context = HandoffEvidenceContext(
+        criteria=[
+            HandoffEvidenceCriterion(
+                criterion_id="AC-02",
+                description="发布失败后在十分钟内完成回滚",
+                evidence="灰度演练时间线与恢复指标",
+                priority="MUST",
+            )
+        ],
+        sources=[
+            HandoffEvidenceSource(
+                ref="artifact:SYSTEM_DESIGN",
+                source_type="artifact",
+                label="系统设计",
+                fingerprint="a" * 64,
+            )
+        ],
+    )
+    operations_payload = parse_specialist_handoff(
+        grounded_handoff_response(
+            "operations_analyst",
+            ["AC-02"],
+            ["artifact:SYSTEM_DESIGN"],
+        ),
+        "operations_analyst",
+        {"operations_analyst", "test_engineer"},
+        evidence_context=operations_context,
+    )
+    operations = seal_handoff(
+        plan,
+        operations_assignment,
+        operations_payload.content,
+        plan_version=4,
+        revision_round=0,
+        upstream_handoffs={},
+        contract=operations_payload,
+        evidence_context=operations_context,
+    )
+    testing_context = HandoffEvidenceContext(
+        criteria=[
+            HandoffEvidenceCriterion(
+                criterion_id="AC-01",
+                description="用户可以完成核心路径并恢复会话",
+                evidence="端到端自动化运行记录",
+                priority="MUST",
+            )
+        ],
+        sources=[
+            HandoffEvidenceSource(
+                ref="artifact:PRD",
+                source_type="artifact",
+                label="产品需求文档",
+                fingerprint="b" * 64,
+            ),
+            HandoffEvidenceSource(
+                ref="handoff:operations_analyst",
+                source_type="upstream_handoff",
+                label="发布恢复证据",
+                fingerprint=operations.output_fingerprint,
+            ),
+        ],
+    )
+    testing_payload = parse_specialist_handoff(
+        grounded_handoff_response(
+            "test_engineer",
+            ["AC-01"],
+            ["artifact:PRD", "handoff:operations_analyst"],
+        ),
+        "test_engineer",
+        {"operations_analyst", "test_engineer"},
+        evidence_context=testing_context,
+    )
+    testing = seal_handoff(
+        plan,
+        test_assignment,
+        testing_payload.content,
+        plan_version=4,
+        revision_round=0,
+        upstream_handoffs={"operations_analyst": operations},
+        contract=testing_payload,
+        evidence_context=testing_context,
+    )
+    contexts = {
+        "operations_analyst": operations_context,
+        "test_engineer": testing_context,
+    }
+
+    valid = evaluate_handoffs(
+        plan,
+        [operations, testing],
+        plan_version=4,
+        evidence_contexts=contexts,
+    )
+    grounding_check = next(
+        check for check in valid.checks if check["name"] == "evidence_grounding"
+    )
+    changed_operations_context = operations_context.model_copy(
+        update={
+            "sources": [
+                operations_context.sources[0].model_copy(
+                    update={"fingerprint": "c" * 64}
+                )
+            ]
+        }
+    )
+    stale = evaluate_handoffs(
+        plan,
+        [operations, testing],
+        plan_version=4,
+        evidence_contexts={
+            **contexts,
+            "operations_analyst": changed_operations_context,
+        },
+    )
+    invalid_reference = parse_specialist_handoff(
+        grounded_handoff_response(
+            "test_engineer",
+            ["AC-01"],
+            ["handoff:knowledge_admin"],
+        ),
+        "test_engineer",
+        {"operations_analyst", "test_engineer"},
+        evidence_context=testing_context,
+    )
+
+    assert operations_payload.contract_version == 3
+    assert testing_payload.contract_version == 3
+    assert testing.evidence[0].criterion_ids == ["AC-01"]
+    assert testing.evidence[0].source_refs == [
+        "artifact:PRD",
+        "handoff:operations_analyst",
+    ]
+    assert valid.passed is True
+    assert grounding_check["passed"] is True
+    assert stale.passed is False
+    assert set(stale.revision_roles) == {"operations_analyst", "test_engineer"}
+    assert invalid_reference.contract_version == 3
+    assert invalid_reference.structured is False
 
 
 def test_handoff_v2_quality_gate_rejects_unstructured_or_tampered_contracts() -> None:

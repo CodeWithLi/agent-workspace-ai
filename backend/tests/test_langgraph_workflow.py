@@ -24,9 +24,11 @@ from app.models import Agent, AgentRole, AgentTool, Project, Report, Task, User,
 from app.services.workflows import process_workflow
 
 
-def structured_handoff_response(role: str) -> str:
-    return json.dumps(
-        {
+def structured_handoff_response(
+    role: str,
+    evidence_context: dict | None = None,
+) -> str:
+    payload = {
             "summary": (
                 "The specialist completed a verifiable handoff with explicit scope, "
                 "ownership, evidence, risk controls, and recovery criteria."
@@ -66,9 +68,15 @@ def structured_handoff_response(role: str) -> str:
                     "acceptance_criteria": "All core cases pass and the evidence is independently reviewable.",
                 }
             ],
-        },
-        ensure_ascii=False,
-    )
+        }
+    if evidence_context:
+        payload["evidence"][0]["criterion_ids"] = [
+            item["criterion_id"] for item in evidence_context["criteria"]
+        ]
+        payload["evidence"][0]["source_refs"] = [
+            item["ref"] for item in evidence_context["sources"]
+        ]
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def test_node_completion_persists_checkpoint_before_operator_pause(db: Session) -> None:
@@ -190,8 +198,9 @@ async def test_state_graph_pauses_resumes_and_keeps_tasks_idempotent(
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
-            return structured_handoff_response(role)
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             if json.loads(user_prompt)["reviewer_role"] == "architect":
                 raise TimeoutError("architect reviewer unavailable")
@@ -282,11 +291,13 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                             "role": "test_engineer",
                             "objective": "验证核心路径、安全边界和验收证据",
                             "deliverable": "可复现验收清单",
+                            "criterion_ids": ["AC-01"],
                         },
                         {
                             "role": "operations_analyst",
                             "objective": "验证灰度、监控和故障回滚",
                             "deliverable": "发布与回滚手册",
+                            "criterion_ids": ["AC-02"],
                         },
                     ],
                     "success_criteria": [
@@ -324,8 +335,9 @@ async def test_execution_plan_requires_approval_and_supports_replanning(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
-            return structured_handoff_response(role)
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -517,11 +529,13 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
                             "role": "test_engineer",
                             "objective": "验证核心路径、边界状态和验收证据",
                             "deliverable": "可复现验收清单",
+                            "criterion_ids": ["AC-01"],
                         },
                         {
                             "role": "operations_analyst",
                             "objective": "验证监控、灰度发布和故障恢复",
                             "deliverable": "发布与回滚运行手册",
+                            "criterion_ids": ["AC-02"],
                         },
                     ],
                     "success_criteria": [
@@ -560,8 +574,9 @@ async def test_specialist_plan_challenge_forces_human_approval_before_dispatch(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
-            return structured_handoff_response(role)
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -675,11 +690,13 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
                     "role": "test_engineer",
                     "objective": "验证核心路径、边界状态和验收证据",
                     "deliverable": "可复现测试与验收清单",
+                    "criterion_ids": ["AC-01"],
                 },
                 {
                     "role": "operations_analyst",
                     "objective": "验证监控、灰度发布和故障恢复边界",
                     "deliverable": "发布与回滚运行手册",
+                    "criterion_ids": ["AC-02"],
                 },
             ],
             "success_criteria": [
@@ -701,12 +718,14 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
                             "role": "test_engineer",
                             "objective": "验证核心路径、错误预算边界和验收证据",
                             "deliverable": "含错误预算基线的可复现验收清单",
+                            "criterion_ids": ["AC-01"],
                         },
                         {
                             "role": "operations_analyst",
                             "objective": "基于测试证据验证发布窗口、监控和故障恢复",
                             "deliverable": "含发布窗口和回滚阈值的运行手册",
                             "depends_on": ["test_engineer"],
+                            "criterion_ids": ["AC-02"],
                         },
                     ],
                     "success_criteria": [
@@ -751,8 +770,9 @@ async def test_challenged_candidates_are_repaired_recommitted_and_selected_once(
                 ensure_ascii=False,
             )
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
-            return structured_handoff_response(role)
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -853,22 +873,26 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
                             "objective": "基于知识证据验证核心路径和边界场景",
                             "deliverable": "测试与验收清单",
                             "depends_on": ["knowledge_admin"],
+                            "criterion_ids": ["AC-01"],
                         },
                         {
                             "role": "operations_analyst",
                             "objective": "独立验证灰度、监控和故障恢复",
                             "deliverable": "发布运行手册",
+                            "criterion_ids": ["AC-02"],
                         },
                         {
                             "role": "knowledge_admin",
                             "objective": "整理知识来源、证据和权限边界",
                             "deliverable": "知识证据清单",
+                            "criterion_ids": ["AC-01"],
                         },
                         {
                             "role": "notification_secretary",
                             "objective": "依据验收和运营结论设计可靠触达",
                             "deliverable": "通知触达方案",
                             "depends_on": ["test_engineer", "operations_analyst"],
+                            "criterion_ids": ["AC-02"],
                         },
                     ],
                     "success_criteria": ["所有依赖均可追溯", "所有交付均有可复现证据"],
@@ -883,7 +907,7 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
             max_parallel = max(max_parallel, len(active_roles))
             await asyncio.sleep(0.01)
             active_roles.remove(role)
-            return structured_handoff_response(role)
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -925,12 +949,37 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         handoff["role"]: handoff for handoff in state["specialist_handoffs"]
     }
     assert all(handoff["plan_version"] == 1 for handoff in handoffs_by_role.values())
-    assert all(handoff["contract_version"] == 2 for handoff in handoffs_by_role.values())
+    assert all(handoff["contract_version"] == 3 for handoff in handoffs_by_role.values())
     assert all(handoff["structured"] is True for handoff in handoffs_by_role.values())
+    assert all(
+        len(handoff["evidence_context_fingerprint"]) == 64
+        for handoff in handoffs_by_role.values()
+    )
     assert all(len(handoff["input_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
     assert all(len(handoff["output_fingerprint"]) == 64 for handoff in handoffs_by_role.values())
+    expected_criteria = {
+        assignment["role"]: assignment["criterion_ids"]
+        for assignment in state["execution_plan"]["assignments"]
+    }
+    expected_upstream_refs = {
+        "knowledge_admin": set(),
+        "operations_analyst": set(),
+        "test_engineer": {"handoff:knowledge_admin"},
+        "notification_secretary": {
+            "handoff:test_engineer",
+            "handoff:operations_analyst",
+        },
+    }
+    for role, handoff in handoffs_by_role.items():
+        evidence = handoff["evidence"][0]
+        assert evidence["criterion_ids"] == expected_criteria[role]
+        assert set(evidence["source_refs"]) >= {
+            "artifact:PRD",
+            "artifact:SYSTEM_DESIGN",
+            *expected_upstream_refs[role],
+        }
     test_upstream = specialist_contexts["test_engineer"]["upstream_handoffs"][0]
-    assert test_upstream["contract_version"] == 2
+    assert test_upstream["contract_version"] == 3
     assert test_upstream["summary"] == handoffs_by_role["knowledge_admin"]["summary"]
     assert test_upstream["evidence"] == handoffs_by_role["knowledge_admin"]["evidence"]
     assert "content" not in test_upstream
@@ -972,10 +1021,13 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         for event in branch_completed_events
     )
     branch_payloads = [json.loads(event.payload_json) for event in branch_completed_events]
-    assert all(payload["contract_version"] == 2 for payload in branch_payloads)
+    assert all(payload["contract_version"] == 3 for payload in branch_payloads)
     assert all(payload["structured"] is True for payload in branch_payloads)
     assert all(payload["decision_count"] == 1 for payload in branch_payloads)
     assert all(payload["evidence_count"] == 1 for payload in branch_payloads)
+    assert all(payload["grounded_evidence_count"] == 1 for payload in branch_payloads)
+    assert all(payload["criterion_reference_count"] == 1 for payload in branch_payloads)
+    assert sorted(payload["source_reference_count"] for payload in branch_payloads) == [2, 2, 3, 4]
     assert all(payload["risk_count"] == 1 for payload in branch_payloads)
     assert all(payload["open_question_count"] == 1 for payload in branch_payloads)
     assert all(payload["next_action_count"] == 1 for payload in branch_payloads)
@@ -983,6 +1035,17 @@ async def test_specialists_execute_dependency_waves_and_forward_upstream_handoff
         json.loads(event.payload_json)["upstream_count"]
         for event in branch_completed_events
     ) == [0, 0, 1, 2]
+    quality_event = db.scalar(
+        select(WorkflowEvent).where(
+            WorkflowEvent.workflow_id == workflow.id,
+            WorkflowEvent.event_type == "QUALITY_GATE_PASSED",
+        )
+    )
+    assert quality_event is not None
+    quality_payload = json.loads(quality_event.payload_json)
+    assert quality_payload["grounded_handoff_count"] == 4
+    assert quality_payload["criterion_reference_count"] == 2
+    assert quality_payload["source_reference_count"] == 5
 
 
 @pytest.mark.asyncio
@@ -1057,7 +1120,7 @@ async def test_specialist_wave_checkpoint_survives_operator_recovery_without_rep
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise RuntimeError("transient test specialist failure")
-            return structured_handoff_response(role)
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1191,11 +1254,12 @@ async def test_specialist_retries_only_transient_failed_branch_inside_same_workf
 
     async def fake_chat(system_prompt: str, user_prompt: str, *_args) -> str:
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "knowledge_admin" and specialist_calls[role] == 1:
                 raise LLMRetryableError("transient provider failure")
-            return structured_handoff_response(role)
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1261,11 +1325,12 @@ async def test_deterministic_branch_failure_pauses_for_targeted_operator_recover
         if "动态编排器" in system_prompt:
             return "invalid JSON uses the validated fallback plan"
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(user_prompt)["assignment"]["role"]
+            context = json.loads(user_prompt)
+            role = context["assignment"]["role"]
             specialist_calls[role] = specialist_calls.get(role, 0) + 1
             if role == "test_engineer" and specialist_calls[role] == 1:
                 raise ValueError("测试环境配置缺少验收凭据")
-            return structured_handoff_response(role)
+            return structured_handoff_response(role, context.get("evidence_context"))
         if "交接质量评审 Agent" in system_prompt:
             return json.dumps(
                 {
@@ -1402,8 +1467,9 @@ async def test_quality_gate_bounds_automatic_revision_then_accepts_human_directi
             max_parallel_branches = max(max_parallel_branches, active_branches)
             try:
                 await asyncio.sleep(0.01)
-                role = json.loads(_user_prompt)["assignment"]["role"]
-                return structured_handoff_response(role)
+                context = json.loads(_user_prompt)
+                role = context["assignment"]["role"]
+                return structured_handoff_response(role, context.get("evidence_context"))
             finally:
                 active_branches -= 1
         if "报告生成器" in system_prompt:

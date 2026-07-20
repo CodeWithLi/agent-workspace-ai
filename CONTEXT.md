@@ -33,8 +33,12 @@ An independently executable assignment in an Execution Plan whose result can be 
 _Avoid_: Agent, workflow node
 
 **Handoff**:
-A versioned Specialist Branch contract that identifies its owner, objective, promised deliverable and revision round. Handoff v2 separates summary, decisions, evidence, risks, open questions and next actions into bounded fields; legacy v1 retains substantive free-form output for compatibility.
+A versioned Specialist Branch contract that identifies its owner, objective, promised deliverable and revision round. Handoff v3 grounds each evidence item in the branch's Acceptance Criteria and an allowlisted artifact or direct-upstream source; v2 retains bounded structured fields and legacy v1 retains substantive free-form output for compatibility.
 _Avoid_: Message, response
+
+**Grounded Evidence Reference**:
+A Handoff v3 reference to an owned `AC-xx` and an authoritative `artifact:PRD`, `artifact:SYSTEM_DESIGN` or direct `handoff:<role>` source whose fingerprint is sealed into the branch lineage.
+_Avoid_: Citation text, URL, unverified source
 
 **Quality Gate**:
 A recorded decision that evaluates Handoffs against deterministic checks and specialist review before delivery may proceed.

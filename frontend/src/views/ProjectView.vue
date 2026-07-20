@@ -439,6 +439,12 @@
                 <div class="orchestration-branch-copy">
                   <strong>{{ assignment.deliverable }}</strong>
                   <small class="branch-objective">{{ assignment.objective }}</small>
+                  <dl v-if="assignment.criterion_ids?.length" class="branch-capability-summary branch-criterion-summary">
+                    <div>
+                      <dt>验收责任</dt>
+                      <dd>{{ assignment.criterion_ids.join(' · ') }}</dd>
+                    </div>
+                  </dl>
                   <small v-if="assignment.depends_on?.length" class="branch-dependencies">
                     <span class="branch-dependency-label">依赖</span>
                     <span class="branch-dependency-roles">{{ assignment.depends_on.map(specialistRoleLabel).join('、') }}</span>
@@ -508,6 +514,7 @@
               </div>
               <div class="handoff-lineage-route">
                 <span>{{ handoffUpstreamLabel(handoff) }}</span>
+                <code v-if="handoff.evidence_context_fingerprint">证据 {{ shortFingerprint(handoff.evidence_context_fingerprint) }}</code>
                 <code>{{ shortFingerprint(handoff.input_fingerprint) }} → {{ shortFingerprint(handoff.output_fingerprint) }}</code>
               </div>
             </section>
@@ -555,6 +562,18 @@
                       <dl>
                         <div><dt>来源</dt><dd>{{ evidence.source }}</dd></div>
                         <div><dt>验证</dt><dd>{{ evidence.verification }}</dd></div>
+                        <div v-if="evidence.criterion_ids?.length">
+                          <dt>验收标准</dt>
+                          <dd class="handoff-reference-list">
+                            <code v-for="criterionId in evidence.criterion_ids" :key="criterionId">{{ criterionId }}</code>
+                          </dd>
+                        </div>
+                        <div v-if="evidence.source_refs?.length">
+                          <dt>受控引用</dt>
+                          <dd class="handoff-reference-list">
+                            <code v-for="sourceRef in evidence.source_refs" :key="sourceRef">{{ handoffSourceRefLabel(sourceRef) }}</code>
+                          </dd>
+                        </div>
                       </dl>
                     </li>
                   </ol>
@@ -951,6 +970,7 @@ interface WorkflowAssignment {
   depends_on?: string[]
   required_capabilities?: string[]
   selection_reason?: string
+  criterion_ids?: string[]
 }
 
 interface WorkflowCapabilityProfile {
@@ -1041,6 +1061,7 @@ interface WorkflowHandoff extends WorkflowAssignment {
   next_actions?: WorkflowHandoffAction[]
   plan_version?: number
   upstream_fingerprints?: Record<string, string>
+  evidence_context_fingerprint?: string
   input_fingerprint?: string
   output_fingerprint?: string
 }
@@ -1055,6 +1076,8 @@ interface WorkflowHandoffEvidence {
   claim: string
   source: string
   verification: string
+  criterion_ids?: string[]
+  source_refs?: string[]
 }
 
 interface WorkflowHandoffRisk {
@@ -1899,7 +1922,7 @@ function handoffFor(role: string) {
 }
 
 function isStructuredHandoff(handoff: WorkflowHandoff) {
-  return handoff.contract_version === 2 && handoff.structured === true
+  return Boolean(handoff.contract_version && handoff.contract_version >= 2 && handoff.structured)
 }
 
 function shortFingerprint(fingerprint?: string) {
@@ -1911,6 +1934,15 @@ function handoffUpstreamLabel(handoff: WorkflowHandoff) {
   return roles.length
     ? `来源 ${roles.map(specialistRoleLabel).join('、')}`
     : '独立根分支'
+}
+
+function handoffSourceRefLabel(sourceRef: string) {
+  if (sourceRef === 'artifact:PRD') return '产品需求文档（PRD）'
+  if (sourceRef === 'artifact:SYSTEM_DESIGN') return '系统设计'
+  if (sourceRef.startsWith('handoff:')) {
+    return `${specialistRoleLabel(sourceRef.slice('handoff:'.length))}上游交接`
+  }
+  return sourceRef
 }
 
 function branchRuntimeState(role: string): BranchRuntimeState {
@@ -3586,6 +3618,24 @@ onBeforeUnmount(disposeWorkflowEventStream)
   min-width: 0;
   margin: 0;
   color: var(--color-secondary-text);
+}
+
+.handoff-reference-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+
+.handoff-reference-list code {
+  max-width: 100%;
+  padding: 1px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: #f6f8fa;
+  color: var(--color-foreground);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .handoff-contract-list .handoff-blocking {

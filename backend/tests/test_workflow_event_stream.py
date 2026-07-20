@@ -150,6 +150,27 @@ def test_requirement_consensus_event_exposes_counts_without_review_content() -> 
     }
 
 
+def test_grounded_handoff_event_exposes_only_safe_reference_counts() -> None:
+    payload = public_workflow_event_payload(
+        {
+            "grounded_evidence_count": 2,
+            "grounded_handoff_count": 4,
+            "criterion_reference_count": 2,
+            "source_reference_count": 5,
+            "criterion_ids": ["AC-01", "AC-02"],
+            "source_refs": ["artifact:PRD"],
+            "evidence_context_fingerprint": "a" * 64,
+        }
+    )
+
+    assert payload == {
+        "grounded_evidence_count": 2,
+        "grounded_handoff_count": 4,
+        "criterion_reference_count": 2,
+        "source_reference_count": 5,
+    }
+
+
 def test_event_history_returns_latest_window_in_chronological_order_and_is_tenant_scoped(
     db: Session,
 ) -> None:

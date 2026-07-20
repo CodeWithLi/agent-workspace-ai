@@ -289,6 +289,9 @@ def ensure_specialist_capabilities_available(
         )
 
 
+AcceptanceCriterionId = Annotated[str, Field(pattern=r"^AC-[0-9]{2}$")]
+
+
 class SpecialistAssignment(BaseModel):
     role: SpecialistRole
     objective: str = Field(min_length=4, max_length=500)
@@ -296,6 +299,13 @@ class SpecialistAssignment(BaseModel):
     depends_on: list[SpecialistRole] = Field(default_factory=list, max_length=3)
     required_capabilities: list[SpecialistCapability] = Field(default_factory=list, max_length=8)
     selection_reason: str = Field(default="", max_length=500)
+    criterion_ids: list[AcceptanceCriterionId] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_assignment_contract(self) -> "SpecialistAssignment":
+        if len(self.criterion_ids) != len(set(self.criterion_ids)):
+            raise ValueError("specialist acceptance criterion ids must be unique")
+        return self
 
 
 class MultiAgentExecutionPlan(BaseModel):
@@ -618,6 +628,37 @@ def validate_execution_plan_capabilities(
     return bound
 
 
+def validate_execution_plan_criteria(
+    plan: MultiAgentExecutionPlan,
+    criterion_ids: set[str],
+) -> MultiAgentExecutionPlan:
+    if not criterion_ids:
+        return plan
+    for assignment in plan.assignments:
+        if not assignment.criterion_ids:
+            raise ValueError(
+                f"specialist assignment {assignment.role} must own acceptance criteria"
+            )
+        unknown = set(assignment.criterion_ids) - criterion_ids
+        if unknown:
+            raise ValueError(
+                f"specialist assignment {assignment.role} references unknown acceptance criteria: "
+                f"{', '.join(sorted(unknown))}"
+            )
+    covered = {
+        criterion_id
+        for assignment in plan.assignments
+        for criterion_id in assignment.criterion_ids
+    }
+    missing = criterion_ids - covered
+    if missing:
+        raise ValueError(
+            "execution plan does not assign acceptance criteria: "
+            f"{', '.join(sorted(missing))}"
+        )
+    return plan
+
+
 def build_execution_waves(plan: MultiAgentExecutionPlan) -> list[list[SpecialistAssignment]]:
     remaining = list(plan.assignments)
     resolved: set[SpecialistRole] = set()
@@ -845,6 +886,65 @@ def expand_revision_roles(
 
 
 HANDOFF_CONTRACT_JSON_LIMIT = 16000
+EvidenceSourceRef = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^(?:artifact:(?:PRD|SYSTEM_DESIGN)|handoff:(?:test_engineer|"
+            r"operations_analyst|knowledge_admin|notification_secretary))$"
+        )
+    ),
+]
+
+
+class HandoffEvidenceCriterion(BaseModel):
+    criterion_id: AcceptanceCriterionId
+    description: str = Field(min_length=4, max_length=500)
+    evidence: str = Field(min_length=4, max_length=500)
+    priority: Literal["MUST", "SHOULD", "COULD"]
+
+
+class HandoffEvidenceSource(BaseModel):
+    ref: EvidenceSourceRef
+    source_type: Literal["artifact", "upstream_handoff"]
+    label: str = Field(min_length=2, max_length=200)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_source_type(self) -> "HandoffEvidenceSource":
+        expected_type = (
+            "artifact" if self.ref.startswith("artifact:") else "upstream_handoff"
+        )
+        if self.source_type != expected_type:
+            raise ValueError("handoff evidence source type does not match its reference")
+        return self
+
+
+class HandoffEvidenceContext(BaseModel):
+    criteria: list[HandoffEvidenceCriterion] = Field(min_length=1, max_length=10)
+    sources: list[HandoffEvidenceSource] = Field(min_length=1, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_context(self) -> "HandoffEvidenceContext":
+        criterion_ids = [item.criterion_id for item in self.criteria]
+        source_refs = [item.ref for item in self.sources]
+        if len(criterion_ids) != len(set(criterion_ids)):
+            raise ValueError("handoff evidence criteria must be unique")
+        if len(source_refs) != len(set(source_refs)):
+            raise ValueError("handoff evidence sources must be unique")
+        return self
+
+    @property
+    def criterion_ids(self) -> set[str]:
+        return {item.criterion_id for item in self.criteria}
+
+    @property
+    def source_refs(self) -> set[str]:
+        return {item.ref for item in self.sources}
+
+    @property
+    def fingerprint(self) -> str:
+        return _stable_fingerprint(self.model_dump(mode="json"))
 
 
 class HandoffDecision(BaseModel):
@@ -857,6 +957,16 @@ class HandoffEvidence(BaseModel):
     claim: str = Field(min_length=4, max_length=2000)
     source: str = Field(min_length=2, max_length=1000)
     verification: str = Field(min_length=4, max_length=2000)
+    criterion_ids: list[AcceptanceCriterionId] = Field(default_factory=list, max_length=10)
+    source_refs: list[EvidenceSourceRef] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_grounding_references(self) -> "HandoffEvidence":
+        if len(self.criterion_ids) != len(set(self.criterion_ids)):
+            raise ValueError("handoff evidence criterion ids must be unique")
+        if len(self.source_refs) != len(set(self.source_refs)):
+            raise ValueError("handoff evidence source references must be unique")
+        return self
 
 
 class HandoffRisk(BaseModel):
@@ -878,7 +988,7 @@ class HandoffAction(BaseModel):
 
 
 class SpecialistHandoffPayload(BaseModel):
-    contract_version: Literal[2] = 2
+    contract_version: Literal[2, 3] = 2
     structured: bool
     content: str = Field(min_length=1, max_length=24000)
     summary: str = Field(default="", max_length=2000)
@@ -911,6 +1021,17 @@ class SpecialistHandoffPayload(BaseModel):
             self.summary.strip() or any(contract_lists)
         ):
             raise ValueError("unstructured handoffs cannot contain trusted contract fields")
+        grounded_evidence = any(
+            item.criterion_ids or item.source_refs for item in self.evidence
+        )
+        if self.contract_version < 3 and grounded_evidence:
+            raise ValueError("v2 handoffs cannot contain v3 evidence references")
+        if self.contract_version >= 3 and self.structured and any(
+            not item.criterion_ids or not item.source_refs for item in self.evidence
+        ):
+            raise ValueError(
+                "v3 handoffs require criterion and source references for every evidence item"
+            )
         if self.structured and len(
             json.dumps(self.contract_data(), ensure_ascii=False)
         ) > HANDOFF_CONTRACT_JSON_LIMIT:
@@ -927,7 +1048,7 @@ class AgentHandoff(BaseModel):
     deliverable: str = Field(min_length=2, max_length=200)
     content: str = Field(min_length=1, max_length=24000)
     revision_round: int = Field(default=0, ge=0, le=20)
-    contract_version: int = Field(default=1, ge=1, le=2)
+    contract_version: int = Field(default=1, ge=1, le=3)
     structured: bool = False
     summary: str = Field(default="", max_length=2000)
     decisions: list[HandoffDecision] = Field(default_factory=list, max_length=8)
@@ -937,6 +1058,7 @@ class AgentHandoff(BaseModel):
     next_actions: list[HandoffAction] = Field(default_factory=list, max_length=8)
     plan_version: int = Field(default=0, ge=0)
     upstream_fingerprints: dict[SpecialistRole, str] = Field(default_factory=dict)
+    evidence_context_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
     input_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
     output_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
 
@@ -976,6 +1098,17 @@ class AgentHandoff(BaseModel):
             self.summary.strip() or any(contract_lists)
         ):
             raise ValueError("unstructured handoffs cannot contain trusted contract fields")
+        grounded_evidence = any(
+            item.criterion_ids or item.source_refs for item in self.evidence
+        )
+        if self.contract_version < 3 and grounded_evidence:
+            raise ValueError("pre-v3 handoffs cannot contain grounded evidence references")
+        if self.contract_version >= 3 and self.structured and any(
+            not item.criterion_ids or not item.source_refs for item in self.evidence
+        ):
+            raise ValueError(
+                "v3 handoffs require criterion and source references for every evidence item"
+            )
         if self.structured and len(
             json.dumps(self.contract_data(), ensure_ascii=False)
         ) > HANDOFF_CONTRACT_JSON_LIMIT:
@@ -984,6 +1117,10 @@ class AgentHandoff(BaseModel):
             return self
         if self.plan_version < 1 or not self.input_fingerprint or not self.output_fingerprint:
             raise ValueError("sealed handoffs require plan version and input/output fingerprints")
+        if self.contract_version >= 3 and not self.evidence_context_fingerprint:
+            raise ValueError("sealed v3 handoffs require an evidence context fingerprint")
+        if self.contract_version < 3 and self.evidence_context_fingerprint:
+            raise ValueError("pre-v3 handoffs cannot contain an evidence context fingerprint")
         if len(self.upstream_fingerprints) > 3:
             raise ValueError("handoff lineage cannot contain more than three upstream roles")
         if self.role in self.upstream_fingerprints:
@@ -1069,15 +1206,26 @@ def _handoff_input_fingerprint(
     plan_version: int,
     revision_round: int,
     upstream_fingerprints: dict[SpecialistRole, str],
+    contract_version: int = 1,
+    evidence_context_fingerprint: str = "",
 ) -> str:
     return _stable_fingerprint(
         {
-            "contract": "agent-handoff-input-v1",
+            "contract": (
+                "agent-handoff-input-v2"
+                if contract_version >= 3
+                else "agent-handoff-input-v1"
+            ),
             "plan": plan.model_dump(mode="json"),
             "plan_version": plan_version,
             "assignment": assignment.model_dump(mode="json"),
             "revision_round": revision_round,
             "upstream_fingerprints": upstream_fingerprints,
+            **(
+                {"evidence_context_fingerprint": evidence_context_fingerprint}
+                if contract_version >= 3
+                else {}
+            ),
         }
     )
 
@@ -1095,7 +1243,9 @@ def _handoff_output_fingerprint(
     return _stable_fingerprint(
         {
             "contract": (
-                "agent-handoff-output-v2"
+                "agent-handoff-output-v3"
+                if contract_version >= 3
+                else "agent-handoff-output-v2"
                 if contract_version >= 2
                 else "agent-handoff-output-v1"
             ),
@@ -1122,6 +1272,7 @@ def seal_handoff(
     revision_round: int,
     upstream_handoffs: dict[SpecialistRole, AgentHandoff],
     contract: SpecialistHandoffPayload | None = None,
+    evidence_context: HandoffEvidenceContext | None = None,
 ) -> AgentHandoff:
     missing_roles = [
         role for role in assignment.depends_on if role not in upstream_handoffs
@@ -1138,12 +1289,20 @@ def seal_handoff(
         )
         for role in assignment.depends_on
     }
+    contract_version = contract.contract_version if contract is not None else 1
+    if contract_version >= 3 and evidence_context is None:
+        raise ValueError("v3 handoffs require the evidence context used for generation")
+    evidence_context_fingerprint = (
+        evidence_context.fingerprint if evidence_context is not None else ""
+    )
     input_fingerprint = _handoff_input_fingerprint(
         plan,
         assignment,
         plan_version=plan_version,
         revision_round=revision_round,
         upstream_fingerprints=upstream_fingerprints,
+        contract_version=contract_version,
+        evidence_context_fingerprint=evidence_context_fingerprint,
     )
     if contract is not None and contract.content != content:
         raise ValueError("handoff content must match its structured contract")
@@ -1165,6 +1324,7 @@ def seal_handoff(
         **(contract_data or {}),
         plan_version=plan_version,
         upstream_fingerprints=upstream_fingerprints,
+        evidence_context_fingerprint=evidence_context_fingerprint,
         input_fingerprint=input_fingerprint,
         output_fingerprint=output_fingerprint,
     )
@@ -1174,6 +1334,7 @@ def _lineage_invalid_roles(
     plan: MultiAgentExecutionPlan,
     handoffs: list[AgentHandoff],
     plan_version: int | None,
+    evidence_contexts: dict[SpecialistRole, HandoffEvidenceContext] | None = None,
 ) -> tuple[list[SpecialistRole], int]:
     handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
     invalid_roles: list[SpecialistRole] = []
@@ -1194,12 +1355,18 @@ def _lineage_invalid_roles(
                 for role in assignment.depends_on
                 if role in effective_outputs
             }
+            evidence_context = (evidence_contexts or {}).get(handoff.role)
+            evidence_context_fingerprint = (
+                evidence_context.fingerprint if evidence_context is not None else ""
+            )
             expected_input = _handoff_input_fingerprint(
                 plan,
                 assignment,
                 plan_version=handoff.plan_version,
                 revision_round=handoff.revision_round,
                 upstream_fingerprints=upstream_fingerprints,
+                contract_version=handoff.contract_version,
+                evidence_context_fingerprint=evidence_context_fingerprint,
             )
             expected_output = _handoff_output_fingerprint(
                 role=handoff.role,
@@ -1214,6 +1381,14 @@ def _lineage_invalid_roles(
                 and handoff.upstream_fingerprints == upstream_fingerprints
                 and handoff.objective == assignment.objective
                 and handoff.deliverable == assignment.deliverable
+                and (
+                    handoff.contract_version < 3
+                    or (
+                        evidence_context is not None
+                        and handoff.evidence_context_fingerprint
+                        == evidence_context_fingerprint
+                    )
+                )
                 and handoff.input_fingerprint == expected_input
                 and handoff.output_fingerprint == expected_output
                 and (plan_version is None or handoff.plan_version == plan_version)
@@ -1339,13 +1514,15 @@ def _render_specialist_handoff(response: _SpecialistHandoffResponse) -> str:
         )
     lines.extend(["", "## 验收证据"])
     for item in response.evidence:
-        lines.extend(
-            [
-                f"- **结论**：{item.claim}",
-                f"  - 来源：{item.source}",
-                f"  - 验证：{item.verification}",
-            ]
-        )
+        lines.extend([
+            f"- **结论**：{item.claim}",
+            f"  - 来源：{item.source}",
+            f"  - 验证：{item.verification}",
+        ])
+        if item.criterion_ids:
+            lines.append(f"  - 验收标准：{', '.join(item.criterion_ids)}")
+        if item.source_refs:
+            lines.append(f"  - 受控引用：{', '.join(item.source_refs)}")
     lines.extend(["", "## 风险与缓解"])
     for item in response.risks:
         lines.extend(
@@ -1380,6 +1557,8 @@ def parse_specialist_handoff(
     text: str,
     role: SpecialistRole,
     allowed_roles: set[SpecialistRole] | None = None,
+    *,
+    evidence_context: HandoffEvidenceContext | None = None,
 ) -> SpecialistHandoffPayload:
     permitted_roles = allowed_roles or {role}
     for candidate in _json_candidates(text):
@@ -1392,7 +1571,28 @@ def parse_specialist_handoff(
             }
             if owner_roles - permitted_roles:
                 continue
+            if evidence_context is not None:
+                referenced_criteria = {
+                    criterion_id
+                    for item in response.evidence
+                    for criterion_id in item.criterion_ids
+                }
+                referenced_sources = {
+                    source_ref
+                    for item in response.evidence
+                    for source_ref in item.source_refs
+                }
+                if (
+                    referenced_criteria != evidence_context.criterion_ids
+                    or referenced_sources - evidence_context.source_refs
+                    or any(
+                        not item.criterion_ids or not item.source_refs
+                        for item in response.evidence
+                    )
+                ):
+                    continue
             return SpecialistHandoffPayload(
+                contract_version=3 if evidence_context is not None else 2,
                 structured=True,
                 content=_render_specialist_handoff(response),
                 **response.model_dump(mode="json"),
@@ -1400,6 +1600,7 @@ def parse_specialist_handoff(
         except (json.JSONDecodeError, ValidationError, ValueError):
             continue
     return SpecialistHandoffPayload(
+        contract_version=3 if evidence_context is not None else 2,
         structured=False,
         content=(
             text.strip()[:24000]
@@ -1544,6 +1745,8 @@ def parse_execution_plan_candidate(
     text: str,
     user_input: str,
     capability_catalog: list[SpecialistCapabilityProfile] | None = None,
+    *,
+    criterion_ids: set[str] | None = None,
 ) -> MultiAgentExecutionPlan | None:
     catalog = capability_catalog or default_specialist_capability_catalog()
     required_capabilities = infer_required_specialist_capabilities(user_input)
@@ -1551,7 +1754,12 @@ def parse_execution_plan_candidate(
     for candidate in _json_candidates(text):
         try:
             plan = MultiAgentExecutionPlan.model_validate(json.loads(candidate))
-            return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
+            bound = validate_execution_plan_capabilities(
+                plan,
+                catalog,
+                required_capabilities,
+            )
+            return validate_execution_plan_criteria(bound, criterion_ids or set())
         except (json.JSONDecodeError, ValidationError, ValueError):
             continue
     return None
@@ -1560,6 +1768,8 @@ def parse_execution_plan_candidate(
 def build_fallback_plan(
     user_input: str,
     capability_catalog: list[SpecialistCapabilityProfile] | None = None,
+    *,
+    criterion_ids: list[str] | None = None,
 ) -> MultiAgentExecutionPlan:
     catalog = capability_catalog or default_specialist_capability_catalog()
     eligible = ensure_specialist_team_ready(catalog)
@@ -1609,8 +1819,22 @@ def build_fallback_plan(
             "通知触达与失败恢复方案",
         ),
     }
+    planned_roles = selected_roles[:4]
+    criterion_owners: dict[SpecialistRole, list[str]] = {
+        role: [] for role in planned_roles
+    }
+    ordered_criteria = list(dict.fromkeys(criterion_ids or []))
+    for index, criterion_id in enumerate(ordered_criteria):
+        criterion_owners[planned_roles[index % len(planned_roles)]].append(criterion_id)
+    if ordered_criteria:
+        for index, role in enumerate(planned_roles):
+            if not criterion_owners[role]:
+                criterion_owners[role].append(
+                    ordered_criteria[index % len(ordered_criteria)]
+                )
+
     assignments: list[SpecialistAssignment] = []
-    for role in selected_roles[:4]:
+    for role in planned_roles:
         objective, deliverable = templates[role]
         required = list(_SPECIALIST_ROLE_BASELINE_CAPABILITIES[role])
         if role == "knowledge_admin" and includes_knowledge:
@@ -1629,6 +1853,7 @@ def build_fallback_plan(
                 deliverable=deliverable,
                 depends_on=dependencies,
                 required_capabilities=required,
+                criterion_ids=criterion_owners[role],
             )
         )
     plan = MultiAgentExecutionPlan(
@@ -1641,7 +1866,8 @@ def build_fallback_plan(
             "每个专业结论都有明确交付物和后续负责人",
         ],
     )
-    return validate_execution_plan_capabilities(plan, catalog, required_capabilities)
+    bound = validate_execution_plan_capabilities(plan, catalog, required_capabilities)
+    return validate_execution_plan_criteria(bound, set(ordered_criteria))
 
 
 def parse_execution_plan(
@@ -1661,6 +1887,7 @@ def evaluate_handoffs(
     handoffs: list[AgentHandoff],
     *,
     plan_version: int | None = None,
+    evidence_contexts: dict[SpecialistRole, HandoffEvidenceContext] | None = None,
 ) -> QualityGateDecision:
     expected_roles = [assignment.role for assignment in plan.assignments]
     handoffs_by_role = {handoff.role: handoff for handoff in handoffs}
@@ -1690,10 +1917,48 @@ def evaluate_handoffs(
     legacy_count = sum(
         handoff.contract_version == 1 for handoff in handoffs_by_role.values()
     )
+    pre_v3_count = sum(
+        handoff.contract_version < 3 for handoff in handoffs_by_role.values()
+    )
+    grounded_count = sum(
+        handoff.contract_version >= 3 and handoff.structured
+        for handoff in handoffs_by_role.values()
+    )
+    assignments_by_role = {assignment.role: assignment for assignment in plan.assignments}
+    invalid_evidence_roles: list[SpecialistRole] = []
+    for role in expected_roles:
+        handoff = handoffs_by_role.get(role)
+        if handoff is None or handoff.contract_version < 3:
+            continue
+        context = (evidence_contexts or {}).get(role)
+        assignment = assignments_by_role[role]
+        referenced_criteria = {
+            criterion_id
+            for item in handoff.evidence
+            for criterion_id in item.criterion_ids
+        }
+        referenced_sources = {
+            source_ref
+            for item in handoff.evidence
+            for source_ref in item.source_refs
+        }
+        if (
+            context is None
+            or not handoff.structured
+            or context.criterion_ids != set(assignment.criterion_ids)
+            or referenced_criteria != set(assignment.criterion_ids)
+            or bool(referenced_sources - context.source_refs)
+            or any(
+                not item.criterion_ids or not item.source_refs
+                for item in handoff.evidence
+            )
+        ):
+            invalid_evidence_roles.append(role)
     lineage_invalid_roles, sealed_count = _lineage_invalid_roles(
         plan,
         handoffs,
         plan_version,
+        evidence_contexts,
     )
     checks = [
         {
@@ -1717,7 +1982,18 @@ def evaluate_handoffs(
                 if not invalid_contract_roles
                 else f"invalid structured contracts: {', '.join(invalid_contract_roles)}"
             ),
-            "weight": 20,
+            "weight": 15,
+        },
+        {
+            "name": "evidence_grounding",
+            "passed": not invalid_evidence_roles,
+            "detail": (
+                f"{grounded_count} grounded handoffs; "
+                f"{pre_v3_count} pre-v3 handoffs accepted"
+                if not invalid_evidence_roles
+                else f"invalid evidence references: {', '.join(invalid_evidence_roles)}"
+            ),
+            "weight": 15,
         },
         {
             "name": "handoff_lineage",
@@ -1727,13 +2003,13 @@ def evaluate_handoffs(
                 if not lineage_invalid_roles
                 else f"invalid or stale lineage: {', '.join(lineage_invalid_roles)}"
             ),
-            "weight": 15,
+            "weight": 10,
         },
         {
             "name": "success_contract",
             "passed": len(plan.success_criteria) >= 2,
             "detail": f"{len(plan.success_criteria)} success criteria defined",
-            "weight": 15,
+            "weight": 10,
         },
         {
             "name": "specialist_breadth",
@@ -1752,6 +2028,10 @@ def evaluate_handoffs(
         issues.append(
             f"结构化合同无效：{', '.join(invalid_contract_roles)}"
         )
+    if invalid_evidence_roles:
+        issues.append(
+            f"验收证据引用无效：{', '.join(invalid_evidence_roles)}"
+        )
     if lineage_invalid_roles:
         issues.append(f"交接证据链失效：{', '.join(lineage_invalid_roles)}")
     revision_roles = list(
@@ -1760,6 +2040,7 @@ def evaluate_handoffs(
                 *missing_roles,
                 *short_roles,
                 *invalid_contract_roles,
+                *invalid_evidence_roles,
                 *lineage_invalid_roles,
             ]
         )
@@ -1768,6 +2049,7 @@ def evaluate_handoffs(
         not missing_roles
         and not short_roles
         and not invalid_contract_roles
+        and not invalid_evidence_roles
         and not lineage_invalid_roles
         and score >= 80
     )

@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     rag_min_chunk_tokens: int = Field(default=30, ge=1, le=500)
     rag_chunk_strategy: str = "structural"
     rag_semantic_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-    rag_multi_vector_enabled: bool = False
+    rag_multi_vector_enabled: bool = True
     rag_context_max_tokens: int = Field(default=4000, ge=256, le=32000)
     rag_min_query_coverage: float = Field(default=0.15, ge=0.0, le=1.0)
     rag_dense_override_score: float = Field(default=0.72, ge=0.0, le=1.0)

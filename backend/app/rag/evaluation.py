@@ -388,8 +388,8 @@ def load_evaluation_corpus(
 def legacy_candidates(documents: dict[str, bytes], token_count: Callable[[str], int]) -> list[CandidateChunk]:
     candidates: list[CandidateChunk] = []
     for filename, data in documents.items():
-        text = data.decode("utf-8-sig")
-        for chunk_index, content in enumerate(split_text(text, chunk_size=900, overlap=140)):
+        parsed = parse_document_elements(filename, data)
+        for chunk_index, content in enumerate(split_text(parsed.text, chunk_size=900, overlap=140)):
             candidates.append(
                 CandidateChunk(
                     filename,

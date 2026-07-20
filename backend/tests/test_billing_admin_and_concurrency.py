@@ -253,7 +253,21 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
     async def fake_chat(system_prompt: str, _user_prompt: str, *_args) -> str:
         prompts.append(system_prompt)
         if "专业交接 Agent" in system_prompt:
-            role = json.loads(_user_prompt)["assignment"]["role"]
+            context = json.loads(_user_prompt)
+            role = context["assignment"]["role"]
+            evidence_context = context.get("evidence_context")
+            evidence = {
+                "claim": "The core path has reproducible acceptance evidence.",
+                "source": "Automated acceptance records.",
+                "verification": "Rerun the core cases and verify the linked success criteria.",
+            }
+            if evidence_context:
+                evidence["criterion_ids"] = [
+                    item["criterion_id"] for item in evidence_context["criteria"]
+                ]
+                evidence["source_refs"] = [
+                    item["ref"] for item in evidence_context["sources"]
+                ]
             return json.dumps(
                 {
                     "summary": "The specialist completed a verifiable handoff with explicit ownership and recovery criteria.",
@@ -264,13 +278,7 @@ async def test_multi_agent_workflow_charges_once_and_blocks_parallel_run(
                             "rationale": "A staged release preserves a deterministic rollback point.",
                         }
                     ],
-                    "evidence": [
-                        {
-                            "claim": "The core path has reproducible acceptance evidence.",
-                            "source": "Automated acceptance records.",
-                            "verification": "Rerun the core cases and verify the linked success criteria.",
-                        }
-                    ],
+                    "evidence": [evidence],
                     "risks": [
                         {
                             "risk": "Expansion could exceed the current error budget.",

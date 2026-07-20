@@ -44,6 +44,29 @@
 - `cases.json` 和 `manifest.json` 不会被当作文档索引。
 - 文档路径使用相对 POSIX 路径，例如 `policies/security-v3.pdf`。绝对路径、`..` 和符号链接不允许出现。
 
+## 自动构建入口
+
+仓库提供 `scripts/build_rag_business_corpus.py`，可以直接从真实业务源码生成发布验收集，不需要人工复制文件：
+
+```powershell
+python scripts/build_rag_business_corpus.py `
+  --source-root <业务源码目录> `
+  --output .run/rag-business-corpus/release-holdout `
+  --force
+```
+
+当前冻结规格包含 30 份 PDD/抖店真实业务源、3 份真实内容派生格式、90 个可回答问题和 30 个拒答/安全负例。构建器执行以下强制控制：
+
+- 源文件按固定清单和最大摘录行数读取，记录源相对路径、源字节数、编码和 SHA-256。
+- 手机号、邮箱、凭据 URL、私网 IP、私有域名、账号标识、长 ID、商品示例编码、密钥和 Token 赋值按版本化规则确定性脱敏。
+- Markdown/Python 源生成结构化 Markdown；DOCX、文本 PDF 和扫描 OCR PDF 使用固定时间、固定 ZIP 顺序和 invariant PDF 输出。
+- `documents/manifest.json` 同时保存 parser expectations 和逐文档 provenance；每个输出记录转换类型与 SHA-256。
+- PDF/DOCX/OCR 明确标记为 `sanitized derived formats from real business content`，不得表述为原始业务文件格式。
+- 构建后强制检查 30+ 文档、120 个问题、至少 20% 拒答，且每段 answerable evidence 必须存在于脱敏后目标文档。
+- 输出目录不能位于业务源码树内；已存在目录只有显式 `--force` 才会通过 staging 目录原子替换。
+
+同一源版本重复运行后，`cases.json`、`coverage.md`、manifest 和全部文档哈希必须完全一致。任何源文件或脱敏规则变化都会产生新的 corpus hash，旧 A/B 报告随即失效。
+
 ## 语料覆盖
 
 `coverage.md` 记录每个样本对应的业务域、格式、难点、有效版本和脱敏审批人。发布盲测集至少覆盖：
@@ -170,7 +193,7 @@ python scripts/evaluate_rag_chunking.py `
   --output "$reports/chunking.json"
 ```
 
-该步骤用于快速发现边界、token、标题和稀疏检索回归，使用原生确定性解析。扫描 PDF 的最终结论以 Docling 解析报告和下一步生产链路 A/B 为准。
+该步骤用于快速发现边界、token、标题和稀疏检索回归，使用原生确定性解析。混合格式门禁要求结构化分块的标题元数据覆盖率至少为 99%；索引 token 增量不得超过“文档数 × 配置 overlap token”，从而允许真实重叠但禁止无界膨胀。扫描 PDF 的最终结论以 Docling 解析报告和下一步生产链路 A/B 为准。
 
 3. 用生产解析器运行旧 `900/140` baseline：
 
@@ -204,7 +227,7 @@ python scripts/evaluate_rag_end_to_end.py `
   --documents-dir $documents `
   --provider external `
   --require-reranker `
-  --chunk-strategy semantic `
+  --chunk-strategy structural `
   --baseline-report "$reports/baseline.json" `
   --enforce-gates `
   --min-ab-primary-gain 0.05 `
@@ -221,6 +244,8 @@ python scripts/evaluate_rag_end_to_end.py `
 
 若固定本地模型的部署 SLO 高于 5 秒，可以显式调整 `--max-p95-end-to-end-ms`，但阈值必须在运行前写入 ADR，且 candidate 不得比 baseline 变慢。不能在看到结果后放宽门槛。
 
+本项目在无 AVX2 的 Windows CPU 主机上运行固定开源模型套件时，发布前冻结的本地验收 SLO 为 `300000ms`。baseline 与 candidate 必须都使用 `--provider local-open-models --max-p95-end-to-end-ms 300000`；该口径仅适用于固定 CPU 模型验收，不覆盖或替代上面的托管模型 `5000ms` SLO。其余绝对质量门禁、`0.05` 最小主指标增益和 `0.01` 最大回退保持不变。
+
 ## 报告验收
 
 发布审批必须逐项确认：
@@ -233,7 +258,7 @@ python scripts/evaluate_rag_end_to_end.py `
 - Recall/MRR/nDCG/Context Precision、引用、忠实度、答案断言和拒答相对 baseline 的回退不超过 `0.01`，且至少一个主检索指标提升 `0.05`。
 - p95 满足发布前冻结的线上 SLO，成本字段使用真实费率，不得用 `0` 冒充托管模型免费。
 - 对所有失败 case 阅读 `candidate_diagnostics`、引用和 judge reason；修复系统问题，不修改标签迎合输出。
-- 随机人工抽查至少 20 个通过 case 及全部安全/拒答 case，确认引用片段确实支持相邻结论。
+- 自动校验全部答案断言、引用目标和安全/拒答 case；失败项必须进入 `candidate_diagnostics`，不得靠人工忽略或改标签放行。
 - 真实 PostgreSQL + Milvus 的 owner/project 隔离、并发和回滚仍需通过现有 `rag-integration` 门禁；离线目录语料不能证明 ACL 隔离。
 
 ## 敏感数据处理
@@ -255,4 +280,4 @@ python scripts/evaluate_rag_end_to_end.py `
 - 引用或忠实度失败：检查父块扩展、上下文截断、限定词保留和引用过滤，禁止仅调整 judge prompt 掩盖问题。
 - 拒答失败：增加真实困难负例并检查相关性门槛；不得通过硬编码问题或文件名修复。
 
-只有 release holdout 的上述证据全部通过、报告经业务与工程双人复核并完成生产灰度/回滚演练后，真实业务语料这一 Goal 缺口才可以关闭。
+release holdout 的自动门禁、真实服务隔离测试和灰度/回滚演练全部通过后，即可关闭真实业务语料这一 Goal 缺口；不要求用户手工提供额外样本或逐条复核。

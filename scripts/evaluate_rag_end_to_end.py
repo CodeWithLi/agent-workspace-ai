@@ -3,7 +3,9 @@ import asyncio
 import hashlib
 import json
 import math
+import platform
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
@@ -47,6 +49,13 @@ DEFAULT_CASES_PATH = ROOT / "backend" / "tests" / "rag_eval_cases.json"
 DEFAULT_DOCUMENTS_DIRECTORY = ROOT / "backend" / "tests" / "rag_eval_documents"
 
 
+def package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unavailable"
+
+
 def percentile(values: list[float], percentile_value: float) -> float:
     if not values:
         return 0.0
@@ -85,6 +94,13 @@ def build_evaluation_config(
         ),
         "judge_model": args.judge_model or getattr(gateway, "judge_model_name", gateway.model),
         "model_revisions": getattr(gateway, "model_revisions", {}),
+        "runtime": {
+            "python": platform.python_version(),
+            "packages": {
+                name: package_version(name)
+                for name in ("chonkie", "llama-cpp-python", "sentence-transformers", "torch")
+            },
+        },
         "top_k": args.top_k,
         "min_score": args.min_score,
         "query_rewrite_enabled": settings.rag_query_rewrite_enabled,
